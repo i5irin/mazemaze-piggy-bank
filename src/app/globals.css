@@ -1,0 +1,205 @@
+:root {
+  color-scheme: light dark;
+  --app-bg: #f7f7f7;
+  --app-bg-dark: #0b0b0b;
+  --app-surface: #ffffff;
+  --app-surface-dark: #161616;
+  --app-border: #e4e4e4;
+  --app-border-dark: #2a2a2a;
+  --app-text: #1a1a1a;
+  --app-text-dark: #f5f5f5;
+  --app-subtle: #5b5b5b;
+  --app-subtle-dark: #b5b5b5;
+  --app-accent: #0f6cbd;
+  --app-accent-dark: #4f9cf3;
+  --app-radius: 14px;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  background: var(--app-bg);
+  color: var(--app-text);
+}
+
+[data-theme="dark"] body {
+  background: var(--app-bg-dark);
+  color: var(--app-text-dark);
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  min-height: 100vh;
+  background: linear-gradient(180deg, rgba(15, 108, 189, 0.08), transparent 35%);
+}
+
+[data-theme="dark"] .app-shell {
+  background: linear-gradient(180deg, rgba(79, 156, 243, 0.15), transparent 35%);
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px 12px;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  backdrop-filter: blur(12px);
+  background: color-mix(in srgb, var(--app-surface) 75%, transparent);
+  border-bottom: 1px solid var(--app-border);
+}
+
+[data-theme="dark"] .app-header {
+  background: color-mix(in srgb, var(--app-surface-dark) 78%, transparent);
+  border-bottom-color: var(--app-border-dark);
+}
+
+.app-title {
+  font-size: 18px;
+  font-weight: 600;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.app-main {
+  padding: 16px 20px 72px;
+}
+
+.section-stack {
+  display: grid;
+  gap: 16px;
+}
+
+.card-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.app-surface {
+  background: var(--app-surface);
+  border: 1px solid var(--app-border);
+  border-radius: var(--app-radius);
+  padding: 16px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.06);
+}
+
+[data-theme="dark"] .app-surface {
+  background: var(--app-surface-dark);
+  border-color: var(--app-border-dark);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+}
+
+.app-muted {
+  color: var(--app-subtle);
+}
+
+[data-theme="dark"] .app-muted {
+  color: var(--app-subtle-dark);
+}
+
+.app-nav {
+  display: grid;
+  grid-auto-flow: column;
+  justify-content: space-around;
+  align-items: center;
+  padding: 12px 16px;
+  position: sticky;
+  bottom: 0;
+  background: color-mix(in srgb, var(--app-surface) 92%, transparent);
+  border-top: 1px solid var(--app-border);
+}
+
+[data-theme="dark"] .app-nav {
+  background: color-mix(in srgb, var(--app-surface-dark) 92%, transparent);
+  border-top-color: var(--app-border-dark);
+}
+
+.nav-link {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--app-subtle);
+}
+
+.nav-link-active {
+  color: var(--app-accent);
+  font-weight: 600;
+}
+
+[data-theme="dark"] .nav-link {
+  color: var(--app-subtle-dark);
+}
+
+[data-theme="dark"] .nav-link-active {
+  color: var(--app-accent-dark);
+}
+
+.focus-ring:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--app-accent) 60%, transparent);
+  outline-offset: 3px;
+  border-radius: 8px;
+}
+
+@media (min-width: 900px) {
+  .app-shell {
+    grid-template-columns: 240px 1fr;
+    grid-template-rows: auto 1fr;
+  }
+
+  .app-header {
+    grid-column: 1 / -1;
+    position: sticky;
+    top: 0;
+  }
+
+  .app-nav {
+    grid-column: 1;
+    grid-row: 2;
+    position: sticky;
+    top: 72px;
+    align-self: start;
+    height: fit-content;
+    padding: 20px 12px;
+    border-top: none;
+    border-right: 1px solid var(--app-border);
+    background: transparent;
+    justify-content: stretch;
+    gap: 12px;
+  }
+
+  [data-theme="dark"] .app-nav {
+    border-right-color: var(--app-border-dark);
+  }
+
+  .nav-link {
+    flex-direction: row;
+    justify-content: flex-start;
+    gap: 12px;
+    font-size: 14px;
+  }
+
+  .app-main {
+    padding: 24px 32px;
+  }
+}

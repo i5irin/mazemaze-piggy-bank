@@ -50,3 +50,40 @@ Data is stored in the user's OneDrive in the following structure.
 ---
 > **Note**
 > While designed as a PWA for mobile use, this application is fully functional on desktop browsers. Recommended browsers: Latest Chrome, Edge, Safari.
+
+## ✅ Setup
+
+```bash
+npm install
+```
+
+Create your local env file:
+
+```bash
+cp .env.example .env.local
+```
+
+## ▶️ Development
+
+```bash
+npm run dev
+```
+
+Open http://localhost:3000.
+
+## 🔍 Quality Commands
+
+```bash
+npm run format
+npm run lint
+npm run typecheck
+npm test
+npm run check
+```
+
+## 📌 Project Constraints
+
+- UI text and code comments must be written in English only.
+- Microsoft personal accounts only (no work or school accounts).
+- Offline mode is view-only; editing is disabled.
+- No telemetry or analytics are added by default.
