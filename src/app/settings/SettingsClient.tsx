@@ -15,6 +15,72 @@ type OperationState = {
   payload?: unknown;
 };
 
+const sensitiveKeys = [
+  "authorization",
+  "accessToken",
+  "refreshToken",
+  "clientSecret",
+  "password",
+  "secret",
+  "token",
+];
+const emailKeys = ["email", "userPrincipalName", "upn"];
+const idKeys = ["id", "driveId", "itemId", "siteId", "tenantId", "userId"];
+
+const maskId = (value: string): string => {
+  if (value.length <= 8) {
+    return "***";
+  }
+  return `${value.slice(0, 4)}...${value.slice(-4)}`;
+};
+
+const maskEmail = (value: string): string => {
+  const atIndex = value.indexOf("@");
+  if (atIndex <= 1) {
+    return "***";
+  }
+  return `${value.slice(0, 1)}***${value.slice(atIndex)}`;
+};
+
+const looksLikeJwt = (value: string): boolean => {
+  const parts = value.split(".");
+  return parts.length === 3 && parts.every((part) => part.length >= 10);
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null;
+
+const maskSensitiveData = (value: unknown, parentKey?: string): unknown => {
+  if (typeof value === "string") {
+    const key = parentKey?.toLowerCase() ?? "";
+    if (sensitiveKeys.some((entry) => key.includes(entry.toLowerCase()))) {
+      return "[REDACTED]";
+    }
+    if (emailKeys.some((entry) => key.includes(entry.toLowerCase()))) {
+      return maskEmail(value);
+    }
+    if (idKeys.some((entry) => key === entry.toLowerCase())) {
+      return maskId(value);
+    }
+    if (looksLikeJwt(value)) {
+      return "[REDACTED]";
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => maskSensitiveData(item, parentKey));
+  }
+  if (isRecord(value)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, maskSensitiveData(entry, key)]),
+    );
+  }
+  return value;
+};
+
+const formatPayload = (payload: unknown): string =>
+  JSON.stringify(maskSensitiveData(payload), null, 2);
+
 const getUserMessage = (error: unknown): string => {
   if (isAuthError(error)) {
     if (error.code === "missing-config") {
@@ -244,7 +310,7 @@ export function SettingsClient() {
           </div>
         ) : null}
         {driveState.payload ? (
-          <pre className="app-code">{JSON.stringify(driveState.payload, null, 2)}</pre>
+          <pre className="app-code">{formatPayload(driveState.payload)}</pre>
         ) : null}
       </section>
 

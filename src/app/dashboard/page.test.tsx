@@ -15,7 +15,6 @@ jest.mock("@/components/PersonalDataProvider", () => ({
     message: null,
     error: null,
     refresh: jest.fn(),
-    applyDemoChange: jest.fn(),
     saveChanges: jest.fn(),
     discardChanges: jest.fn(),
   }),

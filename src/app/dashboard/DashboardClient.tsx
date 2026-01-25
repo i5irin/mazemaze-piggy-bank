@@ -71,7 +71,6 @@ export default function DashboardClient() {
     message,
     error,
     refresh,
-    applyDemoChange,
     saveChanges,
     discardChanges,
   } = usePersonalData();
@@ -123,9 +122,6 @@ export default function DashboardClient() {
         <div className="app-actions" style={{ marginTop: 12 }}>
           <Button onClick={refresh} disabled={isBusy}>
             {isOnline && isSignedIn ? "Refresh from OneDrive" : "Load cached data"}
-          </Button>
-          <Button onClick={applyDemoChange} disabled={!canEdit || isBusy}>
-            Apply demo change
           </Button>
           <Button
             appearance="primary"

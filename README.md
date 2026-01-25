@@ -72,7 +72,7 @@ This app supports **Personal Microsoft accounts only**.
 2. Add a redirect URI for local development (for example, `http://localhost:3000`).
 3. Configure delegated Microsoft Graph permissions:
    - `User.Read`
-   - `Files.ReadWrite.AppFolder`
+   - `Files.ReadWrite`
 4. Update `.env.local` with your values:
    - `NEXT_PUBLIC_MSAL_CLIENT_ID`
    - `NEXT_PUBLIC_MSAL_REDIRECT_URI`

@@ -36,4 +36,4 @@ export const getMsalConfig = (): Configuration => {
   };
 };
 
-export const getGraphScopes = (): string[] => ["User.Read", "Files.ReadWrite.AppFolder"];
+export const getGraphScopes = (): string[] => ["User.Read", "Files.ReadWrite"];

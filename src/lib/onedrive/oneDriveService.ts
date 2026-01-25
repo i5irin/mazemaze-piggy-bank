@@ -14,8 +14,9 @@ const EVENT_FILE_EXTENSION = ".jsonl";
 
 type GraphClient = ReturnType<typeof createGraphClient>;
 
-const buildPathFromSegments = (segments: string[]) =>
-  segments.map((segment) => encodeURIComponent(segment)).join("/");
+const encodeDrivePath = (path: string) => encodeURIComponent(path).replace(/%2F/g, "/");
+
+const buildPathFromSegments = (segments: string[]) => encodeDrivePath(segments.join("/"));
 
 const buildContentPathFromSegments = (segments: string[]) =>
   `${APP_ROOT_PATH}:/${buildPathFromSegments(segments)}:/content`;

@@ -12,11 +12,27 @@ import {
   serializeEventChunk,
   type PendingEvent,
 } from "@/lib/persistence/eventChunk";
+import {
+  createAccount as createAccountDomain,
+  createAllocation as createAllocationDomain,
+  createGoal as createGoalDomain,
+  createPosition as createPositionDomain,
+  deleteAccount as deleteAccountDomain,
+  deleteAllocation as deleteAllocationDomain,
+  deleteGoal as deleteGoalDomain,
+  deletePosition as deletePositionDomain,
+  reduceAllocations as reduceAllocationsDomain,
+  updateAccount as updateAccountDomain,
+  updateAllocation as updateAllocationDomain,
+  updateGoal as updateGoalDomain,
+  updatePosition as updatePositionDomain,
+  type DomainActionResult,
+} from "@/lib/persistence/domain";
 import { createId } from "@/lib/persistence/id";
 import { createEmptySnapshot, type Snapshot } from "@/lib/persistence/snapshot";
 import { readSnapshotCache, writeSnapshotCache } from "@/lib/persistence/snapshotCache";
 import { useOnlineStatus } from "@/lib/persistence/useOnlineStatus";
-import type { Account, Allocation, Goal, NormalizedState, Position } from "@/lib/persistence/types";
+import type { Goal, NormalizedState, Position } from "@/lib/persistence/types";
 
 const MAX_EVENTS_PER_CHUNK = 500;
 
@@ -31,6 +47,8 @@ type SnapshotRecord = {
   etag: string | null;
 };
 
+type DomainActionOutcome = { ok: true } | { ok: false; error: string };
+
 type PersonalDataContextValue = {
   status: DataStatus;
   activity: DataActivity;
@@ -43,7 +61,50 @@ type PersonalDataContextValue = {
   message: string | null;
   error: string | null;
   refresh: () => Promise<void>;
-  applyDemoChange: () => void;
+  createAccount: (name: string) => DomainActionOutcome;
+  updateAccount: (accountId: string, name: string) => DomainActionOutcome;
+  deleteAccount: (accountId: string) => DomainActionOutcome;
+  createPosition: (input: {
+    accountId: string;
+    assetType: Position["assetType"];
+    label: string;
+    marketValue: number;
+  }) => DomainActionOutcome;
+  updatePosition: (input: {
+    positionId: string;
+    assetType: Position["assetType"];
+    label: string;
+    marketValue: number;
+  }) => DomainActionOutcome;
+  deletePosition: (positionId: string) => DomainActionOutcome;
+  createGoal: (input: {
+    name: string;
+    targetAmount: number;
+    priority: number;
+    status: Goal["status"];
+    startDate?: string;
+    endDate?: string;
+  }) => DomainActionOutcome;
+  updateGoal: (input: {
+    goalId: string;
+    name: string;
+    targetAmount: number;
+    priority: number;
+    status: Goal["status"];
+    startDate?: string;
+    endDate?: string;
+  }) => DomainActionOutcome;
+  deleteGoal: (goalId: string) => DomainActionOutcome;
+  createAllocation: (input: {
+    goalId: string;
+    positionId: string;
+    allocatedAmount: number;
+  }) => DomainActionOutcome;
+  updateAllocation: (allocationId: string, allocatedAmount: number) => DomainActionOutcome;
+  deleteAllocation: (allocationId: string) => DomainActionOutcome;
+  reduceAllocations: (
+    reductions: { allocationId: string; amount: number }[],
+  ) => DomainActionOutcome;
   saveChanges: () => Promise<void>;
   discardChanges: () => void;
 };
@@ -78,178 +139,10 @@ const formatGraphError = (error: unknown): string => {
   return "Something went wrong. Please try again.";
 };
 
-const createSeedState = (now: string) => {
-  const account: Account = {
-    id: createId(),
-    scope: "personal",
-    name: "Personal Cash",
-  };
-  const position: Position = {
-    id: createId(),
-    accountId: account.id,
-    assetType: "cash",
-    label: "Wallet",
-    marketValue: 100000,
-    updatedAt: now,
-  };
-  const goal: Goal = {
-    id: createId(),
-    scope: "personal",
-    name: "Starter Goal",
-    targetAmount: 200000,
-    priority: 1,
-    status: "active",
-  };
-  const allocation: Allocation = {
-    id: createId(),
-    goalId: goal.id,
-    positionId: position.id,
-    allocatedAmount: 50000,
-  };
-  return {
-    nextState: {
-      accounts: [account],
-      positions: [position],
-      goals: [goal],
-      allocations: [allocation],
-    },
-    event: {
-      id: createId(),
-      type: "seed_state",
-      createdAt: now,
-      payload: {
-        accountId: account.id,
-        positionId: position.id,
-        goalId: goal.id,
-      },
-    },
-  };
-};
-
-const applyDemoChange = (state: NormalizedState, now: string) => {
-  if (state.accounts.length === 0) {
-    return createSeedState(now);
-  }
-
-  if (state.positions.length === 0) {
-    const account = state.accounts[0];
-    const position: Position = {
-      id: createId(),
-      accountId: account.id,
-      assetType: "cash",
-      label: "Cash Reserve",
-      marketValue: 80000,
-      updatedAt: now,
-    };
-    const nextState: NormalizedState = {
-      ...state,
-      positions: [position, ...state.positions],
-    };
-    return {
-      nextState,
-      event: {
-        id: createId(),
-        type: "position_added",
-        createdAt: now,
-        payload: {
-          positionId: position.id,
-          accountId: account.id,
-        },
-      },
-    };
-  }
-
-  if (state.goals.length === 0) {
-    const goal: Goal = {
-      id: createId(),
-      scope: "personal",
-      name: "New Goal",
-      targetAmount: 120000,
-      priority: 1,
-      status: "active",
-    };
-    const nextState: NormalizedState = {
-      ...state,
-      goals: [goal, ...state.goals],
-    };
-    return {
-      nextState,
-      event: {
-        id: createId(),
-        type: "goal_added",
-        createdAt: now,
-        payload: {
-          goalId: goal.id,
-        },
-      },
-    };
-  }
-
-  if (state.allocations.length === 0) {
-    const allocation: Allocation = {
-      id: createId(),
-      goalId: state.goals[0].id,
-      positionId: state.positions[0].id,
-      allocatedAmount: 30000,
-    };
-    const nextState: NormalizedState = {
-      ...state,
-      allocations: [allocation, ...state.allocations],
-    };
-    return {
-      nextState,
-      event: {
-        id: createId(),
-        type: "allocation_added",
-        createdAt: now,
-        payload: {
-          allocationId: allocation.id,
-          goalId: allocation.goalId,
-          positionId: allocation.positionId,
-        },
-      },
-    };
-  }
-
-  const [firstPosition, ...restPositions] = state.positions;
-  const updatedPosition: Position = {
-    ...firstPosition,
-    marketValue: firstPosition.marketValue + 1000,
-    updatedAt: now,
-  };
-
-  let allocationAdjusted = false;
-  const updatedAllocations = state.allocations.map((allocation) => {
-    if (!allocationAdjusted && allocation.positionId === updatedPosition.id) {
-      allocationAdjusted = true;
-      return {
-        ...allocation,
-        allocatedAmount: Math.min(allocation.allocatedAmount + 500, updatedPosition.marketValue),
-      };
-    }
-    return allocation;
-  });
-
-  const nextState: NormalizedState = {
-    ...state,
-    positions: [updatedPosition, ...restPositions],
-    allocations: updatedAllocations,
-  };
-
-  return {
-    nextState,
-    event: {
-      id: createId(),
-      type: "position_market_value_adjusted",
-      createdAt: now,
-      payload: {
-        positionId: updatedPosition.id,
-        delta: 1000,
-        allocationAdjusted,
-      },
-    },
-  };
-};
+const buildEventMeta = () => ({
+  eventId: createId(),
+  createdAt: new Date().toISOString(),
+});
 
 export function PersonalDataProvider({ children }: { children: React.ReactNode }) {
   const { status: authStatus, getAccessToken } = useAuth();
@@ -336,7 +229,12 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
           const now = new Date().toISOString();
           const emptySnapshot = createEmptySnapshot(now);
           const result = await oneDrive.writePersonalSnapshot(emptySnapshot);
-          applySnapshot(emptySnapshot, result.etag, "remote", "Initialized a new snapshot.");
+          applySnapshot(
+            emptySnapshot,
+            result.etag,
+            "remote",
+            "No snapshot found yet. Add accounts or goals to create your first snapshot.",
+          );
           await writeSnapshotCache({
             key: "personal",
             snapshot: emptySnapshot,
@@ -470,25 +368,314 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     }
   }, [draftState, handleConflict, isOnline, isSignedIn, oneDrive, pendingEvents, snapshotRecord]);
 
-  const handleDemoChange = useCallback(() => {
+  const ensureEditableState = useCallback((): { state: NormalizedState } | { error: string } => {
     if (!isOnline) {
-      setMessage("Offline mode is view-only. Please reconnect to edit.");
-      return;
+      return { error: "Offline mode is view-only. Please reconnect to edit." };
     }
     if (!isSignedIn) {
-      setMessage("Sign in to edit.");
-      return;
+      return { error: "Sign in to edit." };
     }
     if (!draftState) {
-      setMessage("No snapshot is loaded yet.");
-      return;
+      return { error: "No snapshot is loaded yet." };
     }
-    const now = new Date().toISOString();
-    const { nextState, event } = applyDemoChange(draftState, now);
-    setDraftState(nextState);
-    setPendingEvents((prev) => [...prev, event]);
-    setMessage("Draft updated. Save to sync.");
+    return { state: draftState };
   }, [draftState, isOnline, isSignedIn]);
+
+  const applyDomainResult = useCallback(
+    (result: DomainActionResult, successMessage: string): DomainActionOutcome => {
+      if ("error" in result) {
+        setError(result.error);
+        setMessage(null);
+        return { ok: false, error: result.error };
+      }
+      setDraftState(result.nextState);
+      setPendingEvents((prev) => [...prev, ...result.events]);
+      setMessage(successMessage);
+      setError(null);
+      return { ok: true };
+    },
+    [],
+  );
+
+  const createAccount = useCallback(
+    (name: string): DomainActionOutcome => {
+      const editable = ensureEditableState();
+      if ("error" in editable) {
+        setError(editable.error);
+        setMessage(null);
+        return { ok: false, error: editable.error };
+      }
+      const meta = buildEventMeta();
+      const result = createAccountDomain(editable.state, { id: createId(), name }, meta);
+      return applyDomainResult(result, "Account created in draft.");
+    },
+    [applyDomainResult, ensureEditableState],
+  );
+
+  const updateAccount = useCallback(
+    (accountId: string, name: string): DomainActionOutcome => {
+      const editable = ensureEditableState();
+      if ("error" in editable) {
+        setError(editable.error);
+        setMessage(null);
+        return { ok: false, error: editable.error };
+      }
+      const meta = buildEventMeta();
+      const result = updateAccountDomain(editable.state, { id: accountId, name }, meta);
+      return applyDomainResult(result, "Account updated in draft.");
+    },
+    [applyDomainResult, ensureEditableState],
+  );
+
+  const deleteAccount = useCallback(
+    (accountId: string): DomainActionOutcome => {
+      const editable = ensureEditableState();
+      if ("error" in editable) {
+        setError(editable.error);
+        setMessage(null);
+        return { ok: false, error: editable.error };
+      }
+      const meta = buildEventMeta();
+      const result = deleteAccountDomain(editable.state, accountId, meta);
+      return applyDomainResult(result, "Account deleted in draft.");
+    },
+    [applyDomainResult, ensureEditableState],
+  );
+
+  const createPosition = useCallback(
+    (input: {
+      accountId: string;
+      assetType: Position["assetType"];
+      label: string;
+      marketValue: number;
+    }): DomainActionOutcome => {
+      const editable = ensureEditableState();
+      if ("error" in editable) {
+        setError(editable.error);
+        setMessage(null);
+        return { ok: false, error: editable.error };
+      }
+      const meta = buildEventMeta();
+      const result = createPositionDomain(
+        editable.state,
+        {
+          id: createId(),
+          accountId: input.accountId,
+          assetType: input.assetType,
+          label: input.label,
+          marketValue: input.marketValue,
+        },
+        meta,
+      );
+      return applyDomainResult(result, "Position created in draft.");
+    },
+    [applyDomainResult, ensureEditableState],
+  );
+
+  const updatePosition = useCallback(
+    (input: {
+      positionId: string;
+      assetType: Position["assetType"];
+      label: string;
+      marketValue: number;
+    }): DomainActionOutcome => {
+      const editable = ensureEditableState();
+      if ("error" in editable) {
+        setError(editable.error);
+        setMessage(null);
+        return { ok: false, error: editable.error };
+      }
+      const meta = buildEventMeta();
+      const result = updatePositionDomain(
+        editable.state,
+        {
+          id: input.positionId,
+          assetType: input.assetType,
+          label: input.label,
+          marketValue: input.marketValue,
+        },
+        meta,
+      );
+      return applyDomainResult(result, "Position updated in draft.");
+    },
+    [applyDomainResult, ensureEditableState],
+  );
+
+  const deletePosition = useCallback(
+    (positionId: string): DomainActionOutcome => {
+      const editable = ensureEditableState();
+      if ("error" in editable) {
+        setError(editable.error);
+        setMessage(null);
+        return { ok: false, error: editable.error };
+      }
+      const meta = buildEventMeta();
+      const result = deletePositionDomain(editable.state, positionId, meta);
+      return applyDomainResult(result, "Position deleted in draft.");
+    },
+    [applyDomainResult, ensureEditableState],
+  );
+
+  const createGoal = useCallback(
+    (input: {
+      name: string;
+      targetAmount: number;
+      priority: number;
+      status: Goal["status"];
+      startDate?: string;
+      endDate?: string;
+    }): DomainActionOutcome => {
+      const editable = ensureEditableState();
+      if ("error" in editable) {
+        setError(editable.error);
+        setMessage(null);
+        return { ok: false, error: editable.error };
+      }
+      const meta = buildEventMeta();
+      const result = createGoalDomain(
+        editable.state,
+        {
+          id: createId(),
+          name: input.name,
+          targetAmount: input.targetAmount,
+          priority: input.priority,
+          status: input.status,
+          startDate: input.startDate,
+          endDate: input.endDate,
+        },
+        meta,
+      );
+      return applyDomainResult(result, "Goal created in draft.");
+    },
+    [applyDomainResult, ensureEditableState],
+  );
+
+  const updateGoal = useCallback(
+    (input: {
+      goalId: string;
+      name: string;
+      targetAmount: number;
+      priority: number;
+      status: Goal["status"];
+      startDate?: string;
+      endDate?: string;
+    }): DomainActionOutcome => {
+      const editable = ensureEditableState();
+      if ("error" in editable) {
+        setError(editable.error);
+        setMessage(null);
+        return { ok: false, error: editable.error };
+      }
+      const meta = buildEventMeta();
+      const result = updateGoalDomain(
+        editable.state,
+        {
+          id: input.goalId,
+          name: input.name,
+          targetAmount: input.targetAmount,
+          priority: input.priority,
+          status: input.status,
+          startDate: input.startDate,
+          endDate: input.endDate,
+        },
+        meta,
+      );
+      return applyDomainResult(result, "Goal updated in draft.");
+    },
+    [applyDomainResult, ensureEditableState],
+  );
+
+  const deleteGoal = useCallback(
+    (goalId: string): DomainActionOutcome => {
+      const editable = ensureEditableState();
+      if ("error" in editable) {
+        setError(editable.error);
+        setMessage(null);
+        return { ok: false, error: editable.error };
+      }
+      const meta = buildEventMeta();
+      const result = deleteGoalDomain(editable.state, goalId, meta);
+      return applyDomainResult(result, "Goal deleted in draft.");
+    },
+    [applyDomainResult, ensureEditableState],
+  );
+
+  const createAllocation = useCallback(
+    (input: {
+      goalId: string;
+      positionId: string;
+      allocatedAmount: number;
+    }): DomainActionOutcome => {
+      const editable = ensureEditableState();
+      if ("error" in editable) {
+        setError(editable.error);
+        setMessage(null);
+        return { ok: false, error: editable.error };
+      }
+      const meta = buildEventMeta();
+      const result = createAllocationDomain(
+        editable.state,
+        {
+          id: createId(),
+          goalId: input.goalId,
+          positionId: input.positionId,
+          allocatedAmount: input.allocatedAmount,
+        },
+        meta,
+      );
+      return applyDomainResult(result, "Allocation created in draft.");
+    },
+    [applyDomainResult, ensureEditableState],
+  );
+
+  const updateAllocation = useCallback(
+    (allocationId: string, allocatedAmount: number): DomainActionOutcome => {
+      const editable = ensureEditableState();
+      if ("error" in editable) {
+        setError(editable.error);
+        setMessage(null);
+        return { ok: false, error: editable.error };
+      }
+      const meta = buildEventMeta();
+      const result = updateAllocationDomain(
+        editable.state,
+        { id: allocationId, allocatedAmount },
+        meta,
+      );
+      return applyDomainResult(result, "Allocation updated in draft.");
+    },
+    [applyDomainResult, ensureEditableState],
+  );
+
+  const deleteAllocation = useCallback(
+    (allocationId: string): DomainActionOutcome => {
+      const editable = ensureEditableState();
+      if ("error" in editable) {
+        setError(editable.error);
+        setMessage(null);
+        return { ok: false, error: editable.error };
+      }
+      const meta = buildEventMeta();
+      const result = deleteAllocationDomain(editable.state, allocationId, meta);
+      return applyDomainResult(result, "Allocation deleted in draft.");
+    },
+    [applyDomainResult, ensureEditableState],
+  );
+
+  const reduceAllocations = useCallback(
+    (reductions: { allocationId: string; amount: number }[]): DomainActionOutcome => {
+      const editable = ensureEditableState();
+      if ("error" in editable) {
+        setError(editable.error);
+        setMessage(null);
+        return { ok: false, error: editable.error };
+      }
+      const meta = buildEventMeta();
+      const result = reduceAllocationsDomain(editable.state, { reductions }, meta);
+      return applyDomainResult(result, "Allocations reduced in draft.");
+    },
+    [applyDomainResult, ensureEditableState],
+  );
 
   useEffect(() => {
     void loadFromCache();
@@ -513,25 +700,49 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       message,
       error,
       refresh,
-      applyDemoChange: handleDemoChange,
+      createAccount,
+      updateAccount,
+      deleteAccount,
+      createPosition,
+      updatePosition,
+      deletePosition,
+      createGoal,
+      updateGoal,
+      deleteGoal,
+      createAllocation,
+      updateAllocation,
+      deleteAllocation,
+      reduceAllocations,
       saveChanges,
       discardChanges,
     }),
     [
       activity,
+      createAccount,
+      createAllocation,
+      createGoal,
+      createPosition,
+      deleteAccount,
+      deleteAllocation,
+      deleteGoal,
+      deletePosition,
       discardChanges,
       draftState,
       error,
-      handleDemoChange,
       isOnline,
       isSignedIn,
       message,
       pendingEvents.length,
+      reduceAllocations,
       refresh,
       saveChanges,
       snapshotRecord,
       source,
       status,
+      updateAccount,
+      updateAllocation,
+      updateGoal,
+      updatePosition,
     ],
   );
 
