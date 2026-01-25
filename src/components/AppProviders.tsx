@@ -4,6 +4,7 @@ import { FluentProvider, webDarkTheme, webLightTheme } from "@fluentui/react-com
 import { useEffect, useMemo, useState } from "react";
 import { AppShell } from "@/components/AppShell";
 import { AuthProvider } from "@/components/AuthProvider";
+import { PersonalDataProvider } from "@/components/PersonalDataProvider";
 
 type ThemeMode = "light" | "dark";
 
@@ -41,9 +42,11 @@ export function AppProviders({ children }: { children: React.ReactNode }) {
   return (
     <FluentProvider theme={theme}>
       <AuthProvider>
-        <AppShell mode={mode} onModeChange={setMode}>
-          {children}
-        </AppShell>
+        <PersonalDataProvider>
+          <AppShell mode={mode} onModeChange={setMode}>
+            {children}
+          </AppShell>
+        </PersonalDataProvider>
       </AuthProvider>
     </FluentProvider>
   );

@@ -38,6 +38,9 @@ const getUserMessage = (error: unknown): string => {
     if (error.code === "rate_limited") {
       return "Too many requests. Please wait and try again.";
     }
+    if (error.code === "precondition_failed") {
+      return "The data changed on OneDrive. Please reload and try again.";
+    }
     if (error.code === "network_error") {
       return "Network error. Check your connection and try again.";
     }

@@ -21,7 +21,7 @@ type GraphClientOptions = {
   onRetry?: (info: GraphRetryInfo) => void;
 };
 
-type GraphResponse<T> = {
+export type GraphResponse<T> = {
   data: T;
   headers: Headers;
 };
@@ -67,6 +67,8 @@ const toGraphError = async (response: Response): Promise<GraphError> => {
     code = "forbidden";
   } else if (status === 404) {
     code = "not_found";
+  } else if (status === 412) {
+    code = "precondition_failed";
   } else if (status === 429) {
     code = "rate_limited";
   }
@@ -150,6 +152,18 @@ const requestGraph = async <T>(
 };
 
 export const createGraphClient = ({ accessTokenProvider, onRetry }: GraphClientOptions) => ({
+  getJsonWithHeaders: async (path: string, scopes: string[]) =>
+    requestGraph<unknown>(
+      path,
+      {
+        method: "GET",
+        headers: {
+          Accept: "application/json",
+        },
+      },
+      { scopes, responseType: "json", onRetry },
+      accessTokenProvider,
+    ),
   getJson: async (path: string, scopes: string[]) =>
     (
       await requestGraph<unknown>(
@@ -164,6 +178,18 @@ export const createGraphClient = ({ accessTokenProvider, onRetry }: GraphClientO
         accessTokenProvider,
       )
     ).data,
+  getTextWithHeaders: async (path: string, scopes: string[]) =>
+    requestGraph<string>(
+      path,
+      {
+        method: "GET",
+        headers: {
+          Accept: "text/plain",
+        },
+      },
+      { scopes, responseType: "text", onRetry },
+      accessTokenProvider,
+    ),
   getText: async (path: string, scopes: string[]) =>
     (
       await requestGraph<string>(
@@ -178,7 +204,26 @@ export const createGraphClient = ({ accessTokenProvider, onRetry }: GraphClientO
         accessTokenProvider,
       )
     ).data,
-  putJson: async (path: string, body: unknown, scopes: string[]) =>
+  putJsonWithHeaders: async (
+    path: string,
+    body: unknown,
+    scopes: string[],
+    options?: { ifMatch?: string },
+  ) =>
+    requestGraph<unknown>(
+      path,
+      {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          ...(options?.ifMatch ? { "If-Match": options.ifMatch } : {}),
+        },
+        body: JSON.stringify(body),
+      },
+      { scopes, responseType: "json", onRetry },
+      accessTokenProvider,
+    ),
+  putJson: async (path: string, body: unknown, scopes: string[], options?: { ifMatch?: string }) =>
     (
       await requestGraph<unknown>(
         path,
@@ -186,6 +231,7 @@ export const createGraphClient = ({ accessTokenProvider, onRetry }: GraphClientO
           method: "PUT",
           headers: {
             "Content-Type": "application/json",
+            ...(options?.ifMatch ? { "If-Match": options.ifMatch } : {}),
           },
           body: JSON.stringify(body),
         },
@@ -193,7 +239,7 @@ export const createGraphClient = ({ accessTokenProvider, onRetry }: GraphClientO
         accessTokenProvider,
       )
     ).data,
-  putText: async (path: string, body: string, scopes: string[]) =>
+  putText: async (path: string, body: string, scopes: string[], options?: { ifMatch?: string }) =>
     (
       await requestGraph<unknown>(
         path,
@@ -201,8 +247,24 @@ export const createGraphClient = ({ accessTokenProvider, onRetry }: GraphClientO
           method: "PUT",
           headers: {
             "Content-Type": "text/plain",
+            ...(options?.ifMatch ? { "If-Match": options.ifMatch } : {}),
           },
           body,
+        },
+        { scopes, responseType: "json", onRetry },
+        accessTokenProvider,
+      )
+    ).data,
+  postJson: async (path: string, body: unknown, scopes: string[]) =>
+    (
+      await requestGraph<unknown>(
+        path,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(body),
         },
         { scopes, responseType: "json", onRetry },
         accessTokenProvider,

@@ -6,6 +6,7 @@ export type GraphErrorCode =
   | "unauthorized"
   | "forbidden"
   | "not_found"
+  | "precondition_failed"
   | "unknown";
 
 export class GraphError extends Error {
@@ -30,3 +31,6 @@ export class GraphError extends Error {
 }
 
 export const isGraphError = (value: unknown): value is GraphError => value instanceof GraphError;
+
+export const isPreconditionFailed = (value: unknown): value is GraphError =>
+  value instanceof GraphError && value.code === "precondition_failed";
