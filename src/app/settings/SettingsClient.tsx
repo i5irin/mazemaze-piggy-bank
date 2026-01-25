@@ -3,11 +3,16 @@
 import { Button, Spinner, Text } from "@fluentui/react-components";
 import { useCallback, useMemo, useState } from "react";
 import { useAuth } from "@/components/AuthProvider";
+import { useSharedSelection } from "@/components/SharedSelectionProvider";
 import { isAuthError } from "@/lib/auth/authErrors";
 import { getGraphScopes } from "@/lib/auth/msalConfig";
 import { createGraphClient } from "@/lib/graph/graphClient";
 import { isGraphError } from "@/lib/graph/graphErrors";
-import { DEFAULT_TEST_FILE_NAME, createOneDriveService } from "@/lib/onedrive/oneDriveService";
+import {
+  DEFAULT_TEST_FILE_NAME,
+  createOneDriveService,
+  type SharedRootReference,
+} from "@/lib/onedrive/oneDriveService";
 
 type OperationState = {
   status: "idle" | "working" | "success" | "error";
@@ -118,9 +123,25 @@ const getUserMessage = (error: unknown): string => {
   return "Something went wrong. Please try again.";
 };
 
+const buildExportTimestamp = (): string => new Date().toISOString().replace(/[:.]/g, "-");
+
+const downloadBlob = (blob: Blob, filename: string) => {
+  const url = window.URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  window.URL.revokeObjectURL(url);
+};
+
 export function SettingsClient() {
   const { status, account, error, signIn, signOut, getAccessToken } = useAuth();
+  const { selection } = useSharedSelection();
   const [driveState, setDriveState] = useState<OperationState>({
+    status: "idle",
+    message: null,
+  });
+  const [exportState, setExportState] = useState<OperationState>({
     status: "idle",
     message: null,
   });
@@ -154,6 +175,20 @@ export function SettingsClient() {
   );
 
   const appRootLabel = process.env.NEXT_PUBLIC_ONEDRIVE_APP_ROOT ?? "/Apps/PiggyBank/";
+  const sharedRoot = useMemo<SharedRootReference | null>(() => {
+    if (!selection) {
+      return null;
+    }
+    return {
+      sharedId: selection.sharedId,
+      driveId: selection.driveId,
+      itemId: selection.itemId,
+    };
+  }, [selection]);
+  const sharedLocationLabel = useMemo(
+    () => (selection ? `${selection.name} (${selection.sharedId})` : "Not selected"),
+    [selection],
+  );
 
   const signInStatus =
     status === "loading"
@@ -166,6 +201,7 @@ export function SettingsClient() {
 
   const isSignedIn = status === "signed_in";
   const isWorking = driveState.status === "working";
+  const isExportWorking = exportState.status === "working";
   const isAuthLoading = status === "loading";
   const isAuthBlocked = status === "error";
 
@@ -235,6 +271,97 @@ export function SettingsClient() {
     }
   }, [oneDrive]);
 
+  const handleExportSnapshot = useCallback(
+    async (scope: "personal" | "shared") => {
+      if (!isSignedIn) {
+        setExportState({ status: "error", message: "Sign in to export data." });
+        return;
+      }
+      if (scope === "shared" && !sharedRoot) {
+        setExportState({ status: "error", message: "Select a shared space first." });
+        return;
+      }
+      setExportState({
+        status: "working",
+        message: `Preparing ${scope} snapshot export...`,
+      });
+      try {
+        const timestamp = buildExportTimestamp();
+        if (scope === "personal") {
+          await oneDrive.ensureAppRoot();
+          const result = await oneDrive.readPersonalSnapshot();
+          const payload = JSON.stringify(result.snapshot, null, 2);
+          downloadBlob(
+            new Blob([payload], { type: "application/json" }),
+            `piggy-bank-personal-snapshot-${timestamp}.json`,
+          );
+        } else {
+          const result = await oneDrive.readSharedSnapshot(sharedRoot as SharedRootReference);
+          const payload = JSON.stringify(result.snapshot, null, 2);
+          downloadBlob(
+            new Blob([payload], { type: "application/json" }),
+            `piggy-bank-shared-snapshot-${timestamp}.json`,
+          );
+        }
+        setExportState({
+          status: "success",
+          message: `Downloaded ${scope} snapshot.`,
+        });
+      } catch (err) {
+        setExportState({ status: "error", message: getUserMessage(err) });
+      }
+    },
+    [isSignedIn, oneDrive, sharedRoot],
+  );
+
+  const handleExportEvents = useCallback(
+    async (scope: "personal" | "shared") => {
+      if (!isSignedIn) {
+        setExportState({ status: "error", message: "Sign in to export data." });
+        return;
+      }
+      if (scope === "shared" && !sharedRoot) {
+        setExportState({ status: "error", message: "Select a shared space first." });
+        return;
+      }
+      setExportState({
+        status: "working",
+        message: `Preparing ${scope} event export...`,
+      });
+      try {
+        const timestamp = buildExportTimestamp();
+        const chunkIds =
+          scope === "personal"
+            ? await oneDrive.listEventChunkIds()
+            : await oneDrive.listSharedEventChunkIds(sharedRoot as SharedRootReference);
+        if (chunkIds.length === 0) {
+          setExportState({ status: "error", message: "No event logs found to export." });
+          return;
+        }
+        const sortedChunkIds = [...chunkIds].sort((a, b) => a - b);
+        const chunks = await Promise.all(
+          sortedChunkIds.map((chunkId) =>
+            scope === "personal"
+              ? oneDrive.readEventChunk(chunkId)
+              : oneDrive.readSharedEventChunk(sharedRoot as SharedRootReference, chunkId),
+          ),
+        );
+        const payload = chunks.join("\n");
+        downloadBlob(
+          new Blob([payload], { type: "text/plain" }),
+          `piggy-bank-${scope}-events-${timestamp}.jsonl`,
+        );
+        setExportState({
+          status: "success",
+          message: `Downloaded ${scope} event logs.`,
+        });
+      } catch (err) {
+        setExportState({ status: "error", message: getUserMessage(err) });
+      }
+    },
+    [isSignedIn, oneDrive, sharedRoot],
+  );
+
   return (
     <div className="section-stack">
       <section className="app-surface">
@@ -248,8 +375,12 @@ export function SettingsClient() {
           <div style={{ fontWeight: 600 }}>{signInStatus}</div>
         </div>
         <div className="app-surface">
-          <div className="app-muted">Data location</div>
+          <div className="app-muted">Personal data location</div>
           <div style={{ fontWeight: 600 }}>{appRootLabel}</div>
+        </div>
+        <div className="app-surface">
+          <div className="app-muted">Shared data location</div>
+          <div style={{ fontWeight: 600 }}>{sharedLocationLabel}</div>
         </div>
         <div className="app-surface">
           <div className="app-muted">Offline mode</div>
@@ -315,9 +446,63 @@ export function SettingsClient() {
       </section>
 
       <section className="app-surface">
+        <h2>Export</h2>
+        <p className="app-muted">
+          Download snapshots and event logs for personal data or the selected shared space.
+        </p>
+        <div className="app-actions">
+          <Button
+            onClick={() => handleExportSnapshot("personal")}
+            disabled={!isSignedIn || isExportWorking}
+          >
+            Download personal snapshot
+          </Button>
+          <Button
+            onClick={() => handleExportEvents("personal")}
+            disabled={!isSignedIn || isExportWorking}
+          >
+            Download personal events
+          </Button>
+          <Button
+            onClick={() => handleExportSnapshot("shared")}
+            disabled={!isSignedIn || isExportWorking || !sharedRoot}
+          >
+            Download shared snapshot
+          </Button>
+          <Button
+            onClick={() => handleExportEvents("shared")}
+            disabled={!isSignedIn || isExportWorking || !sharedRoot}
+          >
+            Download shared events
+          </Button>
+          {isExportWorking ? <Spinner size="tiny" /> : null}
+        </div>
+        {exportState.message ? (
+          <div
+            className={`app-alert ${exportState.status === "error" ? "app-alert-error" : ""}`}
+            role="status"
+          >
+            <Text>{exportState.message}</Text>
+          </div>
+        ) : null}
+      </section>
+
+      <section className="app-surface">
         <h2>Data safety</h2>
         <p className="app-muted">
-          Your OneDrive folder is used by the app. Deleting it resets all data.
+          The app stores data in your OneDrive folders. Deleting the personal app folder or the
+          selected shared folder resets the data in that space.
+        </p>
+        <p className="app-muted">
+          Avoid editing or renaming files inside the app folders. If you need a backup, copy the
+          folder instead of editing it in place.
+        </p>
+        <p className="app-muted">
+          To reset, delete the entire root folder in OneDrive. This permanently removes snapshots,
+          events, and lease files.
+        </p>
+        <p className="app-muted">
+          If you delete a shared folder, all collaborators lose access to that shared data.
         </p>
       </section>
     </div>

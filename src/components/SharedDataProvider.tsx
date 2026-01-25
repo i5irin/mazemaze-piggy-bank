@@ -2,10 +2,26 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { useAuth } from "@/components/AuthProvider";
+import { useSharedSelection } from "@/components/SharedSelectionProvider";
+import type {
+  DataActivity,
+  DataContextValue,
+  DataSource,
+  DataStatus,
+  DomainActionOutcome,
+  SpaceInfo,
+} from "@/components/dataContext";
 import { getGraphScopes } from "@/lib/auth/msalConfig";
 import { createGraphClient } from "@/lib/graph/graphClient";
 import { isGraphError, isPreconditionFailed } from "@/lib/graph/graphErrors";
-import { createOneDriveService, type LeaseRecord } from "@/lib/onedrive/oneDriveService";
+import {
+  createOneDriveService,
+  decodeSharedId,
+  encodeSharedId,
+  type LeaseRecord,
+  type SharedRootInfo,
+  type SharedRootReference,
+} from "@/lib/onedrive/oneDriveService";
 import {
   assignEventVersions,
   buildEventChunks,
@@ -33,14 +49,6 @@ import { createEmptySnapshot, type Snapshot } from "@/lib/persistence/snapshot";
 import { readSnapshotCache, writeSnapshotCache } from "@/lib/persistence/snapshotCache";
 import { useOnlineStatus } from "@/lib/persistence/useOnlineStatus";
 import type { Goal, NormalizedState, Position } from "@/lib/persistence/types";
-import type {
-  DataActivity,
-  DataContextValue,
-  DataSource,
-  DataStatus,
-  DomainActionOutcome,
-  SpaceInfo,
-} from "@/components/dataContext";
 
 const MAX_EVENTS_PER_CHUNK = 500;
 const LEASE_DURATION_MS = 90_000;
@@ -51,7 +59,12 @@ type SnapshotRecord = {
   etag: string | null;
 };
 
-const PersonalDataContext = createContext<DataContextValue | null>(null);
+type SharedRootState = {
+  info: SharedRootInfo;
+  reference: SharedRootReference;
+};
+
+const SharedDataContext = createContext<DataContextValue | null>(null);
 
 const formatGraphError = (error: unknown): string => {
   if (isGraphError(error)) {
@@ -86,20 +99,29 @@ const buildEventMeta = () => ({
   createdAt: new Date().toISOString(),
 });
 
-export function PersonalDataProvider({ children }: { children: React.ReactNode }) {
+const resolveSharedReference = (sharedId: string): SharedRootReference | null => {
+  const decoded = decodeSharedId(sharedId);
+  if (!decoded) {
+    return null;
+  }
+  return {
+    sharedId: encodeSharedId(decoded.driveId, decoded.itemId),
+    driveId: decoded.driveId,
+    itemId: decoded.itemId,
+  };
+};
+
+export function SharedDataProvider({
+  sharedId,
+  children,
+}: {
+  sharedId: string;
+  children: React.ReactNode;
+}) {
   const { status: authStatus, account, getAccessToken } = useAuth();
+  const { selection, setSelection } = useSharedSelection();
   const isOnline = useOnlineStatus();
   const isSignedIn = authStatus === "signed_in";
-  const canWrite = true;
-  const readOnlyReason = null;
-
-  const space = useMemo<SpaceInfo>(
-    () => ({
-      scope: "personal",
-      label: "Personal",
-    }),
-    [],
-  );
 
   const [status, setStatus] = useState<DataStatus>("idle");
   const [activity, setActivity] = useState<DataActivity>("idle");
@@ -111,6 +133,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
   const [error, setError] = useState<string | null>(null);
   const [lease, setLease] = useState<LeaseRecord | null>(null);
   const [leaseError, setLeaseError] = useState<string | null>(null);
+  const [rootState, setRootState] = useState<SharedRootState | null>(null);
 
   const graphScopes = useMemo(() => getGraphScopes(), []);
   const tokenProvider = useCallback((scopes: string[]) => getAccessToken(scopes), [getAccessToken]);
@@ -128,6 +151,50 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     [graphClient, graphScopes],
   );
 
+  const sharedReference = useMemo(() => resolveSharedReference(sharedId), [sharedId]);
+
+  const canWrite = rootState?.info.canWrite ?? false;
+  const readOnlyReason =
+    rootState && !rootState.info.canWrite ? "This shared space is read-only." : null;
+
+  const space = useMemo<SpaceInfo>(() => {
+    if (!rootState) {
+      if (selection && selection.sharedId === sharedId) {
+        return {
+          scope: "shared",
+          label: selection.name,
+          sharedId: selection.sharedId,
+          driveId: selection.driveId,
+          itemId: selection.itemId,
+          webUrl: selection.webUrl,
+        };
+      }
+      return {
+        scope: "shared",
+        label: "Shared",
+        sharedId,
+      };
+    }
+    return {
+      scope: "shared",
+      label: rootState.info.name,
+      sharedId: rootState.reference.sharedId,
+      driveId: rootState.reference.driveId,
+      itemId: rootState.reference.itemId,
+      webUrl: rootState.info.webUrl,
+    };
+  }, [rootState, selection, sharedId]);
+
+  const buildLeasePayload = useCallback((): LeaseRecord => {
+    const now = new Date();
+    const holderLabel = account?.name ?? account?.username ?? "Anonymous";
+    return {
+      holderLabel,
+      leaseUntil: new Date(now.getTime() + LEASE_DURATION_MS).toISOString(),
+      updatedAt: now.toISOString(),
+    };
+  }, [account]);
+
   const applySnapshot = useCallback(
     (snapshot: Snapshot, etag: string | null, sourceType: DataSource, notice: string | null) => {
       setSnapshotRecord({ snapshot, etag });
@@ -141,21 +208,54 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     [],
   );
 
-  const loadLeaseFromRemote = useCallback(async () => {
-    try {
-      const result = await oneDrive.readPersonalLease();
-      setLease(result);
-      setLeaseError(null);
-    } catch (err) {
-      setLeaseError(formatGraphError(err));
+  const ensureRootInfo = useCallback(async (): Promise<SharedRootState> => {
+    if (rootState) {
+      return rootState;
     }
-  }, [oneDrive]);
+    if (!sharedReference) {
+      throw new Error("Invalid shared space id.");
+    }
+    const info = await oneDrive.getSharedRootInfo(sharedReference);
+    if (!info.isFolder) {
+      throw new Error("The shared item is not a folder. Please select a shared folder.");
+    }
+    const nextState = { info, reference: sharedReference };
+    setRootState(nextState);
+    setSelection({
+      sharedId: info.sharedId,
+      driveId: info.driveId,
+      itemId: info.itemId,
+      name: info.name,
+      webUrl: info.webUrl,
+    });
+    return nextState;
+  }, [oneDrive, rootState, setSelection, sharedReference]);
+
+  const loadLeaseFromRemote = useCallback(
+    async (root: SharedRootReference) => {
+      try {
+        const result = await oneDrive.readSharedLease(root);
+        setLease(result);
+        setLeaseError(null);
+      } catch (err) {
+        setLeaseError(formatGraphError(err));
+      }
+    },
+    [oneDrive],
+  );
 
   const loadFromCache = useCallback(async () => {
     setStatus("loading");
     setActivity("loading");
     try {
-      const cached = await readSnapshotCache("personal");
+      if (!sharedReference) {
+        setStatus("error");
+        setSource("empty");
+        setMessage(null);
+        setError("Invalid shared space id.");
+        return;
+      }
+      const cached = await readSnapshotCache(`shared:${sharedReference.sharedId}`);
       if (cached) {
         applySnapshot(cached.snapshot, cached.etag, "cache", "Loaded cached data.");
         setLease(null);
@@ -174,18 +274,18 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     } finally {
       setActivity("idle");
     }
-  }, [applySnapshot]);
+  }, [applySnapshot, sharedReference]);
 
   const loadFromRemote = useCallback(async () => {
     setStatus("loading");
     setActivity("loading");
     try {
-      await oneDrive.ensureAppRoot();
-      const result = await oneDrive.readPersonalSnapshot();
+      const root = await ensureRootInfo();
+      const result = await oneDrive.readSharedSnapshot(root.reference);
       applySnapshot(result.snapshot, result.etag, "remote", "Synced from OneDrive.");
-      void loadLeaseFromRemote();
+      void loadLeaseFromRemote(root.reference);
       await writeSnapshotCache({
-        key: "personal",
+        key: `shared:${root.reference.sharedId}`,
         snapshot: result.snapshot,
         etag: result.etag,
         cachedAt: new Date().toISOString(),
@@ -193,9 +293,17 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     } catch (err) {
       if (isGraphError(err) && err.status === 404) {
         try {
+          const root = await ensureRootInfo();
+          if (!root.info.canWrite) {
+            setStatus("error");
+            setSource("empty");
+            setMessage(null);
+            setError("No snapshot exists yet, and this shared space is read-only.");
+            return;
+          }
           const now = new Date().toISOString();
           const emptySnapshot = createEmptySnapshot(now);
-          const result = await oneDrive.writePersonalSnapshot(emptySnapshot);
+          const result = await oneDrive.writeSharedSnapshot(root.reference, emptySnapshot);
           applySnapshot(
             emptySnapshot,
             result.etag,
@@ -203,7 +311,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
             "No snapshot found yet. Add accounts or goals to create your first snapshot.",
           );
           await writeSnapshotCache({
-            key: "personal",
+            key: `shared:${root.reference.sharedId}`,
             snapshot: emptySnapshot,
             etag: result.etag,
             cachedAt: now,
@@ -230,7 +338,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     } finally {
       setActivity("idle");
     }
-  }, [applySnapshot, loadFromCache, loadLeaseFromRemote, oneDrive]);
+  }, [applySnapshot, ensureRootInfo, loadFromCache, loadLeaseFromRemote, oneDrive]);
 
   const refresh = useCallback(async () => {
     if (!isOnline || !isSignedIn) {
@@ -265,6 +373,14 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       setMessage("Sign in to save changes.");
       return;
     }
+    if (!sharedReference) {
+      setError("Invalid shared space id.");
+      return;
+    }
+    if (!canWrite) {
+      setMessage("This shared space is read-only.");
+      return;
+    }
     if (!snapshotRecord || !draftState) {
       setError("No snapshot is loaded yet.");
       return;
@@ -289,13 +405,13 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     };
 
     try {
-      await oneDrive.ensureAppRoot();
-      await oneDrive.ensureEventsFolder();
-      const chunkIds = await oneDrive.listEventChunkIds();
+      const root = await ensureRootInfo();
+      await oneDrive.ensureSharedEventsFolder(root.reference);
+      const chunkIds = await oneDrive.listSharedEventChunkIds(root.reference);
       const nextChunkId = chunkIds.length === 0 ? 1 : Math.max(...chunkIds) + 1;
       const chunks = buildEventChunks(versionedEvents, nextChunkId, MAX_EVENTS_PER_CHUNK, now);
 
-      const writeResult = await oneDrive.writePersonalSnapshot(nextSnapshot, {
+      const writeResult = await oneDrive.writeSharedSnapshot(root.reference, nextSnapshot, {
         ifMatch: snapshotRecord.etag,
       });
 
@@ -309,14 +425,18 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       setError(null);
 
       await writeSnapshotCache({
-        key: "personal",
+        key: `shared:${root.reference.sharedId}`,
         snapshot: nextSnapshot,
         etag: nextEtag,
         cachedAt: now,
       });
       try {
         for (const chunk of chunks) {
-          await oneDrive.writeEventChunk(chunk.chunkId, serializeEventChunk(chunk));
+          await oneDrive.writeSharedEventChunk(
+            root.reference,
+            chunk.chunkId,
+            serializeEventChunk(chunk),
+          );
         }
       } catch (eventError) {
         setMessage(
@@ -333,29 +453,29 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     } finally {
       setActivity("idle");
     }
-  }, [draftState, handleConflict, isOnline, isSignedIn, oneDrive, pendingEvents, snapshotRecord]);
-
-  const buildLeasePayload = useCallback((): LeaseRecord => {
-    const now = new Date();
-    const holderLabel = account?.name ?? account?.username ?? "Anonymous";
-    return {
-      holderLabel,
-      leaseUntil: new Date(now.getTime() + LEASE_DURATION_MS).toISOString(),
-      updatedAt: now.toISOString(),
-    };
-  }, [account]);
+  }, [
+    canWrite,
+    draftState,
+    ensureRootInfo,
+    handleConflict,
+    isOnline,
+    isSignedIn,
+    oneDrive,
+    pendingEvents,
+    sharedReference,
+    snapshotRecord,
+  ]);
 
   useEffect(() => {
-    if (pendingEvents.length === 0 || !isOnline || !isSignedIn || !canWrite) {
+    if (pendingEvents.length === 0 || !isOnline || !isSignedIn || !canWrite || !sharedReference) {
       return;
     }
     let isActive = true;
     const updateLease = async () => {
       try {
-        await oneDrive.ensureAppRoot();
-        await oneDrive.ensureLeasesFolder();
+        await oneDrive.ensureSharedLeasesFolder(sharedReference);
         const payload = buildLeasePayload();
-        await oneDrive.writePersonalLease(payload);
+        await oneDrive.writeSharedLease(sharedReference, payload);
         if (isActive) {
           setLease(payload);
           setLeaseError(null);
@@ -374,7 +494,15 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       isActive = false;
       window.clearInterval(intervalId);
     };
-  }, [buildLeasePayload, canWrite, isOnline, isSignedIn, oneDrive, pendingEvents.length]);
+  }, [
+    buildLeasePayload,
+    canWrite,
+    isOnline,
+    isSignedIn,
+    oneDrive,
+    pendingEvents.length,
+    sharedReference,
+  ]);
 
   const ensureEditableState = useCallback((): { state: NormalizedState } | { error: string } => {
     if (!isOnline) {
@@ -384,7 +512,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       return { error: "Sign in to edit." };
     }
     if (!canWrite) {
-      return { error: readOnlyReason ?? "This space is read-only." };
+      return { error: readOnlyReason ?? "This shared space is read-only." };
     }
     if (!draftState) {
       return { error: "No snapshot is loaded yet." };
@@ -419,7 +547,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       const meta = buildEventMeta();
       const result = createAccountDomain(
         editable.state,
-        { id: createId(), name, scope: "personal" },
+        { id: createId(), name, scope: "shared" },
         meta,
       );
       return applyDomainResult(result, "Account created in draft.");
@@ -551,7 +679,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
         editable.state,
         {
           id: createId(),
-          scope: "personal",
+          scope: "shared",
           name: input.name,
           targetAmount: input.targetAmount,
           priority: input.priority,
@@ -757,8 +885,8 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       leaseError,
       message,
       pendingEvents.length,
-      reduceAllocations,
       readOnlyReason,
+      reduceAllocations,
       refresh,
       saveChanges,
       snapshotRecord,
@@ -772,13 +900,13 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     ],
   );
 
-  return <PersonalDataContext.Provider value={value}>{children}</PersonalDataContext.Provider>;
+  return <SharedDataContext.Provider value={value}>{children}</SharedDataContext.Provider>;
 }
 
-export const usePersonalData = (): DataContextValue => {
-  const context = useContext(PersonalDataContext);
+export const useSharedData = (): DataContextValue => {
+  const context = useContext(SharedDataContext);
   if (!context) {
-    throw new Error("PersonalDataProvider is missing in the component tree.");
+    throw new Error("SharedDataProvider is missing in the component tree.");
   }
   return context;
 };

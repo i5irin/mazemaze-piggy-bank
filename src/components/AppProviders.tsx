@@ -5,6 +5,7 @@ import { useEffect, useMemo, useState } from "react";
 import { AppShell } from "@/components/AppShell";
 import { AuthProvider } from "@/components/AuthProvider";
 import { PersonalDataProvider } from "@/components/PersonalDataProvider";
+import { SharedSelectionProvider } from "@/components/SharedSelectionProvider";
 
 type ThemeMode = "light" | "dark";
 
@@ -42,11 +43,13 @@ export function AppProviders({ children }: { children: React.ReactNode }) {
   return (
     <FluentProvider theme={theme}>
       <AuthProvider>
-        <PersonalDataProvider>
-          <AppShell mode={mode} onModeChange={setMode}>
-            {children}
-          </AppShell>
-        </PersonalDataProvider>
+        <SharedSelectionProvider>
+          <PersonalDataProvider>
+            <AppShell mode={mode} onModeChange={setMode}>
+              {children}
+            </AppShell>
+          </PersonalDataProvider>
+        </SharedSelectionProvider>
       </AuthProvider>
     </FluentProvider>
   );

@@ -41,7 +41,9 @@ export function AppShell({ children, mode, onModeChange }: AppShellProps) {
       <nav className="app-nav" aria-label="Primary">
         {navItems.map((item) => {
           const isActive =
-            pathname === item.href || (item.href === "/dashboard" && pathname === "/");
+            pathname === item.href ||
+            (item.href === "/dashboard" && pathname === "/") ||
+            (item.href === "/shared" && pathname.startsWith("/shared"));
           return (
             <Link
               key={item.href}

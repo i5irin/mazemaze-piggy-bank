@@ -5,7 +5,7 @@ const DB_VERSION = 1;
 const STORE_NAME = "snapshot";
 
 export type CachedSnapshot = {
-  key: "personal";
+  key: string;
   snapshot: Snapshot;
   etag: string | null;
   cachedAt: string;
@@ -24,7 +24,7 @@ const openDatabase = (): Promise<IDBDatabase> =>
     request.onerror = () => reject(request.error);
   });
 
-export const readSnapshotCache = async (): Promise<CachedSnapshot | null> => {
+export const readSnapshotCache = async (key: string): Promise<CachedSnapshot | null> => {
   if (typeof indexedDB === "undefined") {
     return null;
   }
@@ -32,7 +32,7 @@ export const readSnapshotCache = async (): Promise<CachedSnapshot | null> => {
   return new Promise<CachedSnapshot | null>((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, "readonly");
     const store = tx.objectStore(STORE_NAME);
-    const request = store.get("personal");
+    const request = store.get(key);
     request.onsuccess = () => resolve((request.result as CachedSnapshot | undefined) ?? null);
     request.onerror = () => reject(request.error);
     tx.oncomplete = () => db.close();

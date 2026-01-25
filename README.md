@@ -46,6 +46,7 @@ Data is stored in the user's OneDrive in the following structure.
 - **Snapshot**: A normalized JSON file holding the current state of Accounts, Positions, Goals, and Allocations.
 - **Events**: Chunked log files for auditing and recovery.
 - **Lease**: Temporary files used to control the UX for concurrent editing conflicts.
+- **Shared data**: Shared folders must live under `/Apps/PiggyBank/shared/` to appear in the Shared list.
 
 ---
 

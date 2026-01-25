@@ -1,5 +1,13 @@
 import type { PendingEvent } from "./eventChunk";
-import type { Account, Allocation, AssetType, Goal, NormalizedState, Position } from "./types";
+import type {
+  Account,
+  Allocation,
+  AssetType,
+  Goal,
+  NormalizedState,
+  Position,
+  Scope,
+} from "./types";
 
 export type DomainActionResult =
   | { nextState: NormalizedState; events: PendingEvent[] }
@@ -117,7 +125,7 @@ export const recalculateAllocations = (
 
 export const createAccount = (
   state: NormalizedState,
-  input: { id: string; name: string },
+  input: { id: string; name: string; scope?: Scope },
   meta: EventMeta,
 ): DomainActionResult => {
   const trimmedName = input.name.trim();
@@ -130,7 +138,7 @@ export const createAccount = (
   }
   const account: Account = {
     id: input.id,
-    scope: "personal",
+    scope: input.scope ?? "personal",
     name: trimmedName,
   };
   return {
@@ -360,6 +368,7 @@ export const createGoal = (
   state: NormalizedState,
   input: {
     id: string;
+    scope?: Scope;
     name: string;
     targetAmount: number;
     priority: number;
@@ -388,7 +397,7 @@ export const createGoal = (
   }
   const goal: Goal = {
     id: input.id,
-    scope: "personal",
+    scope: input.scope ?? "personal",
     name: trimmedName,
     targetAmount: input.targetAmount,
     priority: input.priority,
