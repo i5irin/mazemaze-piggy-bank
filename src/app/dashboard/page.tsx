@@ -18,9 +18,7 @@ export default function DashboardPage() {
     <div className="section-stack">
       <section className="app-surface">
         <h1>Dashboard</h1>
-        <p className="app-muted">
-          Overview of your latest snapshot and goal progress.
-        </p>
+        <p className="app-muted">Overview of your latest snapshot and goal progress.</p>
       </section>
 
       <section className="card-grid">

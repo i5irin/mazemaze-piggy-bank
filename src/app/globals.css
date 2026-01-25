@@ -116,6 +116,54 @@ a {
   color: var(--app-subtle-dark);
 }
 
+.app-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+}
+
+.app-alert {
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid var(--app-border);
+  background: color-mix(in srgb, var(--app-surface) 92%, transparent);
+}
+
+[data-theme="dark"] .app-alert {
+  border-color: var(--app-border-dark);
+  background: color-mix(in srgb, var(--app-surface-dark) 92%, transparent);
+}
+
+.app-alert-error {
+  border-color: color-mix(in srgb, #d13438 70%, var(--app-border));
+  background: color-mix(in srgb, #d13438 12%, var(--app-surface));
+}
+
+[data-theme="dark"] .app-alert-error {
+  border-color: color-mix(in srgb, #f1707b 65%, var(--app-border-dark));
+  background: color-mix(in srgb, #f1707b 18%, var(--app-surface-dark));
+}
+
+.app-code {
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid var(--app-border);
+  background: color-mix(in srgb, var(--app-surface) 92%, transparent);
+  font-family:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",
+    monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
+[data-theme="dark"] .app-code {
+  border-color: var(--app-border-dark);
+  background: color-mix(in srgb, var(--app-surface-dark) 92%, transparent);
+}
+
 .app-nav {
   display: grid;
   grid-auto-flow: column;

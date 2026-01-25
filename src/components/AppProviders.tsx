@@ -1,12 +1,9 @@
 "use client";
 
-import {
-  FluentProvider,
-  webDarkTheme,
-  webLightTheme,
-} from "@fluentui/react-components";
+import { FluentProvider, webDarkTheme, webLightTheme } from "@fluentui/react-components";
 import { useEffect, useMemo, useState } from "react";
 import { AppShell } from "@/components/AppShell";
+import { AuthProvider } from "@/components/AuthProvider";
 
 type ThemeMode = "light" | "dark";
 
@@ -39,16 +36,15 @@ export function AppProviders({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
-  const theme = useMemo(
-    () => (mode === "dark" ? webDarkTheme : webLightTheme),
-    [mode],
-  );
+  const theme = useMemo(() => (mode === "dark" ? webDarkTheme : webLightTheme), [mode]);
 
   return (
     <FluentProvider theme={theme}>
-      <AppShell mode={mode} onModeChange={setMode}>
-        {children}
-      </AppShell>
+      <AuthProvider>
+        <AppShell mode={mode} onModeChange={setMode}>
+          {children}
+        </AppShell>
+      </AuthProvider>
     </FluentProvider>
   );
 }

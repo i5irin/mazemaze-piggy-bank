@@ -35,10 +35,10 @@ export default function AccountsPage() {
         {accounts.map((account) => (
           <div key={account.name} className="app-surface">
             <div style={{ fontWeight: 600 }}>{account.name}</div>
-            <div className="app-muted">{account.scope} · {account.positions}</div>
-            <div style={{ marginTop: 8, fontSize: "20px", fontWeight: 600 }}>
-              {account.balance}
+            <div className="app-muted">
+              {account.scope} · {account.positions}
             </div>
+            <div style={{ marginTop: 8, fontSize: "20px", fontWeight: 600 }}>{account.balance}</div>
           </div>
         ))}
       </section>

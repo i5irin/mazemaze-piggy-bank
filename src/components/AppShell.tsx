@@ -40,7 +40,8 @@ export function AppShell({ children, mode, onModeChange }: AppShellProps) {
       </header>
       <nav className="app-nav" aria-label="Primary">
         {navItems.map((item) => {
-          const isActive = pathname === item.href || (item.href === "/dashboard" && pathname === "/");
+          const isActive =
+            pathname === item.href || (item.href === "/dashboard" && pathname === "/");
           return (
             <Link
               key={item.href}

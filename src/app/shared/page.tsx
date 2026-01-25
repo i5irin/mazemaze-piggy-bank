@@ -12,9 +12,7 @@ export default function SharedPage() {
     <div className="section-stack">
       <section className="app-surface">
         <h1>Shared</h1>
-        <p className="app-muted">
-          Access shared pools backed by OneDrive permissions.
-        </p>
+        <p className="app-muted">Access shared pools backed by OneDrive permissions.</p>
       </section>
 
       <section className="card-grid">
