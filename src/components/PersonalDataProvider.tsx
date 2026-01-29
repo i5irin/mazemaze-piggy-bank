@@ -1,6 +1,14 @@
 "use client";
 
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useAuth } from "@/components/AuthProvider";
 import { getGraphScopes } from "@/lib/auth/msalConfig";
 import { createGraphClient } from "@/lib/graph/graphClient";
@@ -9,6 +17,7 @@ import { createOneDriveService, type LeaseRecord } from "@/lib/onedrive/oneDrive
 import {
   assignEventVersions,
   buildEventChunks,
+  parseEventChunk,
   serializeEventChunk,
   type PendingEvent,
 } from "@/lib/persistence/eventChunk";
@@ -22,10 +31,14 @@ import {
   deleteGoal as deleteGoalDomain,
   deletePosition as deletePositionDomain,
   reduceAllocations as reduceAllocationsDomain,
+  repairStateOnLoad,
+  spendGoal as spendGoalDomain,
+  undoSpend as undoSpendDomain,
   updateAccount as updateAccountDomain,
   updateAllocation as updateAllocationDomain,
   updateGoal as updateGoalDomain,
   updatePosition as updatePositionDomain,
+  type AllocationNotice,
   type DomainActionResult,
 } from "@/lib/persistence/domain";
 import { createId } from "@/lib/persistence/id";
@@ -109,8 +122,12 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
   const [pendingEvents, setPendingEvents] = useState<PendingEvent[]>([]);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [allocationNotice, setAllocationNotice] = useState<AllocationNotice | null>(null);
+  const [latestEvent, setLatestEvent] = useState<PendingEvent | null>(null);
+  const [savedLatestEvent, setSavedLatestEvent] = useState<PendingEvent | null>(null);
   const [lease, setLease] = useState<LeaseRecord | null>(null);
   const [leaseError, setLeaseError] = useState<string | null>(null);
+  const pendingEventsRef = useRef<PendingEvent[]>([]);
 
   const graphScopes = useMemo(() => getGraphScopes(), []);
   const tokenProvider = useCallback((scopes: string[]) => getAccessToken(scopes), [getAccessToken]);
@@ -129,14 +146,28 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
   );
 
   const applySnapshot = useCallback(
-    (snapshot: Snapshot, etag: string | null, sourceType: DataSource, notice: string | null) => {
+    (
+      snapshot: Snapshot,
+      etag: string | null,
+      sourceType: DataSource,
+      notice: string | null,
+      loadedLatestEvent: PendingEvent | null,
+    ) => {
+      const repair = repairStateOnLoad(snapshot.stateJson, buildEventMeta());
       setSnapshotRecord({ snapshot, etag });
-      setDraftState(snapshot.stateJson);
-      setPendingEvents([]);
+      setDraftState(repair.nextState);
+      setPendingEvents(repair.events);
+      setAllocationNotice(repair.notice ?? null);
       setSource(sourceType);
       setStatus("ready");
-      setMessage(notice);
+      const combinedMessage =
+        repair.warnings.length > 0
+          ? [...repair.warnings, notice].filter(Boolean).join(" ")
+          : notice;
+      setMessage(combinedMessage ?? null);
       setError(null);
+      setLatestEvent(loadedLatestEvent);
+      setSavedLatestEvent(loadedLatestEvent);
     },
     [],
   );
@@ -151,13 +182,43 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     }
   }, [oneDrive]);
 
+  const loadLatestEventFromRemote = useCallback(async (): Promise<PendingEvent | null> => {
+    try {
+      const chunkIds = await oneDrive.listEventChunkIds();
+      if (chunkIds.length === 0) {
+        return null;
+      }
+      const latestChunkId = Math.max(...chunkIds);
+      const content = await oneDrive.readEventChunk(latestChunkId);
+      const parsed = parseEventChunk(content);
+      const latest = parsed.events[parsed.events.length - 1];
+      if (!latest) {
+        return null;
+      }
+      return {
+        id: latest.id,
+        type: latest.type,
+        createdAt: latest.createdAt,
+        payload: latest.payload,
+      };
+    } catch {
+      return null;
+    }
+  }, [oneDrive]);
+
   const loadFromCache = useCallback(async () => {
     setStatus("loading");
     setActivity("loading");
     try {
       const cached = await readSnapshotCache("personal");
       if (cached) {
-        applySnapshot(cached.snapshot, cached.etag, "cache", "Loaded cached data.");
+        applySnapshot(
+          cached.snapshot,
+          cached.etag,
+          "cache",
+          "Loaded cached data.",
+          savedLatestEvent,
+        );
         setLease(null);
         setLeaseError(null);
       } else {
@@ -174,15 +235,25 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     } finally {
       setActivity("idle");
     }
-  }, [applySnapshot]);
+  }, [applySnapshot, savedLatestEvent]);
 
   const loadFromRemote = useCallback(async () => {
+    if (pendingEvents.length > 0) {
+      setMessage("Unsaved changes are present. Save or discard before syncing.");
+      return;
+    }
     setStatus("loading");
     setActivity("loading");
     try {
       await oneDrive.ensureAppRoot();
       const result = await oneDrive.readPersonalSnapshot();
-      applySnapshot(result.snapshot, result.etag, "remote", "Synced from OneDrive.");
+      const latest = await loadLatestEventFromRemote();
+      if (pendingEventsRef.current.length > 0) {
+        setStatus("ready");
+        setMessage("Unsaved changes are present. Save or discard before syncing.");
+        return;
+      }
+      applySnapshot(result.snapshot, result.etag, "remote", "Synced from OneDrive.", latest);
       void loadLeaseFromRemote();
       await writeSnapshotCache({
         key: "personal",
@@ -201,6 +272,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
             result.etag,
             "remote",
             "No snapshot found yet. Add accounts or goals to create your first snapshot.",
+            null,
           );
           await writeSnapshotCache({
             key: "personal",
@@ -230,7 +302,17 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     } finally {
       setActivity("idle");
     }
-  }, [applySnapshot, loadFromCache, loadLeaseFromRemote, oneDrive]);
+  }, [
+    applySnapshot,
+    loadFromCache,
+    loadLatestEventFromRemote,
+    loadLeaseFromRemote,
+    oneDrive,
+    pendingEvents.length,
+  ]);
+  useEffect(() => {
+    pendingEventsRef.current = pendingEvents;
+  }, [pendingEvents]);
 
   const refresh = useCallback(async () => {
     if (!isOnline || !isSignedIn) {
@@ -244,10 +326,13 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     if (!snapshotRecord) {
       return;
     }
-    setDraftState(snapshotRecord.snapshot.stateJson);
-    setPendingEvents([]);
+    const repair = repairStateOnLoad(snapshotRecord.snapshot.stateJson, buildEventMeta());
+    setDraftState(repair.nextState);
+    setPendingEvents(repair.events);
+    setAllocationNotice(repair.notice ?? null);
+    setLatestEvent(savedLatestEvent);
     setMessage("Discarded local edits.");
-  }, [snapshotRecord]);
+  }, [savedLatestEvent, snapshotRecord]);
 
   const handleConflict = useCallback(async () => {
     await loadFromRemote();
@@ -280,11 +365,22 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
 
     setActivity("saving");
     const now = new Date().toISOString();
-    const versionedEvents = assignEventVersions(pendingEvents, snapshotRecord.snapshot.version);
-    const nextVersion = snapshotRecord.snapshot.version + pendingEvents.length;
+    const repair = repairStateOnLoad(draftState, buildEventMeta());
+    const hasRepair = repair.events.length > 0;
+    const repairWarningMessage =
+      hasRepair && repair.warnings.length > 0 ? repair.warnings.join(" ") : null;
+    const repairedState = hasRepair ? repair.nextState : draftState;
+    const eventsToSave = hasRepair ? [...pendingEvents, ...repair.events] : pendingEvents;
+    if (hasRepair) {
+      setDraftState(repair.nextState);
+      setPendingEvents(eventsToSave);
+      setAllocationNotice(repair.notice ?? null);
+    }
+    const versionedEvents = assignEventVersions(eventsToSave, snapshotRecord.snapshot.version);
+    const nextVersion = snapshotRecord.snapshot.version + eventsToSave.length;
     const nextSnapshot: Snapshot = {
       version: nextVersion,
-      stateJson: draftState,
+      stateJson: repairedState,
       updatedAt: now,
     };
 
@@ -303,9 +399,22 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       setSnapshotRecord({ snapshot: nextSnapshot, etag: nextEtag });
       setDraftState(nextSnapshot.stateJson);
       setPendingEvents([]);
+      const lastEvent = versionedEvents[versionedEvents.length - 1];
+      const latest = lastEvent
+        ? {
+            id: lastEvent.id,
+            type: lastEvent.type,
+            createdAt: lastEvent.createdAt,
+            payload: lastEvent.payload,
+          }
+        : savedLatestEvent;
+      setLatestEvent(latest ?? null);
+      setSavedLatestEvent(latest ?? null);
       setSource("remote");
       setStatus("ready");
-      setMessage("Saved to OneDrive.");
+      setMessage(
+        repairWarningMessage ? `${repairWarningMessage} Saved to OneDrive.` : "Saved to OneDrive.",
+      );
       setError(null);
 
       await writeSnapshotCache({
@@ -333,7 +442,16 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     } finally {
       setActivity("idle");
     }
-  }, [draftState, handleConflict, isOnline, isSignedIn, oneDrive, pendingEvents, snapshotRecord]);
+  }, [
+    draftState,
+    handleConflict,
+    isOnline,
+    isSignedIn,
+    oneDrive,
+    pendingEvents,
+    savedLatestEvent,
+    snapshotRecord,
+  ]);
 
   const buildLeasePayload = useCallback((): LeaseRecord => {
     const now = new Date();
@@ -401,12 +519,23 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       }
       setDraftState(result.nextState);
       setPendingEvents((prev) => [...prev, ...result.events]);
+      if (result.notice) {
+        setAllocationNotice(result.notice);
+      }
+      if (result.events.length > 0) {
+        const lastEvent = result.events[result.events.length - 1];
+        setLatestEvent(lastEvent);
+      }
       setMessage(successMessage);
       setError(null);
       return { ok: true };
     },
     [],
   );
+
+  const clearAllocationNotice = useCallback(() => {
+    setAllocationNotice(null);
+  }, []);
 
   const createAccount = useCallback(
     (name: string): DomainActionOutcome => {
@@ -463,6 +592,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       assetType: Position["assetType"];
       label: string;
       marketValue: number;
+      allocationMode?: Position["allocationMode"];
     }): DomainActionOutcome => {
       const editable = ensureEditableState();
       if ("error" in editable) {
@@ -479,6 +609,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
           assetType: input.assetType,
           label: input.label,
           marketValue: input.marketValue,
+          allocationMode: input.allocationMode,
         },
         meta,
       );
@@ -493,6 +624,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       assetType: Position["assetType"];
       label: string;
       marketValue: number;
+      allocationMode: Position["allocationMode"];
     }): DomainActionOutcome => {
       const editable = ensureEditableState();
       if ("error" in editable) {
@@ -508,6 +640,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
           assetType: input.assetType,
           label: input.label,
           marketValue: input.marketValue,
+          allocationMode: input.allocationMode,
         },
         meta,
       );
@@ -693,6 +826,63 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     [applyDomainResult, ensureEditableState],
   );
 
+  const spendGoal = useCallback(
+    (input: { goalId: string; payments: { positionId: string; amount: number }[] }) => {
+      const editable = ensureEditableState();
+      if ("error" in editable) {
+        setError(editable.error);
+        setMessage(null);
+        return { ok: false, error: editable.error };
+      }
+      const meta = buildEventMeta();
+      const result = spendGoalDomain(editable.state, input, meta);
+      return applyDomainResult(result, "Goal marked as spent in draft.");
+    },
+    [applyDomainResult, ensureEditableState],
+  );
+
+  const undoSpend = useCallback(
+    (goalId: string): DomainActionOutcome => {
+      const editable = ensureEditableState();
+      if ("error" in editable) {
+        setError(editable.error);
+        setMessage(null);
+        return { ok: false, error: editable.error };
+      }
+      if (!latestEvent || latestEvent.type !== "goal_spent") {
+        const message = "Undo is only available for the most recent spend event.";
+        setError(message);
+        setMessage(null);
+        return { ok: false, error: message };
+      }
+      const payload = latestEvent.payload as { goalId?: string; spentAt?: string } | undefined;
+      if (!payload || payload.goalId !== goalId) {
+        const message = "Undo is only available for the most recent spend event.";
+        setError(message);
+        setMessage(null);
+        return { ok: false, error: message };
+      }
+      const spentAt = payload.spentAt ? new Date(payload.spentAt) : null;
+      if (!spentAt || Number.isNaN(spentAt.getTime())) {
+        const message = "Undo data is invalid.";
+        setError(message);
+        setMessage(null);
+        return { ok: false, error: message };
+      }
+      const elapsed = Date.now() - spentAt.getTime();
+      if (elapsed > 24 * 60 * 60 * 1000) {
+        const message = "Undo is only available for 24 hours after spending.";
+        setError(message);
+        setMessage(null);
+        return { ok: false, error: message };
+      }
+      const meta = buildEventMeta();
+      const result = undoSpendDomain(editable.state, { payload: latestEvent.payload }, meta);
+      return applyDomainResult(result, "Spend undone in draft.");
+    },
+    [applyDomainResult, ensureEditableState, latestEvent],
+  );
+
   useEffect(() => {
     void loadFromCache();
   }, [loadFromCache]);
@@ -720,6 +910,8 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       leaseError,
       message,
       error,
+      allocationNotice,
+      latestEvent,
       refresh,
       createAccount,
       updateAccount,
@@ -734,12 +926,17 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       updateAllocation,
       deleteAllocation,
       reduceAllocations,
+      spendGoal,
+      undoSpend,
+      clearAllocationNotice,
       saveChanges,
       discardChanges,
     }),
     [
       activity,
+      allocationNotice,
       canWrite,
+      clearAllocationNotice,
       createAccount,
       createAllocation,
       createGoal,
@@ -755,6 +952,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       isSignedIn,
       lease,
       leaseError,
+      latestEvent,
       message,
       pendingEvents.length,
       reduceAllocations,
@@ -763,8 +961,10 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       saveChanges,
       snapshotRecord,
       source,
+      spendGoal,
       space,
       status,
+      undoSpend,
       updateAccount,
       updateAllocation,
       updateGoal,

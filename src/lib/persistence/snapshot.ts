@@ -27,6 +27,11 @@ const isAssetType = (value: unknown): value is NormalizedState["positions"][numb
   value === "stored" ||
   value === "other";
 
+const isAllocationMode = (
+  value: unknown,
+): value is NormalizedState["positions"][number]["allocationMode"] =>
+  value === "fixed" || value === "ratio" || value === "priority";
+
 const isAccount = (value: unknown): value is NormalizedState["accounts"][number] =>
   isRecord(value) && isString(value.id) && isScope(value.scope) && isString(value.name);
 
@@ -37,6 +42,7 @@ const isPosition = (value: unknown): value is NormalizedState["positions"][numbe
   isAssetType(value.assetType) &&
   isString(value.label) &&
   isNumber(value.marketValue) &&
+  (value.allocationMode === undefined || isAllocationMode(value.allocationMode)) &&
   isString(value.updatedAt);
 
 const isGoal = (value: unknown): value is NormalizedState["goals"][number] =>
@@ -47,6 +53,8 @@ const isGoal = (value: unknown): value is NormalizedState["goals"][number] =>
   isNumber(value.targetAmount) &&
   isNumber(value.priority) &&
   (value.status === "active" || value.status === "closed") &&
+  (value.closedAt === undefined || isString(value.closedAt)) &&
+  (value.spentAt === undefined || isString(value.spentAt)) &&
   (value.startDate === undefined || isString(value.startDate)) &&
   (value.endDate === undefined || isString(value.endDate));
 
@@ -104,9 +112,13 @@ export const parseSnapshot = (text: string): Snapshot => {
   if (!isNormalizedState(parsed.stateJson)) {
     throw new Error("Snapshot file has an invalid state payload.");
   }
+  const normalizedPositions = parsed.stateJson.positions.map((position) => ({
+    ...position,
+    allocationMode: position.allocationMode ?? "fixed",
+  }));
   return {
     version: parsed.version,
-    stateJson: parsed.stateJson,
+    stateJson: { ...parsed.stateJson, positions: normalizedPositions },
     updatedAt: parsed.updatedAt,
   };
 };

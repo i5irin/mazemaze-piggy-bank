@@ -1,6 +1,8 @@
 import type { LeaseRecord } from "@/lib/onedrive/oneDriveService";
+import type { PendingEvent } from "@/lib/persistence/eventChunk";
 import type { Snapshot } from "@/lib/persistence/snapshot";
 import type { Goal, NormalizedState, Position } from "@/lib/persistence/types";
+import type { AllocationNotice } from "@/lib/persistence/domain";
 
 export type DataStatus = "idle" | "loading" | "ready" | "error";
 
@@ -35,6 +37,8 @@ export type DataContextValue = {
   leaseError: string | null;
   message: string | null;
   error: string | null;
+  allocationNotice: AllocationNotice | null;
+  latestEvent: PendingEvent | null;
   refresh: () => Promise<void>;
   createAccount: (name: string) => DomainActionOutcome;
   updateAccount: (accountId: string, name: string) => DomainActionOutcome;
@@ -44,12 +48,14 @@ export type DataContextValue = {
     assetType: Position["assetType"];
     label: string;
     marketValue: number;
+    allocationMode?: Position["allocationMode"];
   }) => DomainActionOutcome;
   updatePosition: (input: {
     positionId: string;
     assetType: Position["assetType"];
     label: string;
     marketValue: number;
+    allocationMode: Position["allocationMode"];
   }) => DomainActionOutcome;
   deletePosition: (positionId: string) => DomainActionOutcome;
   createGoal: (input: {
@@ -80,6 +86,12 @@ export type DataContextValue = {
   reduceAllocations: (
     reductions: { allocationId: string; amount: number }[],
   ) => DomainActionOutcome;
+  spendGoal: (input: {
+    goalId: string;
+    payments: { positionId: string; amount: number }[];
+  }) => DomainActionOutcome;
+  undoSpend: (goalId: string) => DomainActionOutcome;
+  clearAllocationNotice: () => void;
   saveChanges: () => Promise<void>;
   discardChanges: () => void;
 };

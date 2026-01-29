@@ -22,6 +22,7 @@ export type Position = {
   assetType: AssetType;
   label: string;
   marketValue: number;
+  allocationMode: "fixed" | "ratio" | "priority";
   updatedAt: string;
 };
 
@@ -34,6 +35,8 @@ export type Goal = {
   endDate?: string;
   priority: number;
   status: "active" | "closed";
+  closedAt?: string;
+  spentAt?: string;
 };
 
 export type Allocation = {

@@ -16,6 +16,12 @@ const assetTypeOptions: { value: AssetType; label: string }[] = [
   { value: "other", label: "Other" },
 ];
 
+const allocationModeOptions: { value: Position["allocationMode"]; label: string }[] = [
+  { value: "fixed", label: "Fixed" },
+  { value: "ratio", label: "Ratio" },
+  { value: "priority", label: "Priority" },
+];
+
 const formatCurrency = (value: number): string => `¥${value.toLocaleString("en-US")}`;
 
 const parseAmount = (value: string): number | null => {
@@ -116,7 +122,12 @@ const PositionDetailsPanel = ({
 }: {
   position: Position;
   canEdit: boolean;
-  onUpdate: (input: { label: string; assetType: AssetType; marketValue: string }) => void;
+  onUpdate: (input: {
+    label: string;
+    assetType: AssetType;
+    marketValue: string;
+    allocationMode: Position["allocationMode"];
+  }) => void;
   onDelete: () => void;
 }) => {
   const [editPositionLabel, setEditPositionLabel] = useState(position.label);
@@ -124,6 +135,9 @@ const PositionDetailsPanel = ({
   const [editPositionMarketValue, setEditPositionMarketValue] = useState(
     position.marketValue.toString(),
   );
+  const [editPositionAllocationMode, setEditPositionAllocationMode] = useState<
+    Position["allocationMode"]
+  >(position.allocationMode);
   const [positionDeleteStep, setPositionDeleteStep] = useState<0 | 1 | 2>(0);
 
   return (
@@ -166,8 +180,26 @@ const PositionDetailsPanel = ({
           disabled={!canEdit}
         />
       </Field>
+      <Field label="Allocation mode">
+        <Dropdown
+          selectedOptions={[editPositionAllocationMode]}
+          onOptionSelect={(_, data) => {
+            const value = data.optionValue as Position["allocationMode"] | undefined;
+            if (value) {
+              setEditPositionAllocationMode(value);
+            }
+          }}
+          disabled={!canEdit}
+        >
+          {allocationModeOptions.map((option) => (
+            <Option key={option.value} value={option.value}>
+              {option.label}
+            </Option>
+          ))}
+        </Dropdown>
+      </Field>
       <div className="app-muted">
-        Updating the market value triggers proportional allocation recalculation.
+        Updating the market value triggers allocation recalculation based on the selected mode.
       </div>
       <div className="app-actions">
         <Button
@@ -176,6 +208,7 @@ const PositionDetailsPanel = ({
               label: editPositionLabel,
               assetType: editPositionAssetType,
               marketValue: editPositionMarketValue,
+              allocationMode: editPositionAllocationMode,
             })
           }
           disabled={!canEdit}
@@ -322,6 +355,10 @@ export function AccountsView({ data }: { data: DataContextValue }) {
       .filter((allocation) => allocation.positionId === selectedPosition.id)
       .sort((left, right) => left.id.localeCompare(right.id));
   }, [allocations, selectedPosition]);
+  const ratioNeedsSetup =
+    selectedPosition?.allocationMode === "ratio" && selectedPositionAllocations.length === 0;
+  const ratioZeroBalance =
+    selectedPosition?.allocationMode === "ratio" && selectedPosition.marketValue === 0;
 
   const handleCreateAccount = () => {
     const result = createAccount(newAccountName);
@@ -373,6 +410,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
     label: string;
     assetType: AssetType;
     marketValue: string;
+    allocationMode: Position["allocationMode"];
   }) => {
     if (!selectedPosition) {
       setPageError("Select a position to edit.");
@@ -389,6 +427,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
         assetType: input.assetType,
         label: input.label,
         marketValue: parsed,
+        allocationMode: input.allocationMode,
       }),
       "Position updated in draft.",
     );
@@ -609,6 +648,18 @@ export function AccountsView({ data }: { data: DataContextValue }) {
               onUpdate={handleUpdatePosition}
               onDelete={handleDeletePosition}
             />
+            {ratioNeedsSetup ? (
+              <div className="app-muted">
+                Ratio mode preserves existing allocation ratios. Create allocations first to define
+                the ratio.
+              </div>
+            ) : null}
+            {ratioZeroBalance ? (
+              <div className="app-muted">
+                When the balance increases from zero, ratio mode does not auto-allocate. Add
+                allocations manually if needed.
+              </div>
+            ) : null}
 
             <div>
               <h3>Allocations linked to this position</h3>

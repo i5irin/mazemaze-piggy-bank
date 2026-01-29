@@ -58,3 +58,22 @@ export const serializeEventChunk = (chunk: EventChunk): string => {
   const lines = [JSON.stringify(header), ...chunk.events.map((event) => JSON.stringify(event))];
   return `${lines.join("\n")}\n`;
 };
+
+export const parseEventChunk = (content: string): EventChunk => {
+  const lines = content
+    .trim()
+    .split("\n")
+    .filter((line) => line.trim().length > 0);
+  if (lines.length === 0) {
+    throw new Error("Event chunk is empty.");
+  }
+  const header = JSON.parse(lines[0]) as EventChunk;
+  const events = lines.slice(1).map((line) => JSON.parse(line) as EventChunk["events"][number]);
+  return {
+    chunkId: header.chunkId,
+    fromVersion: header.fromVersion,
+    toVersion: header.toVersion,
+    createdAt: header.createdAt,
+    events,
+  };
+};

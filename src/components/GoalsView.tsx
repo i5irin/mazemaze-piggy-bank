@@ -1,7 +1,7 @@
 "use client";
 
 import { Button, Dropdown, Field, Input, Option, Text } from "@fluentui/react-components";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { DataContextValue } from "@/components/dataContext";
 import type { Account, Allocation, Goal, Position } from "@/lib/persistence/types";
 
@@ -34,6 +34,22 @@ const buildReductionDefaults = (allocations: Allocation[]): Record<string, strin
   return values;
 };
 
+const buildSpendDefaults = (allocations: Allocation[]): Record<string, string> => {
+  const values: Record<string, string> = {};
+  for (const allocation of allocations) {
+    values[allocation.id] = allocation.allocatedAmount.toString();
+  }
+  return values;
+};
+
+const formatDateTime = (value: string): string => {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+  return parsed.toLocaleString("en-US");
+};
+
 const getEditNotice = (data: DataContextValue): string | null => {
   if (!data.isOnline) {
     return "Offline mode is view-only. Connect to the internet to edit.";
@@ -46,6 +62,8 @@ const getEditNotice = (data: DataContextValue): string | null => {
   }
   return null;
 };
+
+const isActiveGoal = (goal: Goal): boolean => goal.status === "active" && !goal.spentAt;
 
 const GoalDetailsPanel = ({
   goal,
@@ -216,8 +234,15 @@ const GoalAllocationsPanel = ({
   const allocationsForGoal = useMemo(() => {
     return allocations
       .filter((allocation) => allocation.goalId === goal.id)
-      .sort((left, right) => left.id.localeCompare(right.id));
-  }, [allocations, goal.id]);
+      .sort((left, right) => {
+        const leftLabel = positionsById.get(left.positionId)?.label ?? "";
+        const rightLabel = positionsById.get(right.positionId)?.label ?? "";
+        if (leftLabel !== rightLabel) {
+          return leftLabel.localeCompare(rightLabel);
+        }
+        return left.positionId.localeCompare(right.positionId);
+      });
+  }, [allocations, goal.id, positionsById]);
 
   const availablePositionsForGoal = useMemo(() => {
     return positions.filter((position) => {
@@ -267,6 +292,10 @@ const GoalAllocationsPanel = ({
     const amount = parseNonNegativeInteger(newAllocationAmount);
     if (amount === null) {
       setPageError("Allocated amount must be a non-negative integer.");
+      return;
+    }
+    if (amount === 0) {
+      setPageError("Allocated amount must be greater than zero.");
       return;
     }
     const result = createAllocation({
@@ -461,6 +490,11 @@ export function GoalsView({ data }: { data: DataContextValue }) {
     updateAllocation,
     deleteAllocation,
     reduceAllocations,
+    spendGoal,
+    undoSpend,
+    allocationNotice,
+    clearAllocationNotice,
+    latestEvent,
     space,
   } = data;
 
@@ -475,6 +509,7 @@ export function GoalsView({ data }: { data: DataContextValue }) {
     () => new Map(positions.map((position) => [position.id, position])),
     [positions],
   );
+  const goalsById = useMemo(() => new Map(goals.map((goal) => [goal.id, goal])), [goals]);
   const accountsById = useMemo(
     () => new Map(accounts.map((account) => [account.id, account])),
     [accounts],
@@ -500,8 +535,16 @@ export function GoalsView({ data }: { data: DataContextValue }) {
   const goalsSorted = useMemo(
     () =>
       [...goals].sort((left, right) => {
-        if (left.priority !== right.priority) {
-          return left.priority - right.priority;
+        const leftActive = isActiveGoal(left);
+        const rightActive = isActiveGoal(right);
+        if (leftActive !== rightActive) {
+          return leftActive ? -1 : 1;
+        }
+        if (leftActive && rightActive) {
+          if (left.priority !== right.priority) {
+            return left.priority - right.priority;
+          }
+          return left.id.localeCompare(right.id);
         }
         return left.name.localeCompare(right.name) || left.id.localeCompare(right.id);
       }),
@@ -518,6 +561,46 @@ export function GoalsView({ data }: { data: DataContextValue }) {
   }, [goalsSorted, selectedGoalId]);
 
   const selectedGoal = goals.find((goal) => goal.id === effectiveGoalId) ?? null;
+  const selectedGoalSpent = Boolean(selectedGoal?.spentAt);
+  const canEditSelectedGoal = canEdit && !selectedGoalSpent;
+  const reducedClosedOrSpent = useMemo(() => {
+    if (!allocationNotice) {
+      return false;
+    }
+    return allocationNotice.changes.some((change) => {
+      if (change.after >= change.before) {
+        return false;
+      }
+      const goal = goalsById.get(change.goalId);
+      return goal ? goal.status === "closed" || Boolean(goal.spentAt) : false;
+    });
+  }, [allocationNotice, goalsById]);
+
+  const [allocationEditMode, setAllocationEditMode] = useState<"summary" | "direct" | null>(null);
+  const [allocationEditReason, setAllocationEditReason] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!allocationNotice) {
+      return;
+    }
+    if (allocationNotice.requiresDirectEdit) {
+      const timerId = window.setTimeout(() => {
+        setAllocationEditMode("direct");
+        setAllocationEditReason(
+          allocationNotice.directReasons.length > 0
+            ? `${allocationNotice.directReasons.join(" ")} Review the proposed allocations below.`
+            : "Manual allocation review is required. Review the proposed allocations below.",
+        );
+        if (allocationNotice.affectedGoalIds.length > 0) {
+          setSelectedGoalId(allocationNotice.affectedGoalIds[0]);
+        }
+      }, 0);
+      return () => {
+        window.clearTimeout(timerId);
+      };
+    }
+    return;
+  }, [allocationNotice]);
 
   const [pageMessage, setPageMessage] = useState<string | null>(null);
   const [pageError, setPageError] = useState<string | null>(null);
@@ -546,8 +629,38 @@ export function GoalsView({ data }: { data: DataContextValue }) {
     }
     return allocations
       .filter((allocation) => allocation.goalId === selectedGoal.id)
-      .sort((left, right) => left.id.localeCompare(right.id));
-  }, [allocations, selectedGoal]);
+      .sort((left, right) => {
+        const leftLabel = positionsById.get(left.positionId)?.label ?? "";
+        const rightLabel = positionsById.get(right.positionId)?.label ?? "";
+        if (leftLabel !== rightLabel) {
+          return leftLabel.localeCompare(rightLabel);
+        }
+        return left.positionId.localeCompare(right.positionId);
+      });
+  }, [allocations, positionsById, selectedGoal]);
+
+  const spendDefaults = useMemo(
+    () => buildSpendDefaults(selectedGoalAllocations),
+    [selectedGoalAllocations],
+  );
+  const [spendInputs, setSpendInputs] = useState<Record<string, string>>({});
+  const mergedSpendInputs = useMemo(
+    () => ({ ...spendDefaults, ...spendInputs }),
+    [spendDefaults, spendInputs],
+  );
+  const selectedGoalTotalAllocated = useMemo(
+    () => selectedGoalAllocations.reduce((sum, allocation) => sum + allocation.allocatedAmount, 0),
+    [selectedGoalAllocations],
+  );
+
+  useEffect(() => {
+    const timerId = window.setTimeout(() => {
+      setSpendInputs({});
+    }, 0);
+    return () => {
+      window.clearTimeout(timerId);
+    };
+  }, [selectedGoal?.id]);
 
   const handleCreateGoal = () => {
     const targetAmount = parseNonNegativeInteger(newGoalTargetAmount);
@@ -622,6 +735,122 @@ export function GoalsView({ data }: { data: DataContextValue }) {
     reportOutcome(deleteGoal(selectedGoal.id), "Goal deleted in draft.");
   };
 
+  const [undoInfo, setUndoInfo] = useState<{ available: boolean; message: string | null }>({
+    available: false,
+    message: null,
+  });
+
+  useEffect(() => {
+    let isActive = true;
+    const updateUndoInfo = () => {
+      if (!isActive) {
+        return;
+      }
+      if (!selectedGoal || !selectedGoal.spentAt) {
+        setUndoInfo({ available: false, message: null });
+        return;
+      }
+      if (!latestEvent || latestEvent.type !== "goal_spent") {
+        setUndoInfo({ available: false, message: "Only the most recent spend can be undone." });
+        return;
+      }
+      const payload = latestEvent.payload as { goalId?: string; spentAt?: string } | undefined;
+      if (!payload || payload.goalId !== selectedGoal.id) {
+        setUndoInfo({ available: false, message: "Only the most recent spend can be undone." });
+        return;
+      }
+      const spentAt = payload.spentAt ? new Date(payload.spentAt) : null;
+      if (!spentAt || Number.isNaN(spentAt.getTime())) {
+        setUndoInfo({ available: false, message: "Undo data is invalid." });
+        return;
+      }
+      const elapsed = Date.now() - spentAt.getTime();
+      if (elapsed > 24 * 60 * 60 * 1000) {
+        setUndoInfo({
+          available: false,
+          message: "Undo is only available for 24 hours after spending.",
+        });
+        return;
+      }
+      setUndoInfo({
+        available: true,
+        message: "Undo is available for 24 hours after spending.",
+      });
+    };
+    const timerId = window.setTimeout(updateUndoInfo, 0);
+    return () => {
+      isActive = false;
+      window.clearTimeout(timerId);
+    };
+  }, [latestEvent, selectedGoal]);
+
+  const handleSpendGoal = () => {
+    if (!selectedGoal) {
+      setPageError("Select a goal to spend.");
+      return;
+    }
+    const payments = selectedGoalAllocations.map((allocation) => {
+      const raw = mergedSpendInputs[allocation.id] ?? "0";
+      const amount = parseNonNegativeInteger(raw);
+      return {
+        allocation,
+        amount: amount ?? -1,
+      };
+    });
+    if (payments.some((item) => item.amount < 0)) {
+      setPageError("Payment amounts must be non-negative integers.");
+      return;
+    }
+    const paymentTotal = payments.reduce((sum, item) => sum + item.amount, 0);
+    if (paymentTotal !== selectedGoalTotalAllocated) {
+      setPageError("Payments must total the goal allocation amount.");
+      return;
+    }
+    const exceedsAllocation = payments.some(
+      (item) => item.amount > item.allocation.allocatedAmount,
+    );
+    if (exceedsAllocation) {
+      setPageError("Payment amounts cannot exceed allocated amounts.");
+      return;
+    }
+    const result = spendGoal({
+      goalId: selectedGoal.id,
+      payments: payments.map((item) => ({
+        positionId: item.allocation.positionId,
+        amount: item.amount,
+      })),
+    });
+    if (reportOutcome(result, "Goal marked as spent in draft.")) {
+      setSpendInputs({});
+    }
+  };
+
+  const handleUndoSpend = () => {
+    if (!selectedGoal) {
+      setPageError("Select a goal to undo.");
+      return;
+    }
+    reportOutcome(undoSpend(selectedGoal.id), "Spend undone in draft.");
+  };
+
+  const handleOpenAllocationEdit = (mode: "summary" | "direct") => {
+    setAllocationEditMode(mode);
+    setAllocationEditReason(
+      mode === "direct"
+        ? `${allocationNotice?.directReasons?.join(" ") || "Manual allocation review is required."} Review the proposed allocations below.`
+        : "Review the adjustments below, then edit allocations if needed.",
+    );
+    if (allocationNotice && allocationNotice.affectedGoalIds.length > 0) {
+      setSelectedGoalId(allocationNotice.affectedGoalIds[0]);
+    }
+  };
+
+  const handleDismissAllocationNotice = () => {
+    clearAllocationNotice();
+    setAllocationEditMode(null);
+    setAllocationEditReason(null);
+  };
+
   return (
     <div className="section-stack">
       <section className="app-surface">
@@ -653,6 +882,58 @@ export function GoalsView({ data }: { data: DataContextValue }) {
           <Text>{pageError}</Text>
         </div>
       ) : null}
+      {allocationNotice ? (
+        <div className="app-alert app-alert-warning" role="status">
+          <div className="section-stack">
+            <Text>Allocations were adjusted to keep your data consistent.</Text>
+            {allocationNotice.requiresDirectEdit ? (
+              <Text>
+                Manual allocation review required. {allocationNotice.directReasons.join(" ")}
+              </Text>
+            ) : null}
+            {allocationNotice.requiresDirectEdit ? (
+              <Text>
+                Suggested reductions follow priority order: lower-priority active goals first, then
+                closed or spent goals by most recent close time.
+              </Text>
+            ) : null}
+            {reducedClosedOrSpent ? (
+              <Text>
+                Reductions to closed or spent goals will not be restored automatically. Add them
+                back manually if needed.
+              </Text>
+            ) : null}
+            {allocationNotice.changes.length > 0 ? (
+              <div className="section-stack">
+                {allocationNotice.changes.map((change) => {
+                  const goalName = goalsById.get(change.goalId)?.name ?? "Unknown goal";
+                  const positionName =
+                    positionsById.get(change.positionId)?.label ?? "Unknown position";
+                  return (
+                    <div key={`${change.goalId}-${change.positionId}`}>
+                      {goalName} · {positionName}: {formatCurrency(change.before)} →{" "}
+                      {formatCurrency(change.after)}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
+            <div className="app-actions">
+              <Button
+                appearance="primary"
+                onClick={() =>
+                  handleOpenAllocationEdit(
+                    allocationNotice.requiresDirectEdit ? "direct" : "summary",
+                  )
+                }
+              >
+                Edit allocations
+              </Button>
+              <Button onClick={handleDismissAllocationNotice}>Dismiss</Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       <section className="app-surface">
         <h2>Goal list</h2>
@@ -681,7 +962,7 @@ export function GoalsView({ data }: { data: DataContextValue }) {
                     <div style={{ fontWeight: 600 }}>
                       {formatCurrency(allocated)} of {formatCurrency(goal.targetAmount)}
                     </div>
-                    <div className="app-muted">Status: {goal.status}</div>
+                    <div className="app-muted">Status: {goal.spentAt ? "Spent" : goal.status}</div>
                   </div>
                 </div>
               );
@@ -765,10 +1046,31 @@ export function GoalsView({ data }: { data: DataContextValue }) {
             <GoalDetailsPanel
               key={selectedGoal.id}
               goal={selectedGoal}
-              canEdit={canEdit}
+              canEdit={canEditSelectedGoal}
               onUpdate={handleUpdateGoal}
               onDelete={handleDeleteGoal}
             />
+            {selectedGoal.spentAt ? (
+              <div className="app-alert" role="status">
+                <div className="section-stack">
+                  <Text>
+                    This goal was marked as spent on {formatDateTime(selectedGoal.spentAt)}.
+                  </Text>
+                  <Text>Editing is disabled for spent goals.</Text>
+                  <Text>Undo is unavailable if allocations were edited after spending.</Text>
+                  {undoInfo.message ? <Text>{undoInfo.message}</Text> : null}
+                  <div className="app-actions">
+                    <Button
+                      appearance="primary"
+                      onClick={handleUndoSpend}
+                      disabled={!canEdit || !undoInfo.available}
+                    >
+                      Undo spend
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            ) : null}
           </div>
         )}
       </section>
@@ -778,21 +1080,72 @@ export function GoalsView({ data }: { data: DataContextValue }) {
         {!selectedGoal ? (
           <div className="app-muted">Select a goal to manage allocations.</div>
         ) : (
-          <GoalAllocationsPanel
-            goal={selectedGoal}
-            positions={positions}
-            allocations={selectedGoalAllocations}
-            positionsById={positionsById}
-            accountsById={accountsById}
-            allocationTotalsByPosition={allocationTotalsByPosition}
-            canEdit={canEdit}
-            reportOutcome={reportOutcome}
-            setPageError={setPageError}
-            createAllocation={createAllocation}
-            updateAllocation={updateAllocation}
-            deleteAllocation={deleteAllocation}
-            reduceAllocations={reduceAllocations}
-          />
+          <div className="section-stack">
+            {allocationEditMode ? (
+              <div className="app-alert" role="status">
+                <Text>{allocationEditReason}</Text>
+              </div>
+            ) : null}
+            <GoalAllocationsPanel
+              goal={selectedGoal}
+              positions={positions}
+              allocations={selectedGoalAllocations}
+              positionsById={positionsById}
+              accountsById={accountsById}
+              allocationTotalsByPosition={allocationTotalsByPosition}
+              canEdit={canEditSelectedGoal}
+              reportOutcome={reportOutcome}
+              setPageError={setPageError}
+              createAllocation={createAllocation}
+              updateAllocation={updateAllocation}
+              deleteAllocation={deleteAllocation}
+              reduceAllocations={reduceAllocations}
+            />
+          </div>
+        )}
+      </section>
+
+      <section className="app-surface">
+        <h2>Spend goal</h2>
+        {!selectedGoal ? (
+          <div className="app-muted">Select a goal to mark it as spent.</div>
+        ) : selectedGoal.spentAt ? (
+          <div className="app-muted">This goal is already marked as spent.</div>
+        ) : selectedGoal.status !== "closed" ? (
+          <div className="app-muted">Close the goal before marking it as spent.</div>
+        ) : selectedGoalAllocations.length === 0 ? (
+          <div className="app-muted">No allocations are available to spend.</div>
+        ) : (
+          <div className="section-stack">
+            <div>Total to spend: {formatCurrency(selectedGoalTotalAllocated)}</div>
+            {selectedGoalAllocations.map((allocation) => {
+              const position = positionsById.get(allocation.positionId);
+              return (
+                <Field
+                  key={allocation.id}
+                  label={`Pay from ${position?.label ?? "Position"} (allocated ${formatCurrency(
+                    allocation.allocatedAmount,
+                  )})`}
+                >
+                  <Input
+                    type="number"
+                    inputMode="numeric"
+                    value={mergedSpendInputs[allocation.id] ?? "0"}
+                    onChange={(_, data) =>
+                      setSpendInputs((prev) => ({
+                        ...prev,
+                        [allocation.id]: data.value,
+                      }))
+                    }
+                    disabled={!canEditSelectedGoal}
+                  />
+                </Field>
+              );
+            })}
+            <Button appearance="primary" onClick={handleSpendGoal} disabled={!canEditSelectedGoal}>
+              Mark as spent
+            </Button>
+          </div>
         )}
       </section>
     </div>
