@@ -1,4 +1,6 @@
-# Piggy Bank
+# Mazemaze Piggy Bank
+
+![Mazemaze Piggy Bank Logo](./docs/brand/lockup-horizontal.png)
 
 A Progressive Web App (PWA) designed to manually manage multiple asset accounts and allocate funds to specific "Savings Goals" to track progress.
 

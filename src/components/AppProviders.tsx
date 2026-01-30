@@ -9,7 +9,7 @@ import { SharedSelectionProvider } from "@/components/SharedSelectionProvider";
 
 type ThemeMode = "light" | "dark";
 
-const THEME_STORAGE_KEY = "piggy-bank-theme";
+const THEME_STORAGE_KEY = "mazemaze-piggy-bank-theme";
 
 export function AppProviders({ children }: { children: React.ReactNode }) {
   const [mode, setMode] = useState<ThemeMode>(() => {

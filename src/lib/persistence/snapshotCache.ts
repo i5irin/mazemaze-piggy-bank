@@ -1,6 +1,6 @@
 import type { Snapshot } from "./snapshot";
 
-const DB_NAME = "piggy-bank";
+const DB_NAME = "mazemaze-piggy-bank";
 const DB_VERSION = 1;
 const STORE_NAME = "snapshot";
 

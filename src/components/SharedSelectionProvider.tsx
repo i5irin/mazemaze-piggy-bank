@@ -16,7 +16,7 @@ type SharedSelectionContextValue = {
   clearSelection: () => void;
 };
 
-const STORAGE_KEY = "piggy-bank-shared-selection";
+const STORAGE_KEY = "mazemaze-piggy-bank-shared-selection";
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null;

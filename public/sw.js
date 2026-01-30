@@ -1,4 +1,4 @@
-const CACHE_NAME = "piggy-bank-static-v1";
+const CACHE_NAME = "mazemaze-piggy-bank-static-v1";
 const STATIC_ASSETS = [
   "/",
   "/dashboard",

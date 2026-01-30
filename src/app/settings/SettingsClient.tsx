@@ -293,14 +293,14 @@ export function SettingsClient() {
           const payload = JSON.stringify(result.snapshot, null, 2);
           downloadBlob(
             new Blob([payload], { type: "application/json" }),
-            `piggy-bank-personal-snapshot-${timestamp}.json`,
+            `mazemaze-piggy-bank-personal-snapshot-${timestamp}.json`,
           );
         } else {
           const result = await oneDrive.readSharedSnapshot(sharedRoot as SharedRootReference);
           const payload = JSON.stringify(result.snapshot, null, 2);
           downloadBlob(
             new Blob([payload], { type: "application/json" }),
-            `piggy-bank-shared-snapshot-${timestamp}.json`,
+            `mazemaze-piggy-bank-shared-snapshot-${timestamp}.json`,
           );
         }
         setExportState({
@@ -349,7 +349,7 @@ export function SettingsClient() {
         const payload = chunks.join("\n");
         downloadBlob(
           new Blob([payload], { type: "text/plain" }),
-          `piggy-bank-${scope}-events-${timestamp}.jsonl`,
+          `mazemaze-piggy-bank-${scope}-events-${timestamp}.jsonl`,
         );
         setExportState({
           status: "success",
