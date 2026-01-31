@@ -1,8 +1,8 @@
 {
-  "name": "Piggy Bank",
-  "short_name": "Piggy Bank",
+  "name": "Mazemaze Piggy Bank",
+  "short_name": "Mazemaze",
   "description": "A mobile-first PWA for tracking personal and shared savings allocations.",
-  "start_url": "/dashboard",
+  "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "background_color": "#f7f7f7",
@@ -17,12 +17,6 @@
       "src": "/icons/icon-512.png",
       "sizes": "512x512",
       "type": "image/png"
-    },
-    {
-      "src": "/icons/icon-192.png",
-      "sizes": "192x192",
-      "type": "image/png",
-      "purpose": "maskable"
     }
   ]
 }
