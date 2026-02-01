@@ -62,10 +62,12 @@ import { createEmptySnapshot, type Snapshot } from "@/lib/persistence/snapshot";
 import { readSnapshotCache, writeSnapshotCache } from "@/lib/persistence/snapshotCache";
 import { useOnlineStatus } from "@/lib/persistence/useOnlineStatus";
 import type { Goal, NormalizedState, Position } from "@/lib/persistence/types";
+import { getDeviceId } from "@/lib/lease/deviceId";
 
 const MAX_EVENTS_PER_CHUNK = 500;
 const LEASE_DURATION_MS = 90_000;
 const LEASE_REFRESH_MS = 60_000;
+const LEASE_EDIT_EVENT_TYPES = new Set<string>(["state_repaired"]);
 
 type SnapshotRecord = {
   snapshot: Snapshot;
@@ -205,8 +207,10 @@ export function SharedDataProvider({
   const buildLeasePayload = useCallback((): LeaseRecord => {
     const now = new Date();
     const holderLabel = account?.name ?? account?.username ?? "Anonymous";
+    const deviceId = getDeviceId() ?? undefined;
     return {
       holderLabel,
+      deviceId,
       leaseUntil: new Date(now.getTime() + LEASE_DURATION_MS).toISOString(),
       updatedAt: now.toISOString(),
     };
@@ -322,8 +326,6 @@ export function SharedDataProvider({
           "Loaded cached data.",
           savedLatestEvent,
         );
-        setLease(null);
-        setLeaseError(null);
       } else {
         setStatus("error");
         setSource("empty");
@@ -341,7 +343,7 @@ export function SharedDataProvider({
   }, [applySnapshot, savedLatestEvent, sharedReference]);
 
   const loadFromRemote = useCallback(async () => {
-    if (pendingEvents.length > 0) {
+    if (pendingEventsRef.current.length > 0) {
       setMessage("Unsaved changes are present. Save or discard before syncing.");
       return;
     }
@@ -420,7 +422,6 @@ export function SharedDataProvider({
     loadLatestEventFromRemote,
     loadLeaseFromRemote,
     oneDrive,
-    pendingEvents.length,
   ]);
   useEffect(() => {
     pendingEventsRef.current = pendingEvents;
@@ -584,6 +585,10 @@ export function SharedDataProvider({
     if (pendingEvents.length === 0 || !isOnline || !isSignedIn || !canWrite || !sharedReference) {
       return;
     }
+    const hasUserEdits = pendingEvents.some((event) => !LEASE_EDIT_EVENT_TYPES.has(event.type));
+    if (!hasUserEdits) {
+      return;
+    }
     let isActive = true;
     const updateLease = async () => {
       try {
@@ -608,15 +613,7 @@ export function SharedDataProvider({
       isActive = false;
       window.clearInterval(intervalId);
     };
-  }, [
-    buildLeasePayload,
-    canWrite,
-    isOnline,
-    isSignedIn,
-    oneDrive,
-    pendingEvents.length,
-    sharedReference,
-  ]);
+  }, [buildLeasePayload, canWrite, isOnline, isSignedIn, oneDrive, pendingEvents, sharedReference]);
 
   const ensureEditableState = useCallback((): { state: NormalizedState } | { error: string } => {
     if (!isOnline) {

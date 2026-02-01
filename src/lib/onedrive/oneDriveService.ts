@@ -21,6 +21,7 @@ type GraphClient = ReturnType<typeof createGraphClient>;
 
 export type LeaseRecord = {
   holderLabel: string;
+  deviceId?: string;
   leaseUntil: string;
   updatedAt: string;
 };
@@ -147,11 +148,20 @@ const parseJson = (text: string): unknown => {
 
 const isString = (value: unknown): value is string => typeof value === "string";
 
-const isLeaseRecord = (value: unknown): value is LeaseRecord =>
-  isRecord(value) &&
-  isString(value.holderLabel) &&
-  isString(value.leaseUntil) &&
-  isString(value.updatedAt);
+const isLeaseRecord = (value: unknown): value is LeaseRecord => {
+  if (
+    !isRecord(value) ||
+    !isString(value.holderLabel) ||
+    !isString(value.leaseUntil) ||
+    !isString(value.updatedAt)
+  ) {
+    return false;
+  }
+  if (value.deviceId !== undefined && !isString(value.deviceId)) {
+    return false;
+  }
+  return true;
+};
 
 const parseLeaseRecord = (text: string): LeaseRecord => {
   const data = parseJson(text);

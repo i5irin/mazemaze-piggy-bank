@@ -1,5 +1,13 @@
 "use client";
 
+import {
+  Home24Regular,
+  Grid24Regular,
+  Wallet24Regular,
+  Target24Regular,
+  People24Regular,
+  Settings24Regular,
+} from "@fluentui/react-icons";
 import Image from "next/image";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
@@ -11,11 +19,16 @@ type AppShellProps = {
 };
 
 const navItems = [
-  { href: "/dashboard", label: "Dashboard" },
-  { href: "/accounts", label: "Accounts" },
-  { href: "/goals", label: "Goals" },
-  { href: "/shared", label: "Shared" },
-  { href: "/settings", label: "Settings" },
+  {
+    href: "/dashboard",
+    label: "Dashboard",
+    icon: Grid24Regular,
+    mobileIcon: Home24Regular,
+  },
+  { href: "/accounts", label: "Accounts", icon: Wallet24Regular },
+  { href: "/goals", label: "Goals", icon: Target24Regular },
+  { href: "/shared", label: "Shared", icon: People24Regular },
+  { href: "/settings", label: "Settings", icon: Settings24Regular },
 ];
 
 export function AppShell({ children }: AppShellProps) {
@@ -61,6 +74,7 @@ export function AppShell({ children }: AppShellProps) {
           <CloudStatus className="status-indicator-header" onRetrySync={handleRetrySync} />
         </div>
       </header>
+      <main className="app-main">{children}</main>
       <nav className="app-nav" aria-label="Primary">
         <div className="app-nav-brand">
           <Link href="/dashboard" className="brand-link" aria-label="Mazemaze Piggy Bank">
@@ -86,6 +100,8 @@ export function AppShell({ children }: AppShellProps) {
               pathname === item.href ||
               (item.href === "/dashboard" && pathname === "/") ||
               (item.href === "/shared" && pathname.startsWith("/shared"));
+            const Icon = item.icon;
+            const MobileIcon = item.mobileIcon ?? item.icon;
             return (
               <Link
                 key={item.href}
@@ -93,6 +109,12 @@ export function AppShell({ children }: AppShellProps) {
                 className={`nav-link focus-ring ${isActive ? "nav-link-active" : ""}`}
                 aria-current={isActive ? "page" : undefined}
               >
+                <span className="nav-icon nav-icon-mobile" aria-hidden>
+                  <MobileIcon />
+                </span>
+                <span className="nav-icon nav-icon-desktop" aria-hidden>
+                  <Icon />
+                </span>
                 <span>{item.label}</span>
               </Link>
             );
@@ -102,7 +124,6 @@ export function AppShell({ children }: AppShellProps) {
           <CloudStatus showLabel onRetrySync={handleRetrySync} />
         </div>
       </nav>
-      <main className="app-main">{children}</main>
     </div>
   );
 }

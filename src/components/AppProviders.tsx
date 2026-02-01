@@ -47,23 +47,14 @@ export function AppProviders({ children }: { children: React.ReactNode }) {
     return "system";
   });
 
-  const [mode, setMode] = useState<ThemeMode>(() => {
-    if (typeof window === "undefined") {
-      return "light";
-    }
-    if (preference === "light" || preference === "dark") {
-      return preference;
-    }
-    return getSystemMode();
-  });
+  const [systemMode, setSystemMode] = useState<ThemeMode>(() => getSystemMode());
+  const mode: ThemeMode = preference === "system" ? systemMode : preference;
 
   useEffect(() => {
-    window.localStorage.setItem(THEME_STORAGE_KEY, preference);
-    if (preference === "system") {
-      setMode(getSystemMode());
-    } else {
-      setMode(preference);
+    if (typeof window === "undefined") {
+      return;
     }
+    window.localStorage.setItem(THEME_STORAGE_KEY, preference);
   }, [preference]);
 
   useEffect(() => {
@@ -75,7 +66,7 @@ export function AppProviders({ children }: { children: React.ReactNode }) {
       return;
     }
     const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
-    const handler = () => setMode(getSystemMode());
+    const handler = () => setSystemMode(getSystemMode());
     mediaQuery.addEventListener("change", handler);
     return () => {
       mediaQuery.removeEventListener("change", handler);

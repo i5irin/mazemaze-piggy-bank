@@ -46,6 +46,7 @@ import { createEmptySnapshot, type Snapshot } from "@/lib/persistence/snapshot";
 import { readSnapshotCache, writeSnapshotCache } from "@/lib/persistence/snapshotCache";
 import { useOnlineStatus } from "@/lib/persistence/useOnlineStatus";
 import type { Goal, NormalizedState, Position } from "@/lib/persistence/types";
+import { getDeviceId } from "@/lib/lease/deviceId";
 import type {
   DataActivity,
   DataContextValue,
@@ -58,6 +59,7 @@ import type {
 const MAX_EVENTS_PER_CHUNK = 500;
 const LEASE_DURATION_MS = 90_000;
 const LEASE_REFRESH_MS = 60_000;
+const LEASE_EDIT_EVENT_TYPES = new Set<string>(["state_repaired"]);
 
 type SnapshotRecord = {
   snapshot: Snapshot;
@@ -219,8 +221,6 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
           "Loaded cached data.",
           savedLatestEvent,
         );
-        setLease(null);
-        setLeaseError(null);
       } else {
         setStatus("error");
         setSource("empty");
@@ -238,7 +238,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
   }, [applySnapshot, savedLatestEvent]);
 
   const loadFromRemote = useCallback(async () => {
-    if (pendingEvents.length > 0) {
+    if (pendingEventsRef.current.length > 0) {
       setMessage("Unsaved changes are present. Save or discard before syncing.");
       return;
     }
@@ -302,14 +302,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     } finally {
       setActivity("idle");
     }
-  }, [
-    applySnapshot,
-    loadFromCache,
-    loadLatestEventFromRemote,
-    loadLeaseFromRemote,
-    oneDrive,
-    pendingEvents.length,
-  ]);
+  }, [applySnapshot, loadFromCache, loadLatestEventFromRemote, loadLeaseFromRemote, oneDrive]);
   useEffect(() => {
     pendingEventsRef.current = pendingEvents;
   }, [pendingEvents]);
@@ -456,8 +449,10 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
   const buildLeasePayload = useCallback((): LeaseRecord => {
     const now = new Date();
     const holderLabel = account?.name ?? account?.username ?? "Anonymous";
+    const deviceId = getDeviceId() ?? undefined;
     return {
       holderLabel,
+      deviceId,
       leaseUntil: new Date(now.getTime() + LEASE_DURATION_MS).toISOString(),
       updatedAt: now.toISOString(),
     };
@@ -465,6 +460,10 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
 
   useEffect(() => {
     if (pendingEvents.length === 0 || !isOnline || !isSignedIn || !canWrite) {
+      return;
+    }
+    const hasUserEdits = pendingEvents.some((event) => !LEASE_EDIT_EVENT_TYPES.has(event.type));
+    if (!hasUserEdits) {
       return;
     }
     let isActive = true;
@@ -492,7 +491,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       isActive = false;
       window.clearInterval(intervalId);
     };
-  }, [buildLeasePayload, canWrite, isOnline, isSignedIn, oneDrive, pendingEvents.length]);
+  }, [buildLeasePayload, canWrite, isOnline, isSignedIn, oneDrive, pendingEvents]);
 
   const ensureEditableState = useCallback((): { state: NormalizedState } | { error: string } => {
     if (!isOnline) {

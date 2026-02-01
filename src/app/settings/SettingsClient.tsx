@@ -139,7 +139,7 @@ export function SettingsClient() {
   const { status, account, error, signIn, signOut, getAccessToken } = useAuth();
   const { preference, setPreference, mode } = useTheme();
   const { selection } = useSharedSelection();
-  const [isMounted, setIsMounted] = useState(false);
+  const [isMounted] = useState(() => typeof window !== "undefined");
   const [driveState, setDriveState] = useState<OperationState>({
     status: "idle",
     message: null,
@@ -253,10 +253,6 @@ export function SettingsClient() {
     window.addEventListener("sync-retry", handler);
     return () => window.removeEventListener("sync-retry", handler);
   }, [handleRetrySync]);
-
-  useEffect(() => {
-    setIsMounted(true);
-  }, []);
 
   const handleWriteTestFile = useCallback(async () => {
     setDriveState({
