@@ -1,7 +1,7 @@
 "use client";
 
 import { Button, Spinner, Text } from "@fluentui/react-components";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useAuth } from "@/components/AuthProvider";
 import { useSharedSelection } from "@/components/SharedSelectionProvider";
 import { isAuthError } from "@/lib/auth/authErrors";
@@ -362,6 +362,26 @@ export function SettingsClient() {
     [isSignedIn, oneDrive, sharedRoot],
   );
 
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    if (!window.location.hash) {
+      return;
+    }
+    const targetId = window.location.hash.replace("#", "");
+    if (!targetId) {
+      return;
+    }
+    const target = document.getElementById(targetId);
+    if (!target) {
+      return;
+    }
+    requestAnimationFrame(() => {
+      target.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }, []);
+
   return (
     <div className="section-stack">
       <section className="app-surface">
@@ -369,26 +389,32 @@ export function SettingsClient() {
         <p className="app-muted">Manage sign-in, storage, and safety notes.</p>
       </section>
 
-      <section className="card-grid">
-        <div className="app-surface">
-          <div className="app-muted">Sign-in</div>
-          <div style={{ fontWeight: 600 }}>{signInStatus}</div>
-        </div>
-        <div className="app-surface">
-          <div className="app-muted">Personal data location</div>
-          <div style={{ fontWeight: 600 }}>{appRootLabel}</div>
-        </div>
-        <div className="app-surface">
-          <div className="app-muted">Shared data location</div>
-          <div style={{ fontWeight: 600 }}>{sharedLocationLabel}</div>
-        </div>
-        <div className="app-surface">
-          <div className="app-muted">Offline mode</div>
-          <div style={{ fontWeight: 600 }}>View-only</div>
-        </div>
-        <div className="app-surface">
-          <div className="app-muted">Account type</div>
-          <div style={{ fontWeight: 600 }}>Personal Microsoft accounts only</div>
+      <section className="app-surface" id="sync-status">
+        <h2>Sync & connection</h2>
+        <p className="app-muted">
+          Check your sign-in status, OneDrive locations, and offline availability.
+        </p>
+        <div className="card-grid">
+          <div className="app-surface">
+            <div className="app-muted">Sign-in</div>
+            <div style={{ fontWeight: 600 }}>{signInStatus}</div>
+          </div>
+          <div className="app-surface">
+            <div className="app-muted">Personal data location</div>
+            <div style={{ fontWeight: 600 }}>{appRootLabel}</div>
+          </div>
+          <div className="app-surface">
+            <div className="app-muted">Shared data location</div>
+            <div style={{ fontWeight: 600 }}>{sharedLocationLabel}</div>
+          </div>
+          <div className="app-surface">
+            <div className="app-muted">Offline mode</div>
+            <div style={{ fontWeight: 600 }}>View-only</div>
+          </div>
+          <div className="app-surface">
+            <div className="app-muted">Account type</div>
+            <div style={{ fontWeight: 600 }}>Personal Microsoft accounts only</div>
+          </div>
         </div>
       </section>
 
