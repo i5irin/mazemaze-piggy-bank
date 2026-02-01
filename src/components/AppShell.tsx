@@ -1,18 +1,13 @@
 "use client";
 
-import { Switch } from "@fluentui/react-components";
 import Image from "next/image";
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import type { ReactNode } from "react";
-import { StatusIndicator } from "@/components/StatusIndicator";
-
-type ThemeMode = "light" | "dark";
+import { CloudStatus } from "@/components/StatusIndicator";
 
 type AppShellProps = {
   children: ReactNode;
-  mode: ThemeMode;
-  onModeChange: (mode: ThemeMode) => void;
 };
 
 const navItems = [
@@ -23,8 +18,20 @@ const navItems = [
   { href: "/settings", label: "Settings" },
 ];
 
-export function AppShell({ children, mode, onModeChange }: AppShellProps) {
+export function AppShell({ children }: AppShellProps) {
   const pathname = usePathname();
+  const router = useRouter();
+
+  const handleRetrySync = () => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.sessionStorage.setItem("sync-retry", String(Date.now()));
+    window.dispatchEvent(new Event("sync-retry"));
+    if (!pathname.startsWith("/settings")) {
+      router.push("/settings#sync-status");
+    }
+  };
 
   return (
     <div className="app-shell">
@@ -51,12 +58,7 @@ export function AppShell({ children, mode, onModeChange }: AppShellProps) {
           </Link>
         </div>
         <div className="app-header-right">
-          <StatusIndicator className="status-indicator-header" />
-          <Switch
-            checked={mode === "dark"}
-            onChange={(_, data) => onModeChange(data.checked ? "dark" : "light")}
-            label="Dark mode"
-          />
+          <CloudStatus className="status-indicator-header" onRetrySync={handleRetrySync} />
         </div>
       </header>
       <nav className="app-nav" aria-label="Primary">
@@ -97,7 +99,7 @@ export function AppShell({ children, mode, onModeChange }: AppShellProps) {
           })}
         </div>
         <div className="app-nav-footer">
-          <StatusIndicator showLabel />
+          <CloudStatus showLabel onRetrySync={handleRetrySync} />
         </div>
       </nav>
       <main className="app-main">{children}</main>

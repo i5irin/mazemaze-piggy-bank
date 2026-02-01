@@ -1,8 +1,9 @@
 "use client";
 
-import { Button, Spinner, Text } from "@fluentui/react-components";
+import { Button, Radio, RadioGroup, Spinner, Text } from "@fluentui/react-components";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useAuth } from "@/components/AuthProvider";
+import { type ThemePreference, useTheme } from "@/components/AppProviders";
 import { useSharedSelection } from "@/components/SharedSelectionProvider";
 import { isAuthError } from "@/lib/auth/authErrors";
 import { getGraphScopes } from "@/lib/auth/msalConfig";
@@ -136,7 +137,9 @@ const downloadBlob = (blob: Blob, filename: string) => {
 
 export function SettingsClient() {
   const { status, account, error, signIn, signOut, getAccessToken } = useAuth();
+  const { preference, setPreference, mode } = useTheme();
   const { selection } = useSharedSelection();
+  const [isMounted, setIsMounted] = useState(false);
   const [driveState, setDriveState] = useState<OperationState>({
     status: "idle",
     message: null,
@@ -224,6 +227,36 @@ export function SettingsClient() {
       });
     }
   }, [oneDrive]);
+
+  const handleRetrySync = useCallback(() => {
+    if (!isSignedIn) {
+      setDriveState({ status: "error", message: "Sign in to retry sync." });
+      return;
+    }
+    void handleEnsureRoot();
+  }, [handleEnsureRoot, isSignedIn]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const runIfQueued = () => {
+      const queued = window.sessionStorage.getItem("sync-retry");
+      if (!queued) {
+        return;
+      }
+      window.sessionStorage.removeItem("sync-retry");
+      handleRetrySync();
+    };
+    runIfQueued();
+    const handler = () => runIfQueued();
+    window.addEventListener("sync-retry", handler);
+    return () => window.removeEventListener("sync-retry", handler);
+  }, [handleRetrySync]);
+
+  useEffect(() => {
+    setIsMounted(true);
+  }, []);
 
   const handleWriteTestFile = useCallback(async () => {
     setDriveState({
@@ -416,6 +449,26 @@ export function SettingsClient() {
             <div style={{ fontWeight: 600 }}>Personal Microsoft accounts only</div>
           </div>
         </div>
+      </section>
+
+      <section className="app-surface">
+        <h2>Appearance</h2>
+        <p className="app-muted">Use system setting or choose a theme manually.</p>
+        <RadioGroup
+          value={preference}
+          onChange={(_, data) => setPreference(data.value as ThemePreference)}
+          aria-label="Theme selection"
+        >
+          <Radio value="system" label="System" />
+          <Radio value="light" label="Light" />
+          <Radio value="dark" label="Dark" />
+        </RadioGroup>
+        <p className="app-muted">
+          Current mode:{" "}
+          <span suppressHydrationWarning>
+            {isMounted ? (mode === "dark" ? "Dark" : "Light") : "Light"}
+          </span>
+        </p>
       </section>
 
       <section className="app-surface">

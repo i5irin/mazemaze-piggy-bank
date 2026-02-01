@@ -108,6 +108,7 @@ a {
 
 .app-header-right {
   justify-content: flex-end;
+  gap: var(--space-2);
 }
 
 .brand-link {
@@ -262,17 +263,25 @@ a {
   border-radius: 8px;
 }
 
-.status-indicator {
+.cloud-status {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 10px;
+  padding: 6px 8px;
   border-radius: 999px;
   border: 1px solid var(--app-border);
   background: color-mix(in srgb, var(--app-surface) 92%, transparent);
   color: var(--app-text);
   font-size: 12px;
   line-height: 1;
+  white-space: nowrap;
+}
+
+.cloud-status-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: inherit;
 }
 
 .status-dot {
@@ -282,11 +291,11 @@ a {
   background: var(--app-accent);
 }
 
-.status-indicator[data-state="offline"] .status-dot {
+.cloud-status[data-state="offline"] .status-dot {
   background: var(--app-border);
 }
 
-.status-indicator[data-state="offline"] {
+.cloud-status[data-state="offline"] {
   color: var(--app-subtle);
 }
 
@@ -296,6 +305,26 @@ a {
 
 .status-indicator-header .status-label {
   display: none;
+}
+
+.status-indicator-header .sync-button {
+  padding: 6px 8px;
+}
+
+.sync-button {
+  border: 0;
+  background: var(--app-accent);
+  color: #1a1a1a;
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.sync-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 @media (min-width: 900px) {

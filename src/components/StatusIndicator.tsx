@@ -1,11 +1,13 @@
 "use client";
 
+import Image from "next/image";
 import Link from "next/link";
 import { useEffect, useState } from "react";
 
-type StatusIndicatorProps = {
+type CloudStatusProps = {
   showLabel?: boolean;
   className?: string;
+  onRetrySync?: () => void;
 };
 
 const getOnlineStatus = (): boolean => {
@@ -15,7 +17,7 @@ const getOnlineStatus = (): boolean => {
   return navigator.onLine;
 };
 
-export function StatusIndicator({ showLabel = false, className }: StatusIndicatorProps) {
+export function CloudStatus({ showLabel = false, className, onRetrySync }: CloudStatusProps) {
   const [isOnline, setIsOnline] = useState<boolean>(getOnlineStatus);
 
   useEffect(() => {
@@ -32,14 +34,28 @@ export function StatusIndicator({ showLabel = false, className }: StatusIndicato
   const label = isOnline ? "Online" : "Offline";
 
   return (
-    <Link
-      href="/settings#sync-status"
-      className={`status-indicator focus-ring ${className ?? ""}`.trim()}
+    <div
+      className={`cloud-status ${className ?? ""}`.trim()}
       data-state={isOnline ? "online" : "offline"}
-      aria-label={`Sync status: ${label}`}
     >
-      <span className="status-dot" aria-hidden />
-      {showLabel ? <span className="status-label">{label}</span> : null}
-    </Link>
+      <Link
+        href="/settings#sync-status"
+        className="cloud-status-link focus-ring"
+        aria-label={`Sync status: ${label}`}
+      >
+        <Image src="/images/onedrive.svg" alt="OneDrive" width={18} height={18} />
+        <span className="status-dot" aria-hidden />
+        {showLabel ? <span className="status-label">{label}</span> : null}
+      </Link>
+      <button
+        type="button"
+        className="sync-button focus-ring"
+        aria-label="Retry sync"
+        onClick={onRetrySync}
+        disabled={!onRetrySync}
+      >
+        Retry
+      </button>
+    </div>
   );
 }
