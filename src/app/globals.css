@@ -763,6 +763,14 @@ a {
   gap: var(--space-3);
 }
 
+.accounts-desktop-only {
+  display: block;
+}
+
+.accounts-mobile-only {
+  display: none;
+}
+
 .accounts-master-detail {
   display: grid;
   gap: var(--space-4);
@@ -861,6 +869,71 @@ a {
 
 .accounts-empty-card p {
   margin: 0;
+}
+
+.accounts-mobile-account-card,
+.accounts-mobile-position-card {
+  width: 100%;
+  text-align: left;
+  border: 1px solid var(--app-border);
+  background: color-mix(in srgb, var(--app-surface) 95%, transparent);
+  border-radius: var(--app-radius);
+  padding: var(--space-3);
+  display: grid;
+  gap: 6px;
+  color: inherit;
+}
+
+.accounts-mobile-value {
+  font-weight: 700;
+}
+
+.accounts-mobile-position-card-highlight {
+  border-color: color-mix(in srgb, var(--app-accent) 65%, var(--app-border));
+  background: color-mix(in srgb, var(--app-accent) 24%, var(--app-surface));
+}
+
+.accounts-mobile-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.accounts-mobile-title h2 {
+  margin: 0;
+}
+
+.accounts-mobile-fab {
+  position: fixed;
+  right: 16px;
+  bottom: 92px;
+  z-index: 38;
+  display: none;
+  gap: var(--space-2);
+  justify-items: end;
+}
+
+.accounts-mobile-fab-button {
+  width: 52px;
+  height: 52px;
+  border-radius: 999px;
+  font-size: 24px;
+  padding: 0;
+}
+
+.accounts-mobile-fab-menu {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border-radius: var(--app-radius);
+  border: 1px solid var(--app-border);
+  background: var(--app-surface);
+  box-shadow: var(--app-shadow);
+  min-width: 220px;
+}
+
+.accounts-mobile-fab-reason {
+  font-size: 12px;
 }
 
 .accounts-table {
@@ -995,6 +1068,14 @@ a {
 }
 
 @media (max-width: 719px) {
+  .accounts-desktop-only {
+    display: none;
+  }
+
+  .accounts-mobile-only {
+    display: block;
+  }
+
   .accounts-drawer-overlay {
     padding: 0;
   }
@@ -1003,5 +1084,9 @@ a {
   .accounts-dialog {
     max-width: none;
     border-radius: 0;
+  }
+
+  .accounts-mobile-fab {
+    display: grid;
   }
 }

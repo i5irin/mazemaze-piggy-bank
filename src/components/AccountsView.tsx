@@ -56,6 +56,8 @@ type InlineEditState = {
   isSaving: boolean;
 };
 
+type MobileScreen = "accounts" | "account";
+
 const getEditNotice = (data: DataContextValue): string | null => {
   if (!data.isOnline) {
     return "Offline mode is view-only. Connect to the internet to edit.";
@@ -149,6 +151,8 @@ export function AccountsView({ data }: { data: DataContextValue }) {
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
   const [drawer, setDrawer] = useState<DrawerState>({ type: "closed" });
   const [positionTab, setPositionTab] = useState<"details" | "allocations" | "history">("details");
+  const [mobileScreen, setMobileScreen] = useState<MobileScreen>("accounts");
+  const [isFabMenuOpen, setIsFabMenuOpen] = useState(false);
   const [inlineEdit, setInlineEdit] = useState<InlineEditState | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [retryPending, setRetryPending] = useState(false);
@@ -166,6 +170,9 @@ export function AccountsView({ data }: { data: DataContextValue }) {
   const [positionDetailsAssetType, setPositionDetailsAssetType] = useState<AssetType>("cash");
   const [positionDetailsAllocationMode, setPositionDetailsAllocationMode] =
     useState<Position["allocationMode"]>("fixed");
+  const [highlightedPositionId, setHighlightedPositionId] = useState<string | null>(null);
+  const pendingNewAccountIdsRef = useRef<Set<string> | null>(null);
+  const pendingNewPositionIdsRef = useRef<{ accountId: string; ids: Set<string> } | null>(null);
 
   useEffect(() => {
     saveChangesRef.current = saveChanges;
@@ -196,6 +203,10 @@ export function AccountsView({ data }: { data: DataContextValue }) {
     }
     return positions.filter((position) => position.accountId === selectedAccount.id);
   }, [positions, selectedAccount]);
+  const mobilePositionsForAccount = useMemo(
+    () => [...positionsForAccount].reverse(),
+    [positionsForAccount],
+  );
 
   const selectedAccountTotals = useMemo(() => {
     if (!selectedAccount) {
@@ -365,6 +376,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
     if (!selectedAccount) {
       return;
     }
+    setIsFabMenuOpen(false);
     setPositionFormLabel("");
     setPositionFormAssetType("cash");
     setPositionFormMarketValue("0");
@@ -372,6 +384,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
   };
 
   const openAddAccountDrawer = () => {
+    setIsFabMenuOpen(false);
     setAccountFormName("");
     setDrawer({ type: "addAccount" });
   };
@@ -401,11 +414,47 @@ export function AccountsView({ data }: { data: DataContextValue }) {
     }
   };
 
+  useEffect(() => {
+    const pendingAccountIds = pendingNewAccountIdsRef.current;
+    if (pendingAccountIds) {
+      const created = accounts.find((account) => !pendingAccountIds.has(account.id));
+      if (created) {
+        setSelectedAccountId(created.id);
+        setMobileScreen("account");
+        pendingNewAccountIdsRef.current = null;
+      }
+    }
+  }, [accounts]);
+
+  useEffect(() => {
+    const pendingPosition = pendingNewPositionIdsRef.current;
+    if (pendingPosition) {
+      const created = positions.find(
+        (position) =>
+          position.accountId === pendingPosition.accountId && !pendingPosition.ids.has(position.id),
+      );
+      if (created) {
+        setHighlightedPositionId(created.id);
+        setMobileScreen("account");
+        pendingNewPositionIdsRef.current = null;
+      }
+    }
+  }, [positions]);
+
+  useEffect(() => {
+    if (!highlightedPositionId) {
+      return;
+    }
+    const timerId = window.setTimeout(() => setHighlightedPositionId(null), 1800);
+    return () => window.clearTimeout(timerId);
+  }, [highlightedPositionId]);
+
   const submitAddAccount = () => {
     if (accountFormName.trim().length === 0) {
       setErrorMessage("Account name is required.");
       return;
     }
+    pendingNewAccountIdsRef.current = new Set(accounts.map((account) => account.id));
     closeDrawer();
     void runMutation(() => createAccount(accountFormName));
   };
@@ -416,6 +465,13 @@ export function AccountsView({ data }: { data: DataContextValue }) {
       setErrorMessage("Market value must be a non-negative integer.");
       return;
     }
+    pendingNewPositionIdsRef.current = {
+      accountId,
+      ids: new Set(
+        positions.filter((position) => position.accountId === accountId).map((item) => item.id),
+      ),
+    };
+    setMobileScreen("account");
     closeDrawer();
     void runMutation(() =>
       createPosition({
@@ -426,6 +482,14 @@ export function AccountsView({ data }: { data: DataContextValue }) {
       }),
     );
   };
+
+  const fabPositionDisabledReason = !canEdit
+    ? editNotice
+    : mobileScreen !== "account"
+      ? "Open an account first."
+      : !selectedAccount
+        ? "Select an account first."
+        : null;
 
   return (
     <div className="section-stack accounts-page">
@@ -448,7 +512,154 @@ export function AccountsView({ data }: { data: DataContextValue }) {
         </div>
       ) : null}
 
-      <div className="accounts-master-detail">
+      <div className="accounts-mobile-only section-stack">
+        {mobileScreen === "accounts" ? (
+          <section className="app-surface">
+            <div className="accounts-pane-header">
+              <h2>Accounts</h2>
+            </div>
+            {accountsSummary.length === 0 ? (
+              <div className="accounts-empty-card">
+                <h3>No accounts yet</h3>
+                <p className="app-muted">Add an account to start tracking your positions.</p>
+                <Button appearance="primary" onClick={openAddAccountDrawer} disabled={!canEdit}>
+                  Add account
+                </Button>
+              </div>
+            ) : (
+              <div className="section-stack">
+                {accountsSummary.map(({ account, total, free, count }) => (
+                  <button
+                    key={account.id}
+                    type="button"
+                    className="accounts-mobile-account-card"
+                    onClick={() => {
+                      setSelectedAccountId(account.id);
+                      setMobileScreen("account");
+                    }}
+                  >
+                    <div>
+                      <div className="accounts-master-name">{account.name}</div>
+                      <div className="app-muted">{count} positions</div>
+                      <div className="app-muted">Free {formatCurrency(free)}</div>
+                    </div>
+                    <div className="accounts-master-total">{formatCurrency(total)}</div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </section>
+        ) : (
+          <section className="app-surface">
+            <div className="accounts-pane-header">
+              <div className="accounts-mobile-title">
+                <Button
+                  appearance="secondary"
+                  size="small"
+                  onClick={() => setMobileScreen("accounts")}
+                >
+                  Back
+                </Button>
+                <h2>{selectedAccount ? `Positions in ${selectedAccount.name}` : "Positions"}</h2>
+              </div>
+              <span
+                className="accounts-info-icon"
+                aria-label="Inline edit help"
+                title={"Enter to save · Esc to cancel\nJPY integer only."}
+              >
+                ⓘ
+              </span>
+            </div>
+
+            {selectedAccount ? (
+              <div className="accounts-summary-bar">
+                <div className="accounts-summary-name">{selectedAccount.name}</div>
+                <div>Total {formatCurrency(selectedAccountTotals.total)}</div>
+                <div>Allocated {formatCurrency(selectedAccountTotals.allocated)}</div>
+                <div>Free {formatCurrency(selectedAccountTotals.free)}</div>
+                <Button
+                  size="small"
+                  onClick={() => openEditAccountDrawer(selectedAccount.id)}
+                  disabled={!canEdit}
+                >
+                  Edit account
+                </Button>
+              </div>
+            ) : null}
+
+            {!selectedAccount ? (
+              <div className="app-muted">Select an account first.</div>
+            ) : mobilePositionsForAccount.length === 0 ? (
+              <div className="accounts-empty-card">
+                <h3>No positions in this account</h3>
+                <p className="app-muted">Add your first position (e.g., Deposit, Cash, FX).</p>
+                <Button appearance="primary" onClick={openAddPositionDrawer} disabled={!canEdit}>
+                  Add position
+                </Button>
+              </div>
+            ) : (
+              <div className="section-stack">
+                {mobilePositionsForAccount.map((position) => {
+                  const allocated = allocationTotals[position.id] ?? 0;
+                  const free = Math.max(0, position.marketValue - allocated);
+                  return (
+                    <button
+                      key={position.id}
+                      type="button"
+                      className={`accounts-mobile-position-card ${highlightedPositionId === position.id ? "accounts-mobile-position-card-highlight" : ""}`}
+                      onClick={() => openPositionDetailsDrawer(position)}
+                    >
+                      <div className="accounts-position-label">{position.label}</div>
+                      <div className="accounts-mobile-value">
+                        {formatCurrency(position.marketValue)}
+                      </div>
+                      <div className="app-muted">
+                        Allocated {formatCurrency(allocated)} · Free {formatCurrency(free)}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        )}
+
+        <div className="accounts-mobile-fab">
+          <Button
+            appearance="primary"
+            className="accounts-mobile-fab-button"
+            onClick={() => setIsFabMenuOpen((open) => !open)}
+            aria-label="Open add menu"
+          >
+            +
+          </Button>
+          {isFabMenuOpen ? (
+            <div className="accounts-mobile-fab-menu">
+              <Button
+                onClick={openAddAccountDrawer}
+                disabled={!canEdit}
+                title={!canEdit ? (editNotice ?? undefined) : undefined}
+              >
+                🏦 Account
+              </Button>
+              <Button
+                onClick={openAddPositionDrawer}
+                disabled={!!fabPositionDisabledReason}
+                title={fabPositionDisabledReason ?? undefined}
+              >
+                💰 Position
+              </Button>
+              {fabPositionDisabledReason ? (
+                <div className="app-muted accounts-mobile-fab-reason">
+                  {fabPositionDisabledReason}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      </div>
+
+      <div className="accounts-master-detail accounts-desktop-only">
         <section className="app-surface accounts-master-pane">
           <div className="accounts-pane-header">
             <h2>Accounts</h2>
@@ -484,12 +695,14 @@ export function AccountsView({ data }: { data: DataContextValue }) {
                     onClick={() => {
                       setSelectedAccountId(account.id);
                       setInlineEdit(null);
+                      setMobileScreen("account");
                     }}
                     onKeyDown={(event) => {
                       if (event.key === "Enter" || event.key === " ") {
                         event.preventDefault();
                         setSelectedAccountId(account.id);
                         setInlineEdit(null);
+                        setMobileScreen("account");
                       }
                     }}
                   >
