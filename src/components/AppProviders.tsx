@@ -20,6 +20,54 @@ type ThemeContextValue = {
 
 const ThemeContext = createContext<ThemeContextValue | null>(null);
 
+const lightTheme = {
+  ...webLightTheme,
+  colorBrandBackground: "#f6e58d",
+  colorBrandBackground2: "#f1df83",
+  colorBrandBackgroundHover: "#e7d173",
+  colorBrandBackgroundPressed: "#d9be59",
+  colorBrandForeground1: "#626258",
+  colorBrandForeground2: "#56564d",
+  colorBrandForegroundLink: "#626258",
+  colorBrandForegroundLinkHover: "#4f4f46",
+  colorBrandForegroundLinkPressed: "#3f3f38",
+  colorBrandStroke1: "#b7a862",
+  colorBrandStroke2: "#d2c273",
+  colorCompoundBrandBackground: "#f6e58d",
+  colorCompoundBrandBackgroundHover: "#e7d173",
+  colorCompoundBrandBackgroundPressed: "#d9be59",
+  colorCompoundBrandStroke: "#b7a862",
+  colorCompoundBrandStrokeHover: "#a39457",
+  colorCompoundBrandStrokePressed: "#8f824d",
+  colorNeutralForegroundOnBrand: "#1a1a16",
+  colorStrokeFocus1: "#f5f5f2",
+  colorStrokeFocus2: "#f6e58d",
+};
+
+const darkTheme = {
+  ...webDarkTheme,
+  colorBrandBackground: "#f6e58d",
+  colorBrandBackground2: "#f1df83",
+  colorBrandBackgroundHover: "#e7d173",
+  colorBrandBackgroundPressed: "#d9be59",
+  colorBrandForeground1: "#f5f5f2",
+  colorBrandForeground2: "#e6e6de",
+  colorBrandForegroundLink: "#f6e58d",
+  colorBrandForegroundLinkHover: "#f1df83",
+  colorBrandForegroundLinkPressed: "#e7d173",
+  colorBrandStroke1: "#f1df83",
+  colorBrandStroke2: "#d2c273",
+  colorCompoundBrandBackground: "#f6e58d",
+  colorCompoundBrandBackgroundHover: "#e7d173",
+  colorCompoundBrandBackgroundPressed: "#d9be59",
+  colorCompoundBrandStroke: "#f1df83",
+  colorCompoundBrandStrokeHover: "#e7d173",
+  colorCompoundBrandStrokePressed: "#d9be59",
+  colorNeutralForegroundOnBrand: "#1a1a16",
+  colorStrokeFocus1: "#1e1e1b",
+  colorStrokeFocus2: "#f6e58d",
+};
+
 const getSystemMode = (): ThemeMode => {
   if (typeof window === "undefined") {
     return "light";
@@ -82,7 +130,7 @@ export function AppProviders({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
-  const theme = useMemo(() => (mode === "dark" ? webDarkTheme : webLightTheme), [mode]);
+  const theme = useMemo(() => (mode === "dark" ? darkTheme : lightTheme), [mode]);
 
   return (
     <FluentProvider theme={theme}>

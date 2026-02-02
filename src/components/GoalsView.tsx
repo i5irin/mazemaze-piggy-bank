@@ -4,19 +4,7 @@ import { Button, Dropdown, Field, Input, Option, Text } from "@fluentui/react-co
 import { useEffect, useMemo, useState } from "react";
 import type { DataContextValue } from "@/components/dataContext";
 import type { Account, Allocation, Goal, Position } from "@/lib/persistence/types";
-
-const formatCurrency = (value: number): string => `¥${value.toLocaleString("en-US")}`;
-
-const parseNonNegativeInteger = (value: string): number | null => {
-  if (value.trim().length === 0) {
-    return null;
-  }
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 0) {
-    return null;
-  }
-  return parsed;
-};
+import { formatCurrency, parseIntegerInput } from "@/lib/numberFormat";
 
 const buildAllocationDefaults = (allocations: Allocation[]): Record<string, string> => {
   const values: Record<string, string> = {};
@@ -289,7 +277,7 @@ const GoalAllocationsPanel = ({
       setPageError("Select a position to allocate from.");
       return;
     }
-    const amount = parseNonNegativeInteger(newAllocationAmount);
+    const amount = parseIntegerInput(newAllocationAmount);
     if (amount === null) {
       setPageError("Allocated amount must be a non-negative integer.");
       return;
@@ -310,7 +298,7 @@ const GoalAllocationsPanel = ({
 
   const handleUpdateAllocation = (allocationId: string) => {
     const value = mergedEdits[allocationId] ?? "";
-    const amount = parseNonNegativeInteger(value);
+    const amount = parseIntegerInput(value);
     if (amount === null) {
       setPageError("Allocated amount must be a non-negative integer.");
       return;
@@ -328,7 +316,7 @@ const GoalAllocationsPanel = ({
       if (raw.trim().length === 0) {
         return { allocationId: allocation.id, amount: 0 };
       }
-      const amount = parseNonNegativeInteger(raw);
+      const amount = parseIntegerInput(raw);
       return { allocationId: allocation.id, amount: amount ?? -1 };
     });
     const hasInvalid = reductions.some((item) => item.amount < 0);
@@ -663,8 +651,8 @@ export function GoalsView({ data }: { data: DataContextValue }) {
   }, [selectedGoal?.id]);
 
   const handleCreateGoal = () => {
-    const targetAmount = parseNonNegativeInteger(newGoalTargetAmount);
-    const priority = parseNonNegativeInteger(newGoalPriority);
+    const targetAmount = parseIntegerInput(newGoalTargetAmount);
+    const priority = parseIntegerInput(newGoalPriority);
     if (targetAmount === null) {
       setPageError("Target amount must be a non-negative integer.");
       return;
@@ -703,8 +691,8 @@ export function GoalsView({ data }: { data: DataContextValue }) {
       setPageError("Select a goal to edit.");
       return;
     }
-    const targetAmount = parseNonNegativeInteger(input.targetAmount);
-    const priority = parseNonNegativeInteger(input.priority);
+    const targetAmount = parseIntegerInput(input.targetAmount);
+    const priority = parseIntegerInput(input.priority);
     if (targetAmount === null) {
       setPageError("Target amount must be a non-negative integer.");
       return;
@@ -791,7 +779,7 @@ export function GoalsView({ data }: { data: DataContextValue }) {
     }
     const payments = selectedGoalAllocations.map((allocation) => {
       const raw = mergedSpendInputs[allocation.id] ?? "0";
-      const amount = parseNonNegativeInteger(raw);
+      const amount = parseIntegerInput(raw);
       return {
         allocation,
         amount: amount ?? -1,

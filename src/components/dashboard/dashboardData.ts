@@ -1,6 +1,7 @@
 import type { AllocationNotice } from "@/lib/persistence/domain";
 import type { PendingEvent } from "@/lib/persistence/eventChunk";
 import type { Account, Allocation, Goal, NormalizedState, Position } from "@/lib/persistence/types";
+export { formatCurrency } from "@/lib/numberFormat";
 
 export type DashboardTotals = {
   totalAssets: number | null;
@@ -81,13 +82,6 @@ const sumBy = <T>(items: T[], pick: (item: T) => number): number =>
   items.reduce((total, item) => total + pick(item), 0);
 
 const isGoalActive = (goal: Goal): boolean => goal.status === "active" && !goal.spentAt;
-
-export const formatCurrency = (value: number | null): string => {
-  if (value === null) {
-    return "—";
-  }
-  return `¥${value.toLocaleString("en-US")}`;
-};
 
 export const formatPercent = (ratio: number | null): string => {
   if (ratio === null) {

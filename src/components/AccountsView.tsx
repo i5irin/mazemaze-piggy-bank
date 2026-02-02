@@ -3,6 +3,12 @@
 import { Button, Dropdown, Field, Input, Option, Text } from "@fluentui/react-components";
 import { useMemo, useState } from "react";
 import type { DataContextValue } from "@/components/dataContext";
+import {
+  formatCurrency,
+  formatIntegerInput,
+  getIntegerInputError,
+  parseIntegerInput,
+} from "@/lib/numberFormat";
 import type { Account, AssetType, Position } from "@/lib/persistence/types";
 
 const assetTypeOptions: { value: AssetType; label: string }[] = [
@@ -22,18 +28,10 @@ const allocationModeOptions: { value: Position["allocationMode"]; label: string 
   { value: "priority", label: "Priority" },
 ];
 
-const formatCurrency = (value: number): string => `¥${value.toLocaleString("en-US")}`;
-
-const parseAmount = (value: string): number | null => {
-  if (value.trim().length === 0) {
-    return null;
-  }
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 0) {
-    return null;
-  }
-  return parsed;
-};
+const assetTypeLabels = new Map(assetTypeOptions.map((option) => [option.value, option.label]));
+const allocationModeLabels = new Map(
+  allocationModeOptions.map((option) => [option.value, option.label]),
+);
 
 const getEditNotice = (data: DataContextValue): string | null => {
   if (!data.isOnline) {
@@ -46,6 +44,14 @@ const getEditNotice = (data: DataContextValue): string | null => {
     return data.readOnlyReason;
   }
   return null;
+};
+
+const formatTimestamp = (value: string): string => {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+  return parsed.toLocaleString("en-US");
 };
 
 const AccountDetailsPanel = ({
@@ -133,12 +139,13 @@ const PositionDetailsPanel = ({
   const [editPositionLabel, setEditPositionLabel] = useState(position.label);
   const [editPositionAssetType, setEditPositionAssetType] = useState<AssetType>(position.assetType);
   const [editPositionMarketValue, setEditPositionMarketValue] = useState(
-    position.marketValue.toString(),
+    formatIntegerInput(position.marketValue.toString()),
   );
   const [editPositionAllocationMode, setEditPositionAllocationMode] = useState<
     Position["allocationMode"]
   >(position.allocationMode);
   const [positionDeleteStep, setPositionDeleteStep] = useState<0 | 1 | 2>(0);
+  const marketValueError = getIntegerInputError(editPositionMarketValue, { required: true });
 
   return (
     <div className="section-stack">
@@ -171,12 +178,15 @@ const PositionDetailsPanel = ({
           disabled={!canEdit}
         />
       </Field>
-      <Field label="Market value (JPY)">
+      <Field
+        label="Market value (JPY)"
+        validationState={marketValueError ? "error" : "none"}
+        validationMessage={marketValueError ?? undefined}
+      >
         <Input
-          type="number"
           inputMode="numeric"
           value={editPositionMarketValue}
-          onChange={(_, data) => setEditPositionMarketValue(data.value)}
+          onChange={(_, data) => setEditPositionMarketValue(formatIntegerInput(data.value))}
           disabled={!canEdit}
         />
       </Field>
@@ -211,7 +221,7 @@ const PositionDetailsPanel = ({
               allocationMode: editPositionAllocationMode,
             })
           }
-          disabled={!canEdit}
+          disabled={!canEdit || !!marketValueError}
         >
           Save position
         </Button>
@@ -284,23 +294,15 @@ export function AccountsView({ data }: { data: DataContextValue }) {
     return map;
   }, [goals]);
 
-  const accountsSorted = useMemo(
-    () =>
-      [...accounts].sort(
-        (left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id),
-      ),
-    [accounts],
-  );
-
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
   const [selectedPositionId, setSelectedPositionId] = useState<string | null>(null);
 
   const effectiveAccountId = useMemo(() => {
-    if (selectedAccountId && accountsSorted.some((account) => account.id === selectedAccountId)) {
+    if (selectedAccountId && accounts.some((account) => account.id === selectedAccountId)) {
       return selectedAccountId;
     }
-    return accountsSorted[0]?.id ?? null;
-  }, [accountsSorted, selectedAccountId]);
+    return accounts[0]?.id ?? null;
+  }, [accounts, selectedAccountId]);
 
   const selectedAccount = accounts.find((account) => account.id === effectiveAccountId) ?? null;
 
@@ -308,11 +310,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
     if (!selectedAccount) {
       return [];
     }
-    return positions
-      .filter((position) => position.accountId === selectedAccount.id)
-      .sort(
-        (left, right) => left.label.localeCompare(right.label) || left.id.localeCompare(right.id),
-      );
+    return positions.filter((position) => position.accountId === selectedAccount.id);
   }, [positions, selectedAccount]);
 
   const effectivePositionId = useMemo(() => {
@@ -346,6 +344,11 @@ export function AccountsView({ data }: { data: DataContextValue }) {
   const [newPositionLabel, setNewPositionLabel] = useState("");
   const [newPositionAssetType, setNewPositionAssetType] = useState<AssetType>("cash");
   const [newPositionMarketValue, setNewPositionMarketValue] = useState("0");
+  const [isAccountDrawerOpen, setIsAccountDrawerOpen] = useState(false);
+  const [isPositionDrawerOpen, setIsPositionDrawerOpen] = useState(false);
+  const [inlineEditPositionId, setInlineEditPositionId] = useState<string | null>(null);
+  const [inlineEditValue, setInlineEditValue] = useState("");
+  const [isFabOpen, setIsFabOpen] = useState(false);
 
   const selectedPositionAllocations = useMemo(() => {
     if (!selectedPosition) {
@@ -359,11 +362,15 @@ export function AccountsView({ data }: { data: DataContextValue }) {
     selectedPosition?.allocationMode === "ratio" && selectedPositionAllocations.length === 0;
   const ratioZeroBalance =
     selectedPosition?.allocationMode === "ratio" && selectedPosition.marketValue === 0;
+  const newPositionMarketValueError = getIntegerInputError(newPositionMarketValue, {
+    required: true,
+  });
 
   const handleCreateAccount = () => {
     const result = createAccount(newAccountName);
     if (reportOutcome(result, "Account created in draft.")) {
       setNewAccountName("");
+      setIsAccountDrawerOpen(false);
     }
   };
 
@@ -388,7 +395,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
       setPageError("Select an account before adding a position.");
       return;
     }
-    const parsed = parseAmount(newPositionMarketValue);
+    const parsed = parseIntegerInput(newPositionMarketValue);
     if (parsed === null) {
       setPageError("Market value must be a non-negative integer.");
       return;
@@ -403,6 +410,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
       setNewPositionLabel("");
       setNewPositionMarketValue("0");
       setNewPositionAssetType("cash");
+      setIsPositionDrawerOpen(false);
     }
   };
 
@@ -416,7 +424,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
       setPageError("Select a position to edit.");
       return;
     }
-    const parsed = parseAmount(input.marketValue);
+    const parsed = parseIntegerInput(input.marketValue);
     if (parsed === null) {
       setPageError("Market value must be a non-negative integer.");
       return;
@@ -442,7 +450,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
   };
 
   const accountCardTotals = useMemo(() => {
-    return accountsSorted.map((account) => {
+    return accounts.map((account) => {
       const positionsForCard = positions.filter((position) => position.accountId === account.id);
       const total = positionsForCard.reduce((sum, position) => sum + position.marketValue, 0);
       return {
@@ -451,18 +459,48 @@ export function AccountsView({ data }: { data: DataContextValue }) {
         total,
       };
     });
-  }, [accountsSorted, positions]);
+  }, [accounts, positions]);
+
+  const startInlineEdit = (position: Position) => {
+    setInlineEditPositionId(position.id);
+    setInlineEditValue(formatIntegerInput(position.marketValue.toString()));
+  };
+
+  const cancelInlineEdit = () => {
+    setInlineEditPositionId(null);
+    setInlineEditValue("");
+  };
 
   return (
     <div className="section-stack">
-      <section className="app-surface">
-        <h1>Accounts</h1>
-        <p className="app-muted">Track {scopeLabel.toLowerCase()} accounts and positions.</p>
-        {space.scope === "shared" ? (
-          <div className="app-muted">
-            Shared space: {space.label} ({space.sharedId ?? "Unknown"})
+      <section className="app-surface accounts-hero">
+        <div className="accounts-hero-row">
+          <div>
+            <h1>Accounts</h1>
+            <p className="app-muted">Track {scopeLabel.toLowerCase()} accounts and positions.</p>
+            {space.scope === "shared" ? (
+              <div className="app-muted">
+                Shared space: {space.label} ({space.sharedId ?? "Unknown"})
+              </div>
+            ) : null}
           </div>
-        ) : null}
+          <div className="accounts-hero-actions">
+            <Button
+              appearance="primary"
+              onClick={() => setIsAccountDrawerOpen(true)}
+              disabled={!canEdit}
+            >
+              Add account
+            </Button>
+            <Button
+              appearance="secondary"
+              onClick={() => setIsPositionDrawerOpen(true)}
+              disabled={!canEdit || !selectedAccount}
+            >
+              Add position
+            </Button>
+          </div>
+        </div>
       </section>
 
       {editNotice ? (
@@ -481,209 +519,368 @@ export function AccountsView({ data }: { data: DataContextValue }) {
         </div>
       ) : null}
 
-      <section className="app-surface">
-        <h2>Account list</h2>
-        {accountCardTotals.length === 0 ? (
-          <div className="app-muted">No accounts yet. Create one to get started.</div>
-        ) : (
-          <div className="card-grid">
-            {accountCardTotals.map(({ account, positionsCount, total }) => (
-              <div key={account.id} className="app-surface">
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+      <div className="accounts-layout">
+        <section className="app-surface accounts-list">
+          <div className="accounts-list-header">
+            <h2>Accounts</h2>
+            <Button size="small" onClick={() => setIsAccountDrawerOpen(true)} disabled={!canEdit}>
+              Add
+            </Button>
+          </div>
+          {accountCardTotals.length === 0 ? (
+            <div className="app-muted">No accounts yet. Create one to get started.</div>
+          ) : (
+            <div className="section-stack">
+              {accountCardTotals.map(({ account, positionsCount, total }) => (
+                <div key={account.id} className="accounts-list-item">
                   <div>
                     <div style={{ fontWeight: 600 }}>{account.name}</div>
                     <div className="app-muted">{positionsCount} positions</div>
                   </div>
-                  <Button
-                    size="small"
-                    onClick={() => {
-                      setSelectedAccountId(account.id);
-                      setSelectedPositionId(null);
-                    }}
-                    appearance={effectiveAccountId === account.id ? "primary" : "secondary"}
-                  >
-                    View
-                  </Button>
-                </div>
-                <div style={{ marginTop: 8, fontSize: "18px", fontWeight: 600 }}>
-                  {formatCurrency(total)}
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
-
-      <section className="app-surface">
-        <h2>Create account</h2>
-        <div className="section-stack">
-          <Field label="Account name">
-            <Input
-              value={newAccountName}
-              onChange={(_, data) => setNewAccountName(data.value)}
-              placeholder="Everyday Cash"
-              disabled={!canEdit}
-            />
-          </Field>
-          <Button appearance="primary" onClick={handleCreateAccount} disabled={!canEdit}>
-            Add account
-          </Button>
-        </div>
-      </section>
-
-      <section className="app-surface">
-        <h2>Account details</h2>
-        {!selectedAccount ? (
-          <div className="app-muted">Select an account to view details.</div>
-        ) : (
-          <div className="section-stack">
-            <AccountDetailsPanel
-              key={selectedAccount.id}
-              account={selectedAccount}
-              canEdit={canEdit}
-              onUpdate={handleUpdateAccount}
-              onDelete={handleDeleteAccount}
-            />
-          </div>
-        )}
-      </section>
-
-      <section className="app-surface">
-        <h2>Positions</h2>
-        {!selectedAccount ? (
-          <div className="app-muted">Select an account to manage positions.</div>
-        ) : positionsForAccount.length === 0 ? (
-          <div className="app-muted">No positions yet for this account.</div>
-        ) : (
-          <div className="card-grid">
-            {positionsForAccount.map((position) => {
-              const allocated = allocationTotals[position.id] ?? 0;
-              const available = Math.max(0, position.marketValue - allocated);
-              return (
-                <div key={position.id} className="app-surface">
-                  <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-                    <div>
-                      <div style={{ fontWeight: 600 }}>{position.label}</div>
-                      <div className="app-muted">{position.assetType.toUpperCase()}</div>
-                    </div>
+                  <div className="accounts-list-item-meta">
+                    <div style={{ fontWeight: 600 }}>{formatCurrency(total)}</div>
                     <Button
                       size="small"
-                      onClick={() => setSelectedPositionId(position.id)}
-                      appearance={effectivePositionId === position.id ? "primary" : "secondary"}
+                      onClick={() => {
+                        setSelectedAccountId(account.id);
+                        setSelectedPositionId(null);
+                      }}
+                      appearance={effectiveAccountId === account.id ? "primary" : "secondary"}
                     >
                       View
                     </Button>
                   </div>
-                  <div style={{ marginTop: 8 }}>
-                    <div style={{ fontWeight: 600 }}>{formatCurrency(position.marketValue)}</div>
-                    <div className="app-muted">
-                      Allocated {formatCurrency(allocated)} · Available {formatCurrency(available)}
-                    </div>
-                  </div>
                 </div>
-              );
-            })}
-          </div>
-        )}
-      </section>
-
-      <section className="app-surface">
-        <h2>Add position</h2>
-        <div className="section-stack">
-          <Field label="Asset type">
-            <Dropdown
-              selectedOptions={[newPositionAssetType]}
-              onOptionSelect={(_, data) => {
-                const value = data.optionValue as AssetType | undefined;
-                if (value) {
-                  setNewPositionAssetType(value);
-                }
-              }}
-              disabled={!canEdit || !selectedAccount}
-            >
-              {assetTypeOptions.map((option) => (
-                <Option key={option.value} value={option.value}>
-                  {option.label}
-                </Option>
               ))}
-            </Dropdown>
-          </Field>
-          <Field label="Label">
-            <Input
-              value={newPositionLabel}
-              onChange={(_, data) => setNewPositionLabel(data.value)}
-              placeholder="e.g., Wallet"
-              disabled={!canEdit || !selectedAccount}
-            />
-          </Field>
-          <Field label="Market value (JPY)">
-            <Input
-              type="number"
-              inputMode="numeric"
-              value={newPositionMarketValue}
-              onChange={(_, data) => setNewPositionMarketValue(data.value)}
-              disabled={!canEdit || !selectedAccount}
-            />
-          </Field>
-          <Button
-            appearance="primary"
-            onClick={handleCreatePosition}
-            disabled={!canEdit || !selectedAccount}
-          >
-            Add position
-          </Button>
-        </div>
-      </section>
+            </div>
+          )}
+        </section>
 
-      <section className="app-surface">
-        <h2>Position details</h2>
-        {!selectedPosition ? (
-          <div className="app-muted">Select a position to view details.</div>
-        ) : (
-          <div className="section-stack">
-            <PositionDetailsPanel
-              key={selectedPosition.id}
-              position={selectedPosition}
-              canEdit={canEdit}
-              onUpdate={handleUpdatePosition}
-              onDelete={handleDeletePosition}
-            />
-            {ratioNeedsSetup ? (
-              <div className="app-muted">
-                Ratio mode preserves existing allocation ratios. Create allocations first to define
-                the ratio.
+        <div className="section-stack">
+          <section className="app-surface">
+            <div className="accounts-section-header">
+              <div>
+                <h2>Positions</h2>
+                {selectedAccount ? (
+                  <div className="app-muted">Selected account: {selectedAccount.name}</div>
+                ) : null}
               </div>
-            ) : null}
-            {ratioZeroBalance ? (
-              <div className="app-muted">
-                When the balance increases from zero, ratio mode does not auto-allocate. Add
-                allocations manually if needed.
-              </div>
-            ) : null}
-
-            <div>
-              <h3>Allocations linked to this position</h3>
-              {selectedPositionAllocations.length === 0 ? (
-                <div className="app-muted">No allocations yet for this position.</div>
-              ) : (
-                <div className="section-stack">
-                  {selectedPositionAllocations.map((allocation) => {
-                    const goal = goalsById.get(allocation.goalId);
-                    return (
-                      <div key={allocation.id} className="app-surface">
-                        <div style={{ fontWeight: 600 }}>{goal?.name ?? "Unknown goal"}</div>
-                        <div className="app-muted">
-                          {formatCurrency(allocation.allocatedAmount)}
-                        </div>
-                      </div>
-                    );
-                  })}
+              <Button
+                size="small"
+                onClick={() => setIsPositionDrawerOpen(true)}
+                disabled={!canEdit || !selectedAccount}
+              >
+                Add position
+              </Button>
+            </div>
+            {!selectedAccount ? (
+              <div className="app-muted">Select an account to manage positions.</div>
+            ) : positionsForAccount.length === 0 ? (
+              <div className="app-muted">No positions yet for this account.</div>
+            ) : (
+              <div className="accounts-table">
+                <div className="accounts-table-row accounts-table-header">
+                  <div>Label</div>
+                  <div>Type</div>
+                  <div>Value</div>
+                  <div>Recalc mode</div>
+                  <div>Last updated</div>
+                  <div>Actions</div>
                 </div>
-              )}
+                {positionsForAccount.map((position) => {
+                  const allocated = allocationTotals[position.id] ?? 0;
+                  const available = Math.max(0, position.marketValue - allocated);
+                  const isInlineEditing = inlineEditPositionId === position.id;
+                  const inlineError = isInlineEditing
+                    ? getIntegerInputError(inlineEditValue, { required: true })
+                    : null;
+                  return (
+                    <div key={position.id} className="accounts-table-row">
+                      <div style={{ fontWeight: 600 }}>{position.label}</div>
+                      <div>{assetTypeLabels.get(position.assetType) ?? position.assetType}</div>
+                      <div>
+                        {isInlineEditing ? (
+                          <div className="section-stack" style={{ gap: 4 }}>
+                            <Input
+                              inputMode="numeric"
+                              value={inlineEditValue}
+                              onChange={(_, data) =>
+                                setInlineEditValue(formatIntegerInput(data.value))
+                              }
+                              disabled={!canEdit}
+                              aria-label={`Edit ${position.label} value`}
+                            />
+                            {inlineError ? (
+                              <div className="app-muted" role="alert">
+                                {inlineError}
+                              </div>
+                            ) : null}
+                          </div>
+                        ) : (
+                          <div>
+                            <div style={{ fontWeight: 600 }}>
+                              {formatCurrency(position.marketValue)}
+                            </div>
+                            <div className="app-muted">
+                              Allocated {formatCurrency(allocated)} · Available{" "}
+                              {formatCurrency(available)}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                      <div>
+                        {allocationModeLabels.get(position.allocationMode) ??
+                          position.allocationMode}
+                      </div>
+                      <div>{formatTimestamp(position.updatedAt)}</div>
+                      <div className="accounts-table-actions">
+                        {isInlineEditing ? (
+                          <>
+                            <Button
+                              size="small"
+                              appearance="primary"
+                              onClick={() => {
+                                const parsed = parseIntegerInput(inlineEditValue);
+                                if (parsed === null) {
+                                  setPageError("Market value must be a non-negative integer.");
+                                  return;
+                                }
+                                const result = updatePosition({
+                                  positionId: position.id,
+                                  assetType: position.assetType,
+                                  label: position.label,
+                                  marketValue: parsed,
+                                  allocationMode: position.allocationMode,
+                                });
+                                if (reportOutcome(result, "Position updated in draft.")) {
+                                  cancelInlineEdit();
+                                }
+                              }}
+                              disabled={!canEdit || !!inlineError}
+                            >
+                              Save
+                            </Button>
+                            <Button size="small" onClick={cancelInlineEdit}>
+                              Cancel
+                            </Button>
+                          </>
+                        ) : (
+                          <>
+                            <Button
+                              size="small"
+                              onClick={() => setSelectedPositionId(position.id)}
+                              appearance={
+                                effectivePositionId === position.id ? "primary" : "secondary"
+                              }
+                            >
+                              View
+                            </Button>
+                            <Button
+                              size="small"
+                              onClick={() => startInlineEdit(position)}
+                              disabled={!canEdit}
+                            >
+                              Edit value
+                            </Button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+
+          <section className="app-surface">
+            <h2>Account details</h2>
+            {!selectedAccount ? (
+              <div className="app-muted">Select an account to view details.</div>
+            ) : (
+              <div className="section-stack">
+                <AccountDetailsPanel
+                  key={selectedAccount.id}
+                  account={selectedAccount}
+                  canEdit={canEdit}
+                  onUpdate={handleUpdateAccount}
+                  onDelete={handleDeleteAccount}
+                />
+              </div>
+            )}
+          </section>
+
+          <section className="app-surface">
+            <h2>Position details</h2>
+            {!selectedPosition ? (
+              <div className="app-muted">Select a position to view details.</div>
+            ) : (
+              <div className="section-stack">
+                <PositionDetailsPanel
+                  key={selectedPosition.id}
+                  position={selectedPosition}
+                  canEdit={canEdit}
+                  onUpdate={handleUpdatePosition}
+                  onDelete={handleDeletePosition}
+                />
+                {ratioNeedsSetup ? (
+                  <div className="app-muted">
+                    Ratio mode preserves existing allocation ratios. Create allocations first to
+                    define the ratio.
+                  </div>
+                ) : null}
+                {ratioZeroBalance ? (
+                  <div className="app-muted">
+                    When the balance increases from zero, ratio mode does not auto-allocate. Add
+                    allocations manually if needed.
+                  </div>
+                ) : null}
+
+                <div>
+                  <h3>Allocations linked to this position</h3>
+                  {selectedPositionAllocations.length === 0 ? (
+                    <div className="app-muted">No allocations yet for this position.</div>
+                  ) : (
+                    <div className="section-stack">
+                      {selectedPositionAllocations.map((allocation) => {
+                        const goal = goalsById.get(allocation.goalId);
+                        return (
+                          <div key={allocation.id} className="app-surface">
+                            <div style={{ fontWeight: 600 }}>{goal?.name ?? "Unknown goal"}</div>
+                            <div className="app-muted">
+                              {formatCurrency(allocation.allocatedAmount)}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </section>
+        </div>
+      </div>
+
+      {isAccountDrawerOpen ? (
+        <div className="accounts-drawer-overlay" onClick={() => setIsAccountDrawerOpen(false)}>
+          <div
+            className="accounts-drawer"
+            role="dialog"
+            aria-modal="true"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="accounts-drawer-header">
+              <div style={{ fontWeight: 600 }}>Add account</div>
+              <Button onClick={() => setIsAccountDrawerOpen(false)}>Close</Button>
+            </div>
+            <div className="section-stack">
+              <Field label="Account name">
+                <Input
+                  value={newAccountName}
+                  onChange={(_, data) => setNewAccountName(data.value)}
+                  placeholder="Everyday Cash"
+                  disabled={!canEdit}
+                />
+              </Field>
+              <div className="app-actions">
+                <Button appearance="primary" onClick={handleCreateAccount} disabled={!canEdit}>
+                  Add account
+                </Button>
+                <Button onClick={() => setIsAccountDrawerOpen(false)}>Cancel</Button>
+              </div>
             </div>
           </div>
-        )}
-      </section>
+        </div>
+      ) : null}
+
+      {isPositionDrawerOpen ? (
+        <div className="accounts-drawer-overlay" onClick={() => setIsPositionDrawerOpen(false)}>
+          <div
+            className="accounts-drawer"
+            role="dialog"
+            aria-modal="true"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="accounts-drawer-header">
+              <div style={{ fontWeight: 600 }}>Add position</div>
+              <Button onClick={() => setIsPositionDrawerOpen(false)}>Close</Button>
+            </div>
+            <div className="section-stack">
+              <Field label="Asset type">
+                <Dropdown
+                  selectedOptions={[newPositionAssetType]}
+                  onOptionSelect={(_, data) => {
+                    const value = data.optionValue as AssetType | undefined;
+                    if (value) {
+                      setNewPositionAssetType(value);
+                    }
+                  }}
+                  disabled={!canEdit || !selectedAccount}
+                >
+                  {assetTypeOptions.map((option) => (
+                    <Option key={option.value} value={option.value}>
+                      {option.label}
+                    </Option>
+                  ))}
+                </Dropdown>
+              </Field>
+              <Field label="Label">
+                <Input
+                  value={newPositionLabel}
+                  onChange={(_, data) => setNewPositionLabel(data.value)}
+                  placeholder="e.g., Wallet"
+                  disabled={!canEdit || !selectedAccount}
+                />
+              </Field>
+              <Field
+                label="Market value (JPY)"
+                validationState={newPositionMarketValueError ? "error" : "none"}
+                validationMessage={newPositionMarketValueError ?? undefined}
+              >
+                <Input
+                  inputMode="numeric"
+                  value={newPositionMarketValue}
+                  onChange={(_, data) => setNewPositionMarketValue(formatIntegerInput(data.value))}
+                  disabled={!canEdit || !selectedAccount}
+                />
+              </Field>
+              <div className="app-actions">
+                <Button
+                  appearance="primary"
+                  onClick={handleCreatePosition}
+                  disabled={!canEdit || !selectedAccount || !!newPositionMarketValueError}
+                >
+                  Add position
+                </Button>
+                <Button onClick={() => setIsPositionDrawerOpen(false)}>Cancel</Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      <div className="accounts-fab">
+        <Button
+          appearance="primary"
+          onClick={() => setIsFabOpen((open) => !open)}
+          disabled={!canEdit}
+        >
+          +
+        </Button>
+        {isFabOpen ? (
+          <div className="accounts-fab-menu">
+            <Button onClick={() => setIsAccountDrawerOpen(true)} disabled={!canEdit}>
+              Add account
+            </Button>
+            <Button
+              onClick={() => setIsPositionDrawerOpen(true)}
+              disabled={!canEdit || !selectedAccount}
+            >
+              Add position
+            </Button>
+          </div>
+        ) : null}
+      </div>
     </div>
   );
 }
