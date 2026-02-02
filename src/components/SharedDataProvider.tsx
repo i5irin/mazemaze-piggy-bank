@@ -17,6 +17,7 @@ import type {
   DataSource,
   DataStatus,
   DomainActionOutcome,
+  SaveChangesOutcome,
   SpaceInfo,
 } from "@/components/dataContext";
 import { getGraphScopes } from "@/lib/auth/msalConfig";
@@ -454,34 +455,34 @@ export function SharedDataProvider({
     );
   }, [loadFromRemote]);
 
-  const saveChanges = useCallback(async () => {
+  const saveChanges = useCallback(async (): Promise<SaveChangesOutcome> => {
     if (!isOnline) {
       setMessage("Offline mode is view-only. Please reconnect to save changes.");
-      return;
+      return { ok: false, reason: "offline" };
     }
     if (!isSignedIn) {
       setMessage("Sign in to save changes.");
-      return;
+      return { ok: false, reason: "unauthenticated" };
     }
     if (!sharedReference) {
       setError("Invalid shared space id.");
-      return;
+      return { ok: false, reason: "invalid_space" };
     }
     if (!canWrite) {
       setMessage("This shared space is read-only.");
-      return;
+      return { ok: false, reason: "read_only" };
     }
     if (!snapshotRecord || !draftState) {
       setError("No snapshot is loaded yet.");
-      return;
+      return { ok: false, reason: "no_snapshot" };
     }
     if (pendingEvents.length === 0) {
       setMessage("No changes to save.");
-      return;
+      return { ok: false, reason: "no_changes" };
     }
     if (!snapshotRecord.etag) {
       setError("Missing server version. Please reload and try again.");
-      return;
+      return { ok: false, reason: "missing_etag" };
     }
 
     setActivity("saving");
@@ -558,12 +559,15 @@ export function SharedDataProvider({
         );
         setError(formatGraphError(eventError));
       }
+      return { ok: true };
     } catch (err) {
       if (isPreconditionFailed(err)) {
         await handleConflict();
-        return;
+        return { ok: false, reason: "conflict" };
       }
-      setError(formatGraphError(err));
+      const message = formatGraphError(err);
+      setError(message);
+      return { ok: false, reason: "error", error: message };
     } finally {
       setActivity("idle");
     }

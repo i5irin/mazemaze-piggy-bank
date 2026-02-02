@@ -11,6 +11,19 @@ export type DataActivity = "idle" | "loading" | "saving";
 export type DataSource = "remote" | "cache" | "empty";
 
 export type DomainActionOutcome = { ok: true } | { ok: false; error: string };
+export type SaveChangesReason =
+  | "offline"
+  | "unauthenticated"
+  | "read_only"
+  | "invalid_space"
+  | "no_snapshot"
+  | "no_changes"
+  | "missing_etag"
+  | "conflict"
+  | "error";
+export type SaveChangesOutcome =
+  | { ok: true }
+  | { ok: false; reason: SaveChangesReason; error?: string };
 
 export type SpaceInfo = {
   scope: "personal" | "shared";
@@ -92,6 +105,6 @@ export type DataContextValue = {
   }) => DomainActionOutcome;
   undoSpend: (goalId: string) => DomainActionOutcome;
   clearAllocationNotice: () => void;
-  saveChanges: () => Promise<void>;
+  saveChanges: () => Promise<SaveChangesOutcome>;
   discardChanges: () => void;
 };

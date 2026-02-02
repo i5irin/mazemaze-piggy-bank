@@ -53,6 +53,7 @@ import type {
   DataSource,
   DataStatus,
   DomainActionOutcome,
+  SaveChangesOutcome,
   SpaceInfo,
 } from "@/components/dataContext";
 
@@ -334,26 +335,26 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     );
   }, [loadFromRemote]);
 
-  const saveChanges = useCallback(async () => {
+  const saveChanges = useCallback(async (): Promise<SaveChangesOutcome> => {
     if (!isOnline) {
       setMessage("Offline mode is view-only. Please reconnect to save changes.");
-      return;
+      return { ok: false, reason: "offline" };
     }
     if (!isSignedIn) {
       setMessage("Sign in to save changes.");
-      return;
+      return { ok: false, reason: "unauthenticated" };
     }
     if (!snapshotRecord || !draftState) {
       setError("No snapshot is loaded yet.");
-      return;
+      return { ok: false, reason: "no_snapshot" };
     }
     if (pendingEvents.length === 0) {
       setMessage("No changes to save.");
-      return;
+      return { ok: false, reason: "no_changes" };
     }
     if (!snapshotRecord.etag) {
       setError("Missing server version. Please reload and try again.");
-      return;
+      return { ok: false, reason: "missing_etag" };
     }
 
     setActivity("saving");
@@ -426,12 +427,15 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
         );
         setError(formatGraphError(eventError));
       }
+      return { ok: true };
     } catch (err) {
       if (isPreconditionFailed(err)) {
         await handleConflict();
-        return;
+        return { ok: false, reason: "conflict" };
       }
-      setError(formatGraphError(err));
+      const message = formatGraphError(err);
+      setError(message);
+      return { ok: false, reason: "error", error: message };
     } finally {
       setActivity("idle");
     }
