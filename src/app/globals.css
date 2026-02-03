@@ -1120,6 +1120,14 @@ a {
   margin-bottom: var(--space-3);
 }
 
+.goals-desktop-only {
+  display: inline-flex;
+}
+
+.goals-mobile-only {
+  display: none;
+}
+
 .goals-filter-row {
   display: flex;
   flex-wrap: wrap;
@@ -1135,7 +1143,7 @@ a {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 12px;
+  padding: 8px 14px;
   cursor: pointer;
   font-size: 13px;
 }
@@ -1269,6 +1277,23 @@ a {
   margin-bottom: var(--space-2);
 }
 
+.goals-allocation-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.goals-allocation-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.goals-allocation-actions.goals-mobile-only {
+  display: none;
+}
+
 .goals-detail-shell {
   display: grid;
   min-height: 0;
@@ -1305,6 +1330,11 @@ a {
   justify-content: space-between;
   align-items: center;
   gap: var(--space-3);
+  min-height: 22px;
+}
+
+.goals-allocation-edit-button {
+  min-height: 32px;
 }
 
 .goals-empty-card {
@@ -1376,6 +1406,44 @@ a {
   margin-top: 0;
 }
 
+.goals-mobile-fab {
+  display: none;
+  position: fixed;
+  right: 16px;
+  bottom: 84px;
+  z-index: 35;
+  justify-items: end;
+  gap: var(--space-2);
+}
+
+.goals-mobile-fab-button {
+  width: 56px;
+  height: 56px;
+  border-radius: 999px;
+  box-shadow: var(--app-shadow);
+  font-size: 26px;
+}
+
+.goals-mobile-fab-menu {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 260px;
+  padding: var(--space-2);
+  border: 1px solid var(--app-border);
+  border-radius: var(--app-radius);
+  background: var(--app-surface);
+  box-shadow: var(--app-shadow);
+}
+
+.goals-mobile-fab-menu .fui-Button {
+  justify-content: flex-start;
+  min-height: 40px;
+}
+
+.goals-mobile-fab-reason {
+  padding: 0 var(--space-2) var(--space-1);
+}
+
 @media (min-width: 900px) {
   .goals-layout {
     grid-template-columns: minmax(0, 360px) minmax(0, 1fr);
@@ -1411,5 +1479,25 @@ a {
 
   .goals-detail-content {
     overflow: visible;
+  }
+
+  .goals-desktop-only {
+    display: none;
+  }
+
+  .goals-mobile-only {
+    display: inline-flex;
+  }
+
+  .goals-mobile-fab {
+    display: grid;
+  }
+
+  .goals-allocation-toolbar {
+    justify-content: flex-end;
+  }
+
+  .goals-allocation-actions.goals-mobile-only {
+    display: inline-flex;
   }
 }

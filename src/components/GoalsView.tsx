@@ -223,10 +223,23 @@ export function GoalsView({ data }: { data: DataContextValue }) {
 
   const [goalFilter, setGoalFilter] = useState<GoalFilter>("active");
   const [isHydrated, setIsHydrated] = useState(false);
+  const [isFabMenuOpen, setIsFabMenuOpen] = useState(false);
+  const [isMobileViewport, setIsMobileViewport] = useState(false);
 
   useEffect(() => {
     const timerId = window.setTimeout(() => setIsHydrated(true), 0);
     return () => window.clearTimeout(timerId);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const media = window.matchMedia("(max-width: 719px)");
+    const apply = () => setIsMobileViewport(media.matches);
+    apply();
+    media.addEventListener("change", apply);
+    return () => media.removeEventListener("change", apply);
   }, []);
 
   const filteredGoals = useMemo(() => {
@@ -269,6 +282,8 @@ export function GoalsView({ data }: { data: DataContextValue }) {
   const queryGoalId = searchParams.get("goalId");
   const selectedGoal = goals.find((goal) => goal.id === queryGoalId) ?? null;
   const selectedGoalTab = normalizeTabForGoal(searchParams.get("tab"), selectedGoal);
+  const showGoalListPane = !isMobileViewport || !selectedGoal;
+  const showGoalDetailPane = !isMobileViewport || Boolean(selectedGoal);
   const selectedGoalSpent = Boolean(selectedGoal?.spentAt);
   const canEditSelectedGoal = canEdit && !selectedGoalSpent;
 
@@ -284,6 +299,15 @@ export function GoalsView({ data }: { data: DataContextValue }) {
     }
 
     if (!selectedGoal) {
+      if (isMobileViewport) {
+        if (searchParams.has("goalId") && queryGoalId) {
+          updateGoalsQuery((params) => {
+            params.delete("goalId");
+            params.delete("tab");
+          });
+        }
+        return;
+      }
       const fallbackGoal = filteredGoals[0] ?? goalsSorted[0];
       if (!fallbackGoal) {
         return;
@@ -305,6 +329,8 @@ export function GoalsView({ data }: { data: DataContextValue }) {
     goalsSorted,
     normalizeTabForGoal,
     searchParams,
+    queryGoalId,
+    isMobileViewport,
     selectedGoal,
     selectedGoalTab,
     updateGoalsQuery,
@@ -605,9 +631,13 @@ export function GoalsView({ data }: { data: DataContextValue }) {
 
   const [allocationDrafts, setAllocationDrafts] = useState<Record<string, string>>({});
   const allocationSavingRef = useRef<Set<string>>(new Set());
+  const [editingAllocationPositionId, setEditingAllocationPositionId] = useState<string | null>(
+    null,
+  );
   const [addAllocationDrawerOpen, setAddAllocationDrawerOpen] = useState(false);
   const [addAllocationPositionId, setAddAllocationPositionId] = useState<string | null>(null);
   const [addAllocationAmount, setAddAllocationAmount] = useState("0");
+  const [removeAllDialogOpen, setRemoveAllDialogOpen] = useState(false);
 
   useEffect(() => {
     const timerId = window.setTimeout(() => {
@@ -802,11 +832,48 @@ export function GoalsView({ data }: { data: DataContextValue }) {
     ? Math.max(0, selectedGoal.targetAmount - selectedGoalTotalAllocated)
     : 0;
 
+  const fabGoalDisabledReason = !canEdit
+    ? (editNotice ?? "Sign in to edit.")
+    : activity !== "idle"
+      ? "Please wait until the current action finishes."
+      : null;
+
+  const fabAllocationDisabledReason = !selectedGoal
+    ? "Open a goal and switch to Allocations to add one."
+    : selectedGoalTab !== "allocations"
+      ? "Open a goal and switch to Allocations to add one."
+      : !canEditSelectedGoal
+        ? selectedGoalSpent
+          ? "Spent goals are read-only."
+          : (editNotice ?? "Sign in to edit.")
+        : activity !== "idle"
+          ? "Please wait until the current action finishes."
+          : null;
+
+  const handleBackToGoalList = () => {
+    setIsFabMenuOpen(false);
+    updateGoalsQuery((params) => {
+      params.delete("goalId");
+      params.delete("tab");
+    });
+  };
+
+  const openCreateGoalDrawer = () => {
+    setIsFabMenuOpen(false);
+    setCreateGoalDrawerOpen(true);
+  };
+
+  const openAddAllocationDrawer = () => {
+    setIsFabMenuOpen(false);
+    setAddAllocationDrawerOpen(true);
+    setAddAllocationAmount("0");
+  };
+
   const handleRemoveAllAllocations = async () => {
     if (selectedGoalAllocations.length === 0) {
-      return;
+      return false;
     }
-    await runMutation(
+    return runMutation(
       () =>
         reduceAllocations(
           selectedGoalAllocations.map((allocation) => ({
@@ -1089,559 +1156,645 @@ export function GoalsView({ data }: { data: DataContextValue }) {
       ) : null}
 
       <div className="goals-layout">
-        <section className="app-surface goals-master-pane">
-          <div className="goals-pane-header">
-            <h2>Goal list</h2>
-            <Button
-              appearance="primary"
-              size="small"
-              onClick={() => setCreateGoalDrawerOpen(true)}
-              disabled={!canEdit || activity !== "idle"}
-            >
-              + New goal
-            </Button>
-          </div>
-
-          <div className="goals-filter-row" role="tablist" aria-label="Goal filters">
-            {(
-              [
-                ["active", "Active"],
-                ["closed", "Closed"],
-                ["spent", "Spent"],
-              ] as const
-            ).map(([value, label]) => (
-              <button
-                key={value}
-                type="button"
-                className={`goals-filter-chip ${goalFilter === value ? "goals-filter-chip-active" : ""}`}
-                onClick={() => setGoalFilter(value)}
-                role="tab"
-                aria-selected={goalFilter === value}
+        {showGoalListPane ? (
+          <section className="app-surface goals-master-pane">
+            <div className="goals-pane-header">
+              <h2>Goal list</h2>
+              <Button
+                className="goals-desktop-only"
+                appearance="primary"
+                size="small"
+                onClick={openCreateGoalDrawer}
+                disabled={!canEdit || activity !== "idle"}
               >
-                <span>{label}</span>
-                <span className="goals-filter-count">{goalCounts[value]}</span>
-              </button>
-            ))}
-          </div>
-
-          {filteredGoals.length === 0 ? (
-            <div className="goals-empty-card">
-              <h3>No {goalFilter} goals</h3>
-              <p className="app-muted">
-                {goalsSorted.length === 0
-                  ? "Create your first goal to start tracking progress."
-                  : "Try another filter or create a new goal."}
-              </p>
-              {goalsSorted.length === 0 ? (
-                <Button
-                  appearance="primary"
-                  onClick={() => setCreateGoalDrawerOpen(true)}
-                  disabled={!canEdit || activity !== "idle"}
-                >
-                  + New goal
-                </Button>
-              ) : null}
+                Add goal
+              </Button>
             </div>
-          ) : (
-            <div className="section-stack" role="listbox" aria-label="Goal list">
-              {filteredGoals.map((goal) => {
-                const allocated = allocationTotalsByGoal[goal.id] ?? 0;
-                const ratio =
-                  goal.targetAmount > 0 ? Math.min(1, allocated / goal.targetAmount) : 1;
-                const achieved = allocated >= goal.targetAmount;
-                const selected = selectedGoal?.id === goal.id;
-                const spent = Boolean(goal.spentAt);
 
-                return (
-                  <button
-                    key={goal.id}
-                    type="button"
-                    className={`goals-master-item ${selected ? "goals-master-item-selected" : ""}`}
-                    onClick={() => {
-                      updateGoalsQuery((params) => {
-                        params.set("goalId", goal.id);
-                        params.set("tab", normalizeTabForGoal(params.get("tab"), goal));
-                      });
-                    }}
+            <div className="goals-filter-row" role="tablist" aria-label="Goal filters">
+              {(
+                [
+                  ["active", "Active"],
+                  ["closed", "Closed"],
+                  ["spent", "Spent"],
+                ] as const
+              ).map(([value, label]) => (
+                <button
+                  key={value}
+                  type="button"
+                  className={`goals-filter-chip ${goalFilter === value ? "goals-filter-chip-active" : ""}`}
+                  onClick={() => setGoalFilter(value)}
+                  role="tab"
+                  aria-selected={goalFilter === value}
+                >
+                  <span>{label}</span>
+                  <span className="goals-filter-count">{goalCounts[value]}</span>
+                </button>
+              ))}
+            </div>
+
+            {filteredGoals.length === 0 ? (
+              <div className="goals-empty-card">
+                <h3>No {goalFilter} goals</h3>
+                <p className="app-muted">
+                  {goalsSorted.length === 0
+                    ? "Create your first goal to start tracking progress."
+                    : "Try another filter or create a new goal."}
+                </p>
+                {goalsSorted.length === 0 ? (
+                  <Button
+                    className="goals-desktop-only"
+                    appearance="primary"
+                    onClick={openCreateGoalDrawer}
+                    disabled={!canEdit || activity !== "idle"}
                   >
-                    <div className="goals-master-item-header">
-                      <div className="goals-master-name">{goal.name}</div>
+                    Add goal
+                  </Button>
+                ) : null}
+              </div>
+            ) : (
+              <div className="section-stack" role="listbox" aria-label="Goal list">
+                {filteredGoals.map((goal) => {
+                  const allocated = allocationTotalsByGoal[goal.id] ?? 0;
+                  const ratio =
+                    goal.targetAmount > 0 ? Math.min(1, allocated / goal.targetAmount) : 1;
+                  const achieved = allocated >= goal.targetAmount;
+                  const selected = selectedGoal?.id === goal.id;
+                  const spent = Boolean(goal.spentAt);
+
+                  return (
+                    <button
+                      key={goal.id}
+                      type="button"
+                      className={`goals-master-item ${selected ? "goals-master-item-selected" : ""}`}
+                      onClick={() => {
+                        setIsFabMenuOpen(false);
+                        updateGoalsQuery((params) => {
+                          params.set("goalId", goal.id);
+                          params.set("tab", normalizeTabForGoal(params.get("tab"), goal));
+                        });
+                      }}
+                    >
+                      <div className="goals-master-item-header">
+                        <div className="goals-master-name">{goal.name}</div>
+                        <div className="goals-status-group">
+                          {achieved && !spent ? (
+                            <span className="goals-status-badge">Achieved</span>
+                          ) : null}
+                          {spent ? (
+                            <span className="goals-status-chip">Spent</span>
+                          ) : goal.status === "closed" ? (
+                            <span className="goals-status-chip">Closed</span>
+                          ) : null}
+                        </div>
+                      </div>
+                      <div className="app-muted">Priority {goal.priority}</div>
+
+                      {spent ? (
+                        <div className="app-muted">
+                          Spent on {formatDateOnly(goal.spentAt ?? "")}
+                        </div>
+                      ) : (
+                        <>
+                          <div className="goals-progress-row">
+                            <span>
+                              {formatCurrency(allocated)} / {formatCurrency(goal.targetAmount)}
+                            </span>
+                            <span>{Math.round(ratio * 100)}%</span>
+                          </div>
+                          <div className="goals-progress-bar" aria-hidden>
+                            <div
+                              className="goals-progress-fill"
+                              style={{ width: `${ratio * 100}%` }}
+                            />
+                          </div>
+                        </>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        ) : null}
+
+        {showGoalDetailPane ? (
+          <section className="app-surface goals-detail-pane">
+            {!selectedGoal ? (
+              <div className="goals-empty-card">
+                <h3>No goal selected</h3>
+                <p className="app-muted">Select a goal from the list to view details.</p>
+              </div>
+            ) : (
+              <div className="goals-detail-shell">
+                <div className="goals-detail-sticky">
+                  <div className="goals-detail-header">
+                    <div className="goals-mobile-only">
+                      <Button appearance="secondary" size="small" onClick={handleBackToGoalList}>
+                        Back
+                      </Button>
+                    </div>
+                    <div>
+                      <h2>{selectedGoal.name}</h2>
                       <div className="goals-status-group">
-                        {achieved && !spent ? (
+                        {achievedSelectedGoal ? (
                           <span className="goals-status-badge">Achieved</span>
                         ) : null}
-                        {spent ? (
+                        {selectedGoal.spentAt ? (
                           <span className="goals-status-chip">Spent</span>
                         ) : (
-                          <span className="goals-status-chip">{goal.status}</span>
+                          <span className="goals-status-chip">{selectedGoal.status}</span>
                         )}
                       </div>
                     </div>
-                    <div className="app-muted">Priority {goal.priority}</div>
-
-                    {spent ? (
-                      <div className="app-muted">Spent on {formatDateOnly(goal.spentAt ?? "")}</div>
-                    ) : (
-                      <>
-                        <div className="goals-progress-row">
-                          <span>
-                            {formatCurrency(allocated)} / {formatCurrency(goal.targetAmount)}
-                          </span>
-                          <span>{Math.round(ratio * 100)}%</span>
-                        </div>
-                        <div className="goals-progress-bar" aria-hidden>
-                          <div
-                            className="goals-progress-fill"
-                            style={{ width: `${ratio * 100}%` }}
-                          />
-                        </div>
-                      </>
-                    )}
-                  </button>
-                );
-              })}
-            </div>
-          )}
-        </section>
-
-        <section className="app-surface goals-detail-pane">
-          {!selectedGoal ? (
-            <div className="goals-empty-card">
-              <h3>No goal selected</h3>
-              <p className="app-muted">Select a goal from the list to view details.</p>
-            </div>
-          ) : (
-            <div className="goals-detail-shell">
-              <div className="goals-detail-sticky">
-                <div className="goals-detail-header">
-                  <div>
-                    <h2>{selectedGoal.name}</h2>
-                    <div className="goals-status-group">
-                      {achievedSelectedGoal ? (
-                        <span className="goals-status-badge">Achieved</span>
-                      ) : null}
-                      {selectedGoal.spentAt ? (
-                        <span className="goals-status-chip">Spent</span>
-                      ) : (
-                        <span className="goals-status-chip">{selectedGoal.status}</span>
-                      )}
-                    </div>
-                  </div>
-                  <div className="goals-progress-meta">
-                    <div>
-                      {formatCurrency(selectedGoalTotalAllocated)} /{" "}
-                      {formatCurrency(selectedGoal.targetAmount)}
-                    </div>
-                    <div className="app-muted">Priority {selectedGoal.priority}</div>
-                  </div>
-                </div>
-
-                <div className="goals-header-actions">
-                  {selectedGoal.spentAt ? (
-                    <Button
-                      appearance="primary"
-                      onClick={() => void handleUndoSpend()}
-                      disabled={!canEdit || !undoInfo.available || activity !== "idle"}
-                    >
-                      Undo spend
-                    </Button>
-                  ) : selectedGoal.status === "closed" ? (
-                    <Button
-                      appearance="primary"
-                      onClick={() => setSpendDrawerOpen(true)}
-                      disabled={!canEdit || activity !== "idle"}
-                    >
-                      Mark as spent...
-                    </Button>
-                  ) : null}
-                </div>
-
-                <TabList
-                  selectedValue={selectedGoalTab}
-                  onTabSelect={(_, value) => {
-                    const nextTab = value.value as GoalTab;
-                    updateGoalsQuery((params) => {
-                      params.set("tab", nextTab);
-                    });
-                  }}
-                >
-                  <Tab value="details">Details</Tab>
-                  <Tab value="allocations">Allocations</Tab>
-                  <Tab value="history">History</Tab>
-                  {selectedGoal.spentAt ? <Tab value="receipt">Receipt</Tab> : null}
-                </TabList>
-              </div>
-
-              <div className="goals-detail-content">
-                {selectedGoalTab === "details" ? (
-                  <div className="section-stack">
-                    {achievedSelectedGoal && !selectedGoal.spentAt ? (
-                      <div className="app-alert" role="status">
-                        <div className="section-stack">
-                          <Text>This goal reached 100% of the target.</Text>
-                          <div className="app-actions">
-                            {selectedGoal.status === "active" ? (
-                              <Button
-                                onClick={() =>
-                                  void runMutation(
-                                    () =>
-                                      updateGoal({
-                                        goalId: selectedGoal.id,
-                                        name: selectedGoal.name,
-                                        targetAmount: selectedGoal.targetAmount,
-                                        priority: selectedGoal.priority,
-                                        status: "closed",
-                                        startDate: selectedGoal.startDate,
-                                        endDate: selectedGoal.endDate,
-                                      }),
-                                    "Goal closed.",
-                                  )
-                                }
-                                disabled={!canEditSelectedGoal || activity !== "idle"}
-                              >
-                                Close goal
-                              </Button>
-                            ) : (
-                              <Button
-                                onClick={() => setSpendDrawerOpen(true)}
-                                disabled={!canEditSelectedGoal || activity !== "idle"}
-                              >
-                                Mark as spent...
-                              </Button>
-                            )}
-                          </div>
-                        </div>
+                    <div className="goals-progress-meta">
+                      <div>
+                        {formatCurrency(selectedGoalTotalAllocated)} /{" "}
+                        {formatCurrency(selectedGoal.targetAmount)}
                       </div>
-                    ) : null}
+                      <div className="app-muted">Priority {selectedGoal.priority}</div>
+                    </div>
+                  </div>
 
-                    <Field label="Goal name">
-                      <Input
-                        value={editGoalName}
-                        onChange={(_, value) => setEditGoalName(value.value)}
-                        disabled={!canEditSelectedGoal || activity !== "idle"}
-                      />
-                    </Field>
-
-                    <Field
-                      label="Target amount (JPY)"
-                      validationState={editGoalTargetError ? "error" : "none"}
-                      validationMessage={editGoalTargetError ?? undefined}
-                    >
-                      <Input
-                        inputMode="numeric"
-                        value={editGoalTargetAmount}
-                        onChange={(_, value) =>
-                          setEditGoalTargetAmount(formatIntegerInput(value.value))
-                        }
-                        disabled={!canEditSelectedGoal || activity !== "idle"}
-                      />
-                    </Field>
-
-                    <Field
-                      label="Priority"
-                      validationState={editGoalPriorityError ? "error" : "none"}
-                      validationMessage={editGoalPriorityError ?? undefined}
-                    >
-                      <Input
-                        inputMode="numeric"
-                        value={editGoalPriority}
-                        onChange={(_, value) =>
-                          setEditGoalPriority(formatIntegerInput(value.value))
-                        }
-                        disabled={!canEditSelectedGoal || activity !== "idle"}
-                      />
-                    </Field>
-
-                    <Field label="Status">
-                      <Dropdown
-                        selectedOptions={[editGoalStatus]}
-                        onOptionSelect={(_, value) => {
-                          const status = value.optionValue as "active" | "closed" | undefined;
-                          if (status) {
-                            setEditGoalStatus(status);
-                          }
-                        }}
-                        disabled={!canEditSelectedGoal || activity !== "idle"}
-                      >
-                        <Option value="active">Active</Option>
-                        <Option value="closed">Closed</Option>
-                      </Dropdown>
-                    </Field>
-
-                    <Field label="Start date (optional)">
-                      <Input
-                        type="date"
-                        value={editGoalStartDate}
-                        onChange={(_, value) => setEditGoalStartDate(value.value)}
-                        disabled={!canEditSelectedGoal || activity !== "idle"}
-                      />
-                    </Field>
-
-                    <Field label="End date (optional)">
-                      <Input
-                        type="date"
-                        value={editGoalEndDate}
-                        onChange={(_, value) => setEditGoalEndDate(value.value)}
-                        disabled={!canEditSelectedGoal || activity !== "idle"}
-                      />
-                    </Field>
-
-                    <div className="app-actions">
+                  <div className="goals-header-actions">
+                    {selectedGoal.spentAt ? (
                       <Button
                         appearance="primary"
-                        onClick={() => void handleUpdateGoal()}
-                        disabled={
-                          !canEditSelectedGoal ||
-                          activity !== "idle" ||
-                          !!editGoalTargetError ||
-                          !!editGoalPriorityError ||
-                          editGoalName.trim().length === 0
-                        }
+                        onClick={() => void handleUndoSpend()}
+                        disabled={!canEdit || !undoInfo.available || activity !== "idle"}
                       >
-                        Save goal
+                        Undo spend
                       </Button>
+                    ) : selectedGoal.status === "closed" ? (
+                      <Button
+                        appearance="primary"
+                        onClick={() => setSpendDrawerOpen(true)}
+                        disabled={!canEdit || activity !== "idle"}
+                      >
+                        Mark as spent...
+                      </Button>
+                    ) : null}
+                  </div>
 
-                      {goalDeleteStep === 0 ? (
-                        <Button
-                          onClick={() => setGoalDeleteStep(1)}
+                  <TabList
+                    selectedValue={selectedGoalTab}
+                    onTabSelect={(_, value) => {
+                      const nextTab = value.value as GoalTab;
+                      updateGoalsQuery((params) => {
+                        params.set("tab", nextTab);
+                      });
+                    }}
+                  >
+                    <Tab value="details">Details</Tab>
+                    <Tab value="allocations">Allocations</Tab>
+                    <Tab value="history">History</Tab>
+                    {selectedGoal.spentAt ? <Tab value="receipt">Receipt</Tab> : null}
+                  </TabList>
+                </div>
+
+                <div className="goals-detail-content">
+                  {selectedGoalTab === "details" ? (
+                    <div className="section-stack">
+                      {achievedSelectedGoal && !selectedGoal.spentAt ? (
+                        <div className="app-alert" role="status">
+                          <div className="section-stack">
+                            <Text>This goal reached 100% of the target.</Text>
+                            <div className="app-actions">
+                              {selectedGoal.status === "active" ? (
+                                <Button
+                                  onClick={() =>
+                                    void runMutation(
+                                      () =>
+                                        updateGoal({
+                                          goalId: selectedGoal.id,
+                                          name: selectedGoal.name,
+                                          targetAmount: selectedGoal.targetAmount,
+                                          priority: selectedGoal.priority,
+                                          status: "closed",
+                                          startDate: selectedGoal.startDate,
+                                          endDate: selectedGoal.endDate,
+                                        }),
+                                      "Goal closed.",
+                                    )
+                                  }
+                                  disabled={!canEditSelectedGoal || activity !== "idle"}
+                                >
+                                  Close goal
+                                </Button>
+                              ) : (
+                                <Button
+                                  onClick={() => setSpendDrawerOpen(true)}
+                                  disabled={!canEditSelectedGoal || activity !== "idle"}
+                                >
+                                  Mark as spent...
+                                </Button>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      ) : null}
+
+                      <Field label="Goal name">
+                        <Input
+                          value={editGoalName}
+                          onChange={(_, value) => setEditGoalName(value.value)}
+                          disabled={!canEditSelectedGoal || activity !== "idle"}
+                        />
+                      </Field>
+
+                      <Field
+                        label="Target amount (JPY)"
+                        validationState={editGoalTargetError ? "error" : "none"}
+                        validationMessage={editGoalTargetError ?? undefined}
+                      >
+                        <Input
+                          inputMode="numeric"
+                          value={editGoalTargetAmount}
+                          onChange={(_, value) =>
+                            setEditGoalTargetAmount(formatIntegerInput(value.value))
+                          }
+                          disabled={!canEditSelectedGoal || activity !== "idle"}
+                        />
+                      </Field>
+
+                      <Field
+                        label="Priority"
+                        validationState={editGoalPriorityError ? "error" : "none"}
+                        validationMessage={editGoalPriorityError ?? undefined}
+                      >
+                        <Input
+                          inputMode="numeric"
+                          value={editGoalPriority}
+                          onChange={(_, value) =>
+                            setEditGoalPriority(formatIntegerInput(value.value))
+                          }
+                          disabled={!canEditSelectedGoal || activity !== "idle"}
+                        />
+                      </Field>
+
+                      <Field label="Status">
+                        <Dropdown
+                          selectedOptions={[editGoalStatus]}
+                          onOptionSelect={(_, value) => {
+                            const status = value.optionValue as "active" | "closed" | undefined;
+                            if (status) {
+                              setEditGoalStatus(status);
+                            }
+                          }}
                           disabled={!canEditSelectedGoal || activity !== "idle"}
                         >
-                          Delete goal
-                        </Button>
-                      ) : null}
-                    </div>
+                          <Option value="active">Active</Option>
+                          <Option value="closed">Closed</Option>
+                        </Dropdown>
+                      </Field>
 
-                    {goalDeleteStep === 1 ? (
-                      <div className="app-alert app-alert-error" role="alert">
-                        <Text>
-                          This deletes the goal and all related allocations. This cannot be undone.
-                        </Text>
-                        <div className="app-actions" style={{ marginTop: 12 }}>
+                      <Field label="Start date (optional)">
+                        <Input
+                          type="date"
+                          value={editGoalStartDate}
+                          onChange={(_, value) => setEditGoalStartDate(value.value)}
+                          disabled={!canEditSelectedGoal || activity !== "idle"}
+                        />
+                      </Field>
+
+                      <Field label="End date (optional)">
+                        <Input
+                          type="date"
+                          value={editGoalEndDate}
+                          onChange={(_, value) => setEditGoalEndDate(value.value)}
+                          disabled={!canEditSelectedGoal || activity !== "idle"}
+                        />
+                      </Field>
+
+                      <div className="app-actions">
+                        <Button
+                          appearance="primary"
+                          onClick={() => void handleUpdateGoal()}
+                          disabled={
+                            !canEditSelectedGoal ||
+                            activity !== "idle" ||
+                            !!editGoalTargetError ||
+                            !!editGoalPriorityError ||
+                            editGoalName.trim().length === 0
+                          }
+                        >
+                          Save goal
+                        </Button>
+
+                        {goalDeleteStep === 0 ? (
                           <Button
-                            appearance="primary"
-                            onClick={() => void handleDeleteGoal()}
+                            onClick={() => setGoalDeleteStep(1)}
                             disabled={!canEditSelectedGoal || activity !== "idle"}
                           >
-                            Delete permanently
+                            Delete goal
                           </Button>
-                          <Button onClick={() => setGoalDeleteStep(0)}>Cancel</Button>
+                        ) : null}
+                      </div>
+
+                      {goalDeleteStep === 1 ? (
+                        <div className="app-alert app-alert-error" role="alert">
+                          <Text>
+                            This deletes the goal and all related allocations. This cannot be
+                            undone.
+                          </Text>
+                          <div className="app-actions" style={{ marginTop: 12 }}>
+                            <Button
+                              appearance="primary"
+                              onClick={() => void handleDeleteGoal()}
+                              disabled={!canEditSelectedGoal || activity !== "idle"}
+                            >
+                              Delete permanently
+                            </Button>
+                            <Button onClick={() => setGoalDeleteStep(0)}>Cancel</Button>
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+
+                  {selectedGoalTab === "allocations" ? (
+                    <div className="section-stack">
+                      <div className="goals-allocation-toolbar">
+                        <div className="goals-allocation-actions goals-desktop-only">
+                          <Button
+                            appearance="primary"
+                            onClick={openAddAllocationDrawer}
+                            disabled={!canEditSelectedGoal || activity !== "idle"}
+                          >
+                            + Add allocation
+                          </Button>
+                          <Button
+                            appearance="secondary"
+                            onClick={() => setRemoveAllDialogOpen(true)}
+                            disabled={
+                              !canEditSelectedGoal ||
+                              activity !== "idle" ||
+                              selectedGoalAllocations.length === 0
+                            }
+                          >
+                            Remove all allocations
+                          </Button>
+                        </div>
+                        <div className="goals-allocation-actions goals-mobile-only">
+                          <Button
+                            appearance="secondary"
+                            onClick={() => setRemoveAllDialogOpen(true)}
+                            disabled={
+                              !canEditSelectedGoal ||
+                              activity !== "idle" ||
+                              selectedGoalAllocations.length === 0
+                            }
+                          >
+                            Remove all allocations
+                          </Button>
                         </div>
                       </div>
-                    ) : null}
-                  </div>
-                ) : null}
 
-                {selectedGoalTab === "allocations" ? (
-                  <div className="section-stack">
-                    <div className="app-actions">
-                      <Button
-                        appearance="primary"
-                        onClick={() => {
-                          setAddAllocationDrawerOpen(true);
-                          setAddAllocationAmount("0");
-                        }}
-                        disabled={!canEditSelectedGoal || activity !== "idle"}
-                      >
-                        + Add allocation
-                      </Button>
-                      <Button
-                        onClick={() => void handleRemoveAllAllocations()}
-                        disabled={!canEditSelectedGoal || activity !== "idle"}
-                      >
-                        Remove all allocations
-                      </Button>
-                    </div>
-
-                    {selectedGoalAllocatedPositions.length === 0 ? (
-                      <div className="goals-empty-card">
-                        <h3>No allocations yet</h3>
-                        <p className="app-muted">
-                          Use + Add allocation to assign funds from positions.
-                        </p>
-                      </div>
-                    ) : (
-                      selectedGoalAllocatedPositions.map(({ allocation, position }) => {
-                        const currentAmount = allocation.allocatedAmount;
-                        const totalForPosition = allocationTotalsByPosition[position.id] ?? 0;
-                        const available = Math.max(
-                          0,
-                          position.marketValue - (totalForPosition - currentAmount),
-                        );
-                        const maxByGoal = Math.max(
-                          0,
-                          selectedGoal.targetAmount - (selectedGoalTotalAllocated - currentAmount),
-                        );
-                        const maxAllowed = Math.min(available, maxByGoal);
-                        const draftRaw = allocationDrafts[position.id] ?? "0";
-                        const draftAmount = parseIntegerInput(draftRaw) ?? 0;
-                        const nextFree = Math.max(
-                          0,
-                          position.marketValue - (totalForPosition - currentAmount + draftAmount),
-                        );
-                        const accountName =
-                          accountsById.get(position.accountId)?.name ?? "Unknown account";
-                        const isHighlighted = highlightedAllocationPositionId === position.id;
-
-                        return (
-                          <div
-                            key={position.id}
-                            className={`app-surface goals-allocation-row ${isHighlighted ? "goals-allocation-row-highlight" : ""}`}
+                      {selectedGoalAllocatedPositions.length === 0 ? (
+                        <div className="goals-empty-card">
+                          <h3>No allocations yet</h3>
+                          <p className="app-muted">
+                            Use + Add allocation to assign funds from positions.
+                          </p>
+                          <Button
+                            appearance="primary"
+                            onClick={openAddAllocationDrawer}
+                            disabled={!canEditSelectedGoal || activity !== "idle"}
                           >
-                            <div className="goals-master-item-header">
-                              <div>
-                                <div className="goals-master-name">{position.label}</div>
-                                <div className="app-muted">{accountName}</div>
-                              </div>
-                              <div className="app-muted">Available {formatCurrency(available)}</div>
-                            </div>
+                            Add allocation
+                          </Button>
+                        </div>
+                      ) : (
+                        selectedGoalAllocatedPositions.map(({ allocation, position }) => {
+                          const currentAmount = allocation.allocatedAmount;
+                          const totalForPosition = allocationTotalsByPosition[position.id] ?? 0;
+                          const available = Math.max(
+                            0,
+                            position.marketValue - (totalForPosition - currentAmount),
+                          );
+                          const maxByGoal = Math.max(
+                            0,
+                            selectedGoal.targetAmount -
+                              (selectedGoalTotalAllocated - currentAmount),
+                          );
+                          const maxAllowed = Math.min(available, maxByGoal);
+                          const draftRaw = allocationDrafts[position.id] ?? "0";
+                          const draftAmount = parseIntegerInput(draftRaw) ?? 0;
+                          const nextFree = Math.max(
+                            0,
+                            position.marketValue - (totalForPosition - currentAmount + draftAmount),
+                          );
+                          const showAfterChangeHint =
+                            editingAllocationPositionId === position.id ||
+                            draftAmount !== currentAmount;
+                          const accountName =
+                            accountsById.get(position.accountId)?.name ?? "Unknown account";
+                          const isHighlighted = highlightedAllocationPositionId === position.id;
 
-                            <Field
-                              label="Allocation (JPY)"
-                              validationState={
-                                getIntegerInputError(draftRaw, { required: true }) ||
-                                draftAmount > maxAllowed
-                                  ? "error"
-                                  : "none"
-                              }
-                              validationMessage={
-                                getIntegerInputError(draftRaw, { required: true }) ??
-                                (draftAmount > maxAllowed
-                                  ? "Allocation exceeds the available amount for this position or goal."
-                                  : undefined)
-                              }
+                          return (
+                            <div
+                              key={position.id}
+                              className={`app-surface goals-allocation-row ${isHighlighted ? "goals-allocation-row-highlight" : ""}`}
                             >
-                              <Input
-                                inputMode="numeric"
-                                value={draftRaw}
-                                onChange={(_, value) =>
-                                  setAllocationDrafts((prev) => ({
-                                    ...prev,
-                                    [position.id]: formatIntegerInput(value.value),
-                                  }))
-                                }
-                                onKeyDown={(event) => {
-                                  if (event.key === "Enter") {
-                                    event.preventDefault();
-                                    void saveAllocationAbsolute(position.id);
-                                  }
-                                }}
-                                onBlur={() => {
-                                  void saveAllocationAbsolute(position.id);
-                                }}
-                                disabled={!canEditSelectedGoal || activity !== "idle"}
-                                placeholder="0 (JPY integer only)"
-                              />
-                            </Field>
+                              <div className="goals-master-item-header">
+                                <div>
+                                  <div className="goals-master-name">{position.label}</div>
+                                  <div className="app-muted">{accountName}</div>
+                                </div>
+                                <div className="app-muted">
+                                  Available {formatCurrency(available)}
+                                </div>
+                              </div>
 
-                            <div className="goals-allocation-meta">
-                              <span className="app-muted">
-                                After change: Free {formatCurrency(nextFree)}
-                              </span>
-                              <Button
-                                size="small"
-                                appearance="secondary"
-                                onClick={() =>
-                                  router.push(
-                                    buildEditPositionHref(position.id, position.accountId),
-                                  )
+                              <Field
+                                label="Allocation (JPY)"
+                                validationState={
+                                  getIntegerInputError(draftRaw, { required: true }) ||
+                                  draftAmount > maxAllowed
+                                    ? "error"
+                                    : "none"
+                                }
+                                validationMessage={
+                                  getIntegerInputError(draftRaw, { required: true }) ??
+                                  (draftAmount > maxAllowed
+                                    ? "Allocation exceeds the available amount for this position or goal."
+                                    : undefined)
                                 }
                               >
-                                Edit position
-                              </Button>
-                            </div>
-                          </div>
-                        );
-                      })
-                    )}
-                  </div>
-                ) : null}
+                                <Input
+                                  inputMode="numeric"
+                                  value={draftRaw}
+                                  onFocus={() => setEditingAllocationPositionId(position.id)}
+                                  onChange={(_, value) =>
+                                    setAllocationDrafts((prev) => ({
+                                      ...prev,
+                                      [position.id]: formatIntegerInput(value.value),
+                                    }))
+                                  }
+                                  onKeyDown={(event) => {
+                                    if (event.key === "Enter") {
+                                      event.preventDefault();
+                                      setEditingAllocationPositionId(null);
+                                      void saveAllocationAbsolute(position.id);
+                                    }
+                                  }}
+                                  onBlur={() => {
+                                    setEditingAllocationPositionId((prev) =>
+                                      prev === position.id ? null : prev,
+                                    );
+                                    void saveAllocationAbsolute(position.id);
+                                  }}
+                                  disabled={!canEditSelectedGoal || activity !== "idle"}
+                                  placeholder="0 (JPY integer only)"
+                                />
+                              </Field>
 
-                {selectedGoalTab === "history" ? (
-                  <div className="section-stack">
-                    {historyError ? (
-                      <div className="app-alert app-alert-error">{historyError}</div>
-                    ) : null}
-
-                    {historyItems.length === 0 && !historyLoading ? (
-                      <div className="goals-empty-card">
-                        <h3>No history yet</h3>
-                        <p className="app-muted">
-                          History UI is ready. Connect the adapter to start loading events.
-                        </p>
-                      </div>
-                    ) : (
-                      <div className="section-stack">
-                        {historyItems.map((item) => (
-                          <div key={item.id} className="goals-history-item">
-                            <div className="goals-master-item-header">
-                              <strong>{item.eventType}</strong>
-                              <span className="app-muted">{formatDateTime(item.timestamp)}</span>
-                            </div>
-                            <div>{item.summary}</div>
-                            {typeof item.amountDelta === "number" ? (
-                              <div className="app-muted">{formatCurrency(item.amountDelta)}</div>
-                            ) : null}
-                          </div>
-                        ))}
-                      </div>
-                    )}
-
-                    <div className="app-actions">
-                      <Button
-                        onClick={() => void loadMoreHistory()}
-                        disabled={!historyCursor || historyLoading}
-                      >
-                        Load more
-                      </Button>
-                      {historyLoading ? <span className="app-muted">Loading...</span> : null}
-                    </div>
-                  </div>
-                ) : null}
-
-                {selectedGoalTab === "receipt" && selectedGoal.spentAt ? (
-                  <div className="section-stack">
-                    <div className="app-surface goals-receipt-card">
-                      <div className="goals-master-item-header">
-                        <strong>Spent on {formatDateOnly(selectedGoal.spentAt)}</strong>
-                        <span className="goals-status-chip">Receipt</span>
-                      </div>
-
-                      {receipt ? (
-                        <>
-                          <div>Total spent: {formatCurrency(receipt.totalAmount)}</div>
-                          <div className="section-stack">
-                            {receipt.payments.map((payment, index) => {
-                              const position = positionsById.get(payment.positionId);
-                              return (
-                                <div
-                                  key={`${payment.positionId}-${index}`}
-                                  className="goals-receipt-row"
+                              <div className="goals-allocation-meta">
+                                {showAfterChangeHint ? (
+                                  <span className="app-muted">
+                                    After change: Free {formatCurrency(nextFree)}
+                                  </span>
+                                ) : null}
+                                <Button
+                                  size="small"
+                                  appearance="secondary"
+                                  className="goals-allocation-edit-button"
+                                  onClick={() =>
+                                    router.push(
+                                      buildEditPositionHref(position.id, position.accountId),
+                                    )
+                                  }
                                 >
-                                  <span>{position?.label ?? "Unknown position"}</span>
-                                  <span>{formatCurrency(payment.amount)}</span>
-                                </div>
-                              );
-                            })}
-                          </div>
-                        </>
-                      ) : (
-                        <div className="app-muted">
-                          Receipt details are unavailable in the current cache.
-                        </div>
+                                  ✏️ Edit
+                                </Button>
+                              </div>
+                            </div>
+                          );
+                        })
                       )}
                     </div>
+                  ) : null}
 
-                    <div className="app-alert" role="status">
-                      <Text>
-                        {undoInfo.message ?? "Undo is only available for 24 hours after spending."}
-                      </Text>
+                  {selectedGoalTab === "history" ? (
+                    <div className="section-stack">
+                      {historyError ? (
+                        <div className="app-alert app-alert-error">{historyError}</div>
+                      ) : null}
+
+                      {historyItems.length === 0 && !historyLoading ? (
+                        <div className="goals-empty-card">
+                          <h3>No history yet</h3>
+                          <p className="app-muted">
+                            History UI is ready. Connect the adapter to start loading events.
+                          </p>
+                        </div>
+                      ) : (
+                        <div className="section-stack">
+                          {historyItems.map((item) => (
+                            <div key={item.id} className="goals-history-item">
+                              <div className="goals-master-item-header">
+                                <strong>{item.eventType}</strong>
+                                <span className="app-muted">{formatDateTime(item.timestamp)}</span>
+                              </div>
+                              <div>{item.summary}</div>
+                              {typeof item.amountDelta === "number" ? (
+                                <div className="app-muted">{formatCurrency(item.amountDelta)}</div>
+                              ) : null}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      <div className="app-actions">
+                        <Button
+                          onClick={() => void loadMoreHistory()}
+                          disabled={!historyCursor || historyLoading}
+                        >
+                          Load more
+                        </Button>
+                        {historyLoading ? <span className="app-muted">Loading...</span> : null}
+                      </div>
                     </div>
-                  </div>
-                ) : null}
+                  ) : null}
+
+                  {selectedGoalTab === "receipt" && selectedGoal.spentAt ? (
+                    <div className="section-stack">
+                      <div className="app-surface goals-receipt-card">
+                        <div className="goals-master-item-header">
+                          <strong>Spent on {formatDateOnly(selectedGoal.spentAt)}</strong>
+                          <span className="goals-status-chip">Receipt</span>
+                        </div>
+
+                        {receipt ? (
+                          <>
+                            <div>Total spent: {formatCurrency(receipt.totalAmount)}</div>
+                            <div className="section-stack">
+                              {receipt.payments.map((payment, index) => {
+                                const position = positionsById.get(payment.positionId);
+                                return (
+                                  <div
+                                    key={`${payment.positionId}-${index}`}
+                                    className="goals-receipt-row"
+                                  >
+                                    <span>{position?.label ?? "Unknown position"}</span>
+                                    <span>{formatCurrency(payment.amount)}</span>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </>
+                        ) : (
+                          <div className="app-muted">
+                            Receipt details are unavailable in the current cache.
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="app-alert" role="status">
+                        <Text>
+                          {undoInfo.message ??
+                            "Undo is only available for 24 hours after spending."}
+                        </Text>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
               </div>
-            </div>
-          )}
-        </section>
+            )}
+          </section>
+        ) : null}
+      </div>
+
+      <div className="goals-mobile-fab">
+        <Button
+          appearance="primary"
+          className="goals-mobile-fab-button"
+          onClick={() => setIsFabMenuOpen((open) => !open)}
+          aria-label="Open add menu"
+        >
+          +
+        </Button>
+        {isFabMenuOpen ? (
+          <div className="goals-mobile-fab-menu">
+            <Button
+              onClick={openCreateGoalDrawer}
+              disabled={!!fabGoalDisabledReason}
+              title={fabGoalDisabledReason ?? undefined}
+            >
+              🎯 Goal
+            </Button>
+            <Button
+              onClick={openAddAllocationDrawer}
+              disabled={!!fabAllocationDisabledReason}
+              title={fabAllocationDisabledReason ?? undefined}
+            >
+              ➕ Allocation
+            </Button>
+            {fabAllocationDisabledReason ? (
+              <div className="app-muted goals-mobile-fab-reason">{fabAllocationDisabledReason}</div>
+            ) : null}
+          </div>
+        ) : null}
       </div>
 
       {addAllocationDrawerOpen ? (
@@ -1932,6 +2085,36 @@ export function GoalsView({ data }: { data: DataContextValue }) {
             <div className="app-actions">
               <Button appearance="primary" onClick={() => setConflictDialogOpen(false)}>
                 OK
+              </Button>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
+      {removeAllDialogOpen ? (
+        <div className="goals-overlay" onClick={() => setRemoveAllDialogOpen(false)}>
+          <section
+            className="goals-drawer goals-dialog"
+            role="dialog"
+            aria-modal="true"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h3>Remove all allocations?</h3>
+            <p>This will set all allocations for this goal to ¥0.</p>
+            <div className="app-actions">
+              <Button onClick={() => setRemoveAllDialogOpen(false)}>Cancel</Button>
+              <Button
+                appearance="primary"
+                onClick={() => {
+                  void handleRemoveAllAllocations().then((persisted) => {
+                    if (persisted) {
+                      setRemoveAllDialogOpen(false);
+                    }
+                  });
+                }}
+                disabled={!canEditSelectedGoal || activity !== "idle"}
+              >
+                Remove
               </Button>
             </div>
           </section>
