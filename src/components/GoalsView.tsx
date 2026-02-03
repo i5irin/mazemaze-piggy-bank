@@ -10,6 +10,7 @@ import {
   TabList,
   Text,
 } from "@fluentui/react-components";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { DataContextValue, DomainActionOutcome } from "@/components/dataContext";
 import {
@@ -18,9 +19,10 @@ import {
   getIntegerInputError,
   parseIntegerInput,
 } from "@/lib/numberFormat";
-import type { Goal } from "@/lib/persistence/types";
+import type { Allocation, Goal } from "@/lib/persistence/types";
 
-type GoalTab = "details" | "allocations" | "history" | "spend";
+type GoalFilter = "active" | "closed" | "spent";
+type GoalTab = "details" | "allocations" | "history" | "receipt";
 
 type SaveFailureReason =
   | "offline"
@@ -33,6 +35,42 @@ type SaveFailureReason =
   | "conflict"
   | "error";
 
+type GoalHistoryItem = {
+  id: string;
+  timestamp: string;
+  eventType: string;
+  summary: string;
+  amountDelta?: number;
+};
+
+type GoalHistoryPage = {
+  items: GoalHistoryItem[];
+  nextCursor: string | null;
+};
+
+type GoalHistoryAdapter = {
+  loadInitial: (goalId: string, limit: number) => Promise<GoalHistoryPage>;
+  loadMore: (goalId: string, cursor: string, limit: number) => Promise<GoalHistoryPage>;
+};
+
+type SpendEventPayload = {
+  goalId: string;
+  spentAt: string;
+  totalAmount: number;
+  payments: { positionId: string; amount: number }[];
+};
+
+const HISTORY_PAGE_SIZE = 20;
+
+const historyAdapter: GoalHistoryAdapter = {
+  loadInitial: async () => ({ items: [], nextCursor: null }),
+  loadMore: async () => ({ items: [], nextCursor: null }),
+};
+
+const isActiveGoal = (goal: Goal): boolean => goal.status === "active" && !goal.spentAt;
+const isClosedGoal = (goal: Goal): boolean => goal.status === "closed" && !goal.spentAt;
+const isSpentGoal = (goal: Goal): boolean => Boolean(goal.spentAt);
+
 const formatDateTime = (value: string): string => {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) {
@@ -41,7 +79,13 @@ const formatDateTime = (value: string): string => {
   return parsed.toLocaleString("en-US");
 };
 
-const isActiveGoal = (goal: Goal): boolean => goal.status === "active" && !goal.spentAt;
+const formatDateOnly = (value: string): string => {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+  return parsed.toLocaleDateString("en-US");
+};
 
 const getEditNotice = (data: DataContextValue): string | null => {
   if (!data.isOnline) {
@@ -80,6 +124,19 @@ const parseRequiredInteger = (value: string): number | null => {
   return parseIntegerInput(value);
 };
 
+const isSpendPayload = (value: unknown): value is SpendEventPayload => {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const payload = value as SpendEventPayload;
+  return (
+    typeof payload.goalId === "string" &&
+    typeof payload.spentAt === "string" &&
+    typeof payload.totalAmount === "number" &&
+    Array.isArray(payload.payments)
+  );
+};
+
 export function GoalsView({ data }: { data: DataContextValue }) {
   const {
     draftState,
@@ -104,6 +161,9 @@ export function GoalsView({ data }: { data: DataContextValue }) {
     space,
   } = data;
 
+  const router = useRouter();
+  const searchParams = useSearchParams();
+
   const canEdit = isOnline && isSignedIn && canWrite;
   const editNotice = getEditNotice(data);
 
@@ -116,11 +176,18 @@ export function GoalsView({ data }: { data: DataContextValue }) {
     () => new Map(positions.map((position) => [position.id, position])),
     [positions],
   );
-  const goalsById = useMemo(() => new Map(goals.map((goal) => [goal.id, goal])), [goals]);
   const accountsById = useMemo(
     () => new Map(accounts.map((account) => [account.id, account])),
     [accounts],
   );
+
+  const allocationsByGoalPosition = useMemo(() => {
+    const map = new Map<string, Allocation>();
+    for (const allocation of allocations) {
+      map.set(`${allocation.goalId}:${allocation.positionId}`, allocation);
+    }
+    return map;
+  }, [allocations]);
 
   const allocationTotalsByGoal = useMemo(() => {
     const totals: Record<string, number> = {};
@@ -142,23 +209,16 @@ export function GoalsView({ data }: { data: DataContextValue }) {
   const goalsSorted = useMemo(
     () =>
       [...goals].sort((left, right) => {
-        const leftActive = isActiveGoal(left);
-        const rightActive = isActiveGoal(right);
-        if (leftActive !== rightActive) {
-          return leftActive ? -1 : 1;
+        if (left.priority !== right.priority) {
+          return left.priority - right.priority;
         }
-        if (leftActive && rightActive) {
-          if (left.priority !== right.priority) {
-            return left.priority - right.priority;
-          }
-          return left.id.localeCompare(right.id);
-        }
-        return left.name.localeCompare(right.name) || left.id.localeCompare(right.id);
+        return left.id.localeCompare(right.id);
       }),
     [goals],
   );
 
   const [selectedGoalId, setSelectedGoalId] = useState<string | null>(null);
+  const [goalFilter, setGoalFilter] = useState<GoalFilter>("active");
   const [goalTab, setGoalTab] = useState<GoalTab>("details");
   const [isHydrated, setIsHydrated] = useState(false);
 
@@ -167,16 +227,46 @@ export function GoalsView({ data }: { data: DataContextValue }) {
     return () => window.clearTimeout(timerId);
   }, []);
 
-  const effectiveGoalId = useMemo(() => {
-    if (selectedGoalId && goalsSorted.some((goal) => goal.id === selectedGoalId)) {
-      return selectedGoalId;
+  const filteredGoals = useMemo(() => {
+    if (goalFilter === "active") {
+      return goalsSorted.filter(isActiveGoal);
     }
-    return goalsSorted[0]?.id ?? null;
-  }, [goalsSorted, selectedGoalId]);
+    if (goalFilter === "closed") {
+      return goalsSorted.filter(isClosedGoal);
+    }
+    return goalsSorted.filter(isSpentGoal);
+  }, [goalFilter, goalsSorted]);
 
-  const selectedGoal = goals.find((goal) => goal.id === effectiveGoalId) ?? null;
+  const goalCounts = useMemo(
+    () => ({
+      active: goalsSorted.filter(isActiveGoal).length,
+      closed: goalsSorted.filter(isClosedGoal).length,
+      spent: goalsSorted.filter(isSpentGoal).length,
+    }),
+    [goalsSorted],
+  );
+
+  useEffect(() => {
+    if (selectedGoalId && goals.some((goal) => goal.id === selectedGoalId)) {
+      return;
+    }
+    setSelectedGoalId(filteredGoals[0]?.id ?? goalsSorted[0]?.id ?? null);
+  }, [filteredGoals, goals, goalsSorted, selectedGoalId]);
+
+  const selectedGoal = goals.find((goal) => goal.id === selectedGoalId) ?? null;
   const selectedGoalSpent = Boolean(selectedGoal?.spentAt);
   const canEditSelectedGoal = canEdit && !selectedGoalSpent;
+
+  useEffect(() => {
+    const queryGoalId = searchParams.get("goalId");
+    if (queryGoalId && goals.some((goal) => goal.id === queryGoalId)) {
+      setSelectedGoalId(queryGoalId);
+    }
+    const queryTab = searchParams.get("tab");
+    if (queryTab === "allocations" || queryTab === "details" || queryTab === "history") {
+      setGoalTab(queryTab);
+    }
+  }, [goals, searchParams]);
 
   const selectedGoalAllocations = useMemo(() => {
     if (!selectedGoal) {
@@ -194,14 +284,59 @@ export function GoalsView({ data }: { data: DataContextValue }) {
       });
   }, [allocations, positionsById, selectedGoal]);
 
-  const availablePositionsForGoal = useMemo(() => {
-    if (!selectedGoal) {
-      return [];
+  const selectedGoalTotalAllocated = useMemo(
+    () => selectedGoalAllocations.reduce((sum, allocation) => sum + allocation.allocatedAmount, 0),
+    [selectedGoalAllocations],
+  );
+
+  const [recentlyAddedPositionId, setRecentlyAddedPositionId] = useState<string | null>(null);
+  const [highlightedAllocationPositionId, setHighlightedAllocationPositionId] = useState<
+    string | null
+  >(null);
+
+  useEffect(() => {
+    if (!highlightedAllocationPositionId) {
+      return;
     }
-    return positions.filter((position) => {
-      return !selectedGoalAllocations.some((allocation) => allocation.positionId === position.id);
+    const timerId = window.setTimeout(() => setHighlightedAllocationPositionId(null), 1800);
+    return () => window.clearTimeout(timerId);
+  }, [highlightedAllocationPositionId]);
+
+  const selectedGoalAllocatedPositions = useMemo(() => {
+    const rows = selectedGoalAllocations
+      .map((allocation) => {
+        const position = positionsById.get(allocation.positionId);
+        if (!position) {
+          return null;
+        }
+        return { allocation, position };
+      })
+      .filter((item): item is { allocation: Allocation; position: (typeof positions)[number] } =>
+        Boolean(item),
+      );
+    return rows.sort((left, right) => {
+      if (recentlyAddedPositionId) {
+        if (
+          left.position.id === recentlyAddedPositionId &&
+          right.position.id !== recentlyAddedPositionId
+        ) {
+          return -1;
+        }
+        if (
+          right.position.id === recentlyAddedPositionId &&
+          left.position.id !== recentlyAddedPositionId
+        ) {
+          return 1;
+        }
+      }
+      const leftAccount = accountsById.get(left.position.accountId)?.name ?? "";
+      const rightAccount = accountsById.get(right.position.accountId)?.name ?? "";
+      if (leftAccount !== rightAccount) {
+        return leftAccount.localeCompare(rightAccount);
+      }
+      return left.position.label.localeCompare(right.position.label);
     });
-  }, [positions, selectedGoal, selectedGoalAllocations]);
+  }, [accountsById, positionsById, recentlyAddedPositionId, selectedGoalAllocations]);
 
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [infoMessage, setInfoMessage] = useState<string | null>(null);
@@ -281,12 +416,22 @@ export function GoalsView({ data }: { data: DataContextValue }) {
     }
   };
 
+  const [createGoalDrawerOpen, setCreateGoalDrawerOpen] = useState(false);
   const [newGoalName, setNewGoalName] = useState("");
   const [newGoalTargetAmount, setNewGoalTargetAmount] = useState("0");
   const [newGoalPriority, setNewGoalPriority] = useState("1");
   const [newGoalStatus, setNewGoalStatus] = useState<"active" | "closed">("active");
   const [newGoalStartDate, setNewGoalStartDate] = useState("");
   const [newGoalEndDate, setNewGoalEndDate] = useState("");
+
+  const resetCreateGoalForm = () => {
+    setNewGoalName("");
+    setNewGoalTargetAmount("0");
+    setNewGoalPriority("1");
+    setNewGoalStatus("active");
+    setNewGoalStartDate("");
+    setNewGoalEndDate("");
+  };
 
   const newGoalTargetError = getIntegerInputError(newGoalTargetAmount, { required: true });
   const newGoalPriorityError = getIntegerInputError(newGoalPriority, { required: true });
@@ -317,12 +462,9 @@ export function GoalsView({ data }: { data: DataContextValue }) {
     );
 
     if (persisted) {
-      setNewGoalName("");
-      setNewGoalTargetAmount("0");
-      setNewGoalPriority("1");
-      setNewGoalStatus("active");
-      setNewGoalStartDate("");
-      setNewGoalEndDate("");
+      setCreateGoalDrawerOpen(false);
+      resetCreateGoalForm();
+      setSelectedGoalId(null);
     }
   };
 
@@ -333,8 +475,8 @@ export function GoalsView({ data }: { data: DataContextValue }) {
   const [editGoalStartDate, setEditGoalStartDate] = useState("");
   const [editGoalEndDate, setEditGoalEndDate] = useState("");
   const [goalDeleteStep, setGoalDeleteStep] = useState<0 | 1>(0);
-  const lastHydratedGoalIdRef = useRef<string | null>(null);
 
+  const lastHydratedGoalIdRef = useRef<string | null>(null);
   useEffect(() => {
     const timerId = window.setTimeout(() => {
       const currentGoalId = selectedGoal?.id ?? null;
@@ -361,6 +503,9 @@ export function GoalsView({ data }: { data: DataContextValue }) {
       setEditGoalStartDate(selectedGoal.startDate ?? "");
       setEditGoalEndDate(selectedGoal.endDate ?? "");
       setGoalDeleteStep(0);
+      setGoalTab(selectedGoal.spentAt ? "receipt" : "details");
+      setRecentlyAddedPositionId(null);
+      setHighlightedAllocationPositionId(null);
     }, 0);
     return () => window.clearTimeout(timerId);
   }, [selectedGoal]);
@@ -373,7 +518,6 @@ export function GoalsView({ data }: { data: DataContextValue }) {
       setErrorMessage("Select a goal to edit.");
       return;
     }
-
     const targetAmount = parseRequiredInteger(editGoalTargetAmount);
     const priority = parseRequiredInteger(editGoalPriority);
     if (targetAmount === null) {
@@ -405,80 +549,168 @@ export function GoalsView({ data }: { data: DataContextValue }) {
       setErrorMessage("Select a goal to delete.");
       return;
     }
-
     const persisted = await runMutation(() => deleteGoal(selectedGoal.id), "Goal deleted.");
     if (persisted) {
       setGoalDeleteStep(0);
+      setSelectedGoalId(null);
     }
   };
 
-  const [newAllocationPositionId, setNewAllocationPositionId] = useState<string | null>(null);
-  const [newAllocationAmount, setNewAllocationAmount] = useState("0");
-  const [allocationEdits, setAllocationEdits] = useState<Record<string, string>>({});
-  const [allocationReductions, setAllocationReductions] = useState<Record<string, string>>({});
+  const [allocationDrafts, setAllocationDrafts] = useState<Record<string, string>>({});
+  const allocationSavingRef = useRef<Set<string>>(new Set());
+  const [addAllocationDrawerOpen, setAddAllocationDrawerOpen] = useState(false);
+  const [addAllocationPositionId, setAddAllocationPositionId] = useState<string | null>(null);
+  const [addAllocationAmount, setAddAllocationAmount] = useState("0");
 
   useEffect(() => {
     const timerId = window.setTimeout(() => {
-      setAllocationEdits({});
-      setAllocationReductions({});
-      setNewAllocationAmount("0");
-    }, 0);
-    return () => window.clearTimeout(timerId);
-  }, [selectedGoal?.id]);
-
-  useEffect(() => {
-    const timerId = window.setTimeout(() => {
-      setAllocationEdits((prev) => {
-        const next: Record<string, string> = {};
-        for (const allocation of selectedGoalAllocations) {
-          next[allocation.id] =
-            prev[allocation.id] ?? formatIntegerInput(allocation.allocatedAmount.toString());
-        }
-        return next;
-      });
-      setAllocationReductions((prev) => {
-        const next: Record<string, string> = {};
-        for (const allocation of selectedGoalAllocations) {
-          next[allocation.id] = prev[allocation.id] ?? "0";
-        }
-        return next;
-      });
-    }, 0);
-    return () => window.clearTimeout(timerId);
-  }, [selectedGoalAllocations]);
-
-  useEffect(() => {
-    const timerId = window.setTimeout(() => {
-      if (
-        newAllocationPositionId &&
-        availablePositionsForGoal.some((position) => position.id === newAllocationPositionId)
-      ) {
+      if (!selectedGoal) {
+        setAllocationDrafts({});
         return;
       }
-      setNewAllocationPositionId(availablePositionsForGoal[0]?.id ?? null);
+      const nextDrafts: Record<string, string> = {};
+      for (const position of positions) {
+        const allocation = allocationsByGoalPosition.get(`${selectedGoal.id}:${position.id}`);
+        nextDrafts[position.id] = formatIntegerInput((allocation?.allocatedAmount ?? 0).toString());
+      }
+      setAllocationDrafts(nextDrafts);
     }, 0);
     return () => window.clearTimeout(timerId);
-  }, [selectedGoal?.id, availablePositionsForGoal, newAllocationPositionId]);
+  }, [allocationsByGoalPosition, positions, selectedGoal]);
 
-  const newAllocationAmountError = getIntegerInputError(newAllocationAmount, { required: true });
+  const addAllocationCandidates = useMemo(() => {
+    if (!selectedGoal) {
+      return [];
+    }
+    return positions
+      .filter((position) => !allocationsByGoalPosition.has(`${selectedGoal.id}:${position.id}`))
+      .map((position) => {
+        const totalForPosition = allocationTotalsByPosition[position.id] ?? 0;
+        const available = Math.max(0, position.marketValue - totalForPosition);
+        const accountName = accountsById.get(position.accountId)?.name ?? "Unknown account";
+        return { position, available, accountName };
+      })
+      .filter((item) => item.available > 0);
+  }, [
+    accountsById,
+    allocationTotalsByPosition,
+    allocationsByGoalPosition,
+    positions,
+    selectedGoal,
+  ]);
 
-  const handleCreateAllocation = async () => {
+  useEffect(() => {
+    if (!addAllocationDrawerOpen) {
+      return;
+    }
+    if (
+      addAllocationPositionId &&
+      addAllocationCandidates.some((candidate) => candidate.position.id === addAllocationPositionId)
+    ) {
+      return;
+    }
+    setAddAllocationPositionId(addAllocationCandidates[0]?.position.id ?? null);
+  }, [addAllocationCandidates, addAllocationDrawerOpen, addAllocationPositionId]);
+
+  const saveAllocationAbsolute = async (positionId: string) => {
+    if (!selectedGoal || !canEditSelectedGoal || activity !== "idle") {
+      return;
+    }
+    if (allocationSavingRef.current.has(positionId)) {
+      return;
+    }
+
+    const raw = allocationDrafts[positionId] ?? "0";
+    const amount = parseIntegerInput(raw);
+    if (amount === null) {
+      setErrorMessage("Allocation must be a non-negative integer.");
+      return;
+    }
+
+    const existing = allocationsByGoalPosition.get(`${selectedGoal.id}:${positionId}`);
+    const currentAmount = existing?.allocatedAmount ?? 0;
+    if (amount === currentAmount) {
+      return;
+    }
+
+    const totalForPosition = allocationTotalsByPosition[positionId] ?? 0;
+    const maxForPosition = Math.max(0, totalForPosition - currentAmount);
+    const position = positionsById.get(positionId);
+    const available = position ? Math.max(0, position.marketValue - maxForPosition) : 0;
+    const maxByGoal = Math.max(
+      0,
+      selectedGoal.targetAmount - (selectedGoalTotalAllocated - currentAmount),
+    );
+    const maxAllowed = Math.min(available, maxByGoal);
+
+    if (amount > maxAllowed) {
+      setErrorMessage("Allocation exceeds the available amount for this position or goal.");
+      return;
+    }
+
+    allocationSavingRef.current.add(positionId);
+    let persisted = false;
+    if (existing) {
+      persisted =
+        amount === 0
+          ? await runMutation(() => deleteAllocation(existing.id), "Allocation updated.")
+          : await runMutation(() => updateAllocation(existing.id, amount), "Allocation updated.");
+    } else {
+      if (amount === 0) {
+        allocationSavingRef.current.delete(positionId);
+        return;
+      }
+      persisted = await runMutation(
+        () =>
+          createAllocation({
+            goalId: selectedGoal.id,
+            positionId,
+            allocatedAmount: amount,
+          }),
+        "Allocation updated.",
+      );
+    }
+
+    allocationSavingRef.current.delete(positionId);
+    if (!persisted) {
+      const fallback = existing?.allocatedAmount ?? 0;
+      setAllocationDrafts((prev) => ({
+        ...prev,
+        [positionId]: formatIntegerInput(fallback.toString()),
+      }));
+    }
+  };
+
+  const handleAddAllocation = async () => {
     if (!selectedGoal) {
       setErrorMessage("Select a goal first.");
       return;
     }
-    if (!newAllocationPositionId) {
-      setErrorMessage("Select a position to allocate from.");
+    if (!addAllocationPositionId) {
+      setErrorMessage("Select a position.");
+      return;
+    }
+    const amount = parseRequiredInteger(addAllocationAmount);
+    if (amount === null) {
+      setErrorMessage("Allocation amount must be a non-negative integer.");
+      return;
+    }
+    if (amount <= 0) {
+      setErrorMessage("Allocation amount must be greater than zero.");
       return;
     }
 
-    const amount = parseRequiredInteger(newAllocationAmount);
-    if (amount === null) {
-      setErrorMessage(newAllocationAmountError ?? "Enter a non-negative integer.");
+    const candidate = addAllocationCandidates.find(
+      (item) => item.position.id === addAllocationPositionId,
+    );
+    if (!candidate) {
+      setErrorMessage("Position is not available for allocation.");
       return;
     }
-    if (amount === 0) {
-      setErrorMessage("Allocated amount must be greater than zero.");
+    const remainingToTarget = Math.max(0, selectedGoal.targetAmount - selectedGoalTotalAllocated);
+    const maxAllowed = Math.min(candidate.available, remainingToTarget);
+    if (amount > maxAllowed) {
+      setErrorMessage("Allocation exceeds available amount or remaining target.");
       return;
     }
 
@@ -486,71 +718,47 @@ export function GoalsView({ data }: { data: DataContextValue }) {
       () =>
         createAllocation({
           goalId: selectedGoal.id,
-          positionId: newAllocationPositionId,
+          positionId: candidate.position.id,
           allocatedAmount: amount,
         }),
       "Allocation added.",
     );
-
     if (persisted) {
-      setNewAllocationAmount("0");
+      setAddAllocationDrawerOpen(false);
+      setAddAllocationAmount("0");
+      setAddAllocationPositionId(null);
+      setRecentlyAddedPositionId(candidate.position.id);
+      setHighlightedAllocationPositionId(candidate.position.id);
     }
   };
 
-  const handleUpdateAllocation = async (allocationId: string) => {
-    const amount = parseRequiredInteger(allocationEdits[allocationId] ?? "");
-    if (amount === null) {
-      setErrorMessage("Allocated amount must be a non-negative integer.");
-      return;
+  const buildEditPositionHref = (positionId: string, accountId: string) => {
+    const query = new URLSearchParams();
+    query.set("drawer", "position");
+    query.set("positionId", positionId);
+    query.set("accountId", accountId);
+    if (selectedGoal) {
+      query.set("returnGoalId", selectedGoal.id);
+      query.set("returnTab", "allocations");
     }
-
-    await runMutation(() => updateAllocation(allocationId, amount), "Allocation updated.");
+    if (space.scope === "shared" && space.sharedId) {
+      return `/shared/${encodeURIComponent(space.sharedId)}/accounts?${query.toString()}`;
+    }
+    return `/accounts?${query.toString()}`;
   };
 
-  const handleDeleteAllocation = async (allocationId: string) => {
-    await runMutation(() => deleteAllocation(allocationId), "Allocation deleted.");
-  };
-
-  const handleReduceAllocations = async () => {
-    const reductions = selectedGoalAllocations.map((allocation) => {
-      const raw = allocationReductions[allocation.id] ?? "0";
-      const parsed = parseIntegerInput(raw);
-      return {
-        allocationId: allocation.id,
-        amount: parsed ?? -1,
-        currentAmount: allocation.allocatedAmount,
-      };
-    });
-
-    const hasInvalid = reductions.some((item) => item.amount < 0);
-    if (hasInvalid) {
-      setErrorMessage("Reduction amounts must be non-negative integers.");
-      return;
-    }
-
-    const exceedsCurrent = reductions.some((item) => item.amount > item.currentAmount);
-    if (exceedsCurrent) {
-      setErrorMessage("Reduction amounts cannot exceed current allocation amounts.");
-      return;
-    }
-
-    await runMutation(
-      () =>
-        reduceAllocations(
-          reductions.map((item) => ({
-            allocationId: item.allocationId,
-            amount: item.amount,
-          })),
-        ),
-      "Allocations reduced.",
-    );
-  };
+  const addAllocationAmountError = getIntegerInputError(addAllocationAmount, { required: true });
+  const selectedAddAllocationCandidate = addAllocationCandidates.find(
+    (candidate) => candidate.position.id === addAllocationPositionId,
+  );
+  const remainingToTarget = selectedGoal
+    ? Math.max(0, selectedGoal.targetAmount - selectedGoalTotalAllocated)
+    : 0;
 
   const handleRemoveAllAllocations = async () => {
     if (selectedGoalAllocations.length === 0) {
       return;
     }
-
     await runMutation(
       () =>
         reduceAllocations(
@@ -563,33 +771,22 @@ export function GoalsView({ data }: { data: DataContextValue }) {
     );
   };
 
-  const selectedGoalTotalAllocated = useMemo(
-    () => selectedGoalAllocations.reduce((sum, allocation) => sum + allocation.allocatedAmount, 0),
-    [selectedGoalAllocations],
-  );
-
+  const [spendDrawerOpen, setSpendDrawerOpen] = useState(false);
   const [spendInputs, setSpendInputs] = useState<Record<string, string>>({});
 
   useEffect(() => {
+    if (!selectedGoal || !spendDrawerOpen) {
+      return;
+    }
     const timerId = window.setTimeout(() => {
-      setSpendInputs({});
+      const nextInputs: Record<string, string> = {};
+      for (const allocation of selectedGoalAllocations) {
+        nextInputs[allocation.id] = formatIntegerInput(allocation.allocatedAmount.toString());
+      }
+      setSpendInputs(nextInputs);
     }, 0);
     return () => window.clearTimeout(timerId);
-  }, [selectedGoal?.id]);
-
-  useEffect(() => {
-    const timerId = window.setTimeout(() => {
-      setSpendInputs((prev) => {
-        const next: Record<string, string> = {};
-        for (const allocation of selectedGoalAllocations) {
-          next[allocation.id] =
-            prev[allocation.id] ?? formatIntegerInput(allocation.allocatedAmount.toString());
-        }
-        return next;
-      });
-    }, 0);
-    return () => window.clearTimeout(timerId);
-  }, [selectedGoalAllocations]);
+  }, [selectedGoal, selectedGoalAllocations, spendDrawerOpen]);
 
   const [undoInfo, setUndoInfo] = useState<{ available: boolean; message: string | null }>({
     available: false,
@@ -598,7 +795,7 @@ export function GoalsView({ data }: { data: DataContextValue }) {
 
   useEffect(() => {
     let isActive = true;
-    const updateUndoInfo = () => {
+    const timerId = window.setTimeout(() => {
       if (!isActive) {
         return;
       }
@@ -632,9 +829,7 @@ export function GoalsView({ data }: { data: DataContextValue }) {
         available: true,
         message: "Undo is available for 24 hours after spending.",
       });
-    };
-
-    const timerId = window.setTimeout(updateUndoInfo, 0);
+    }, 0);
     return () => {
       isActive = false;
       window.clearTimeout(timerId);
@@ -671,7 +866,7 @@ export function GoalsView({ data }: { data: DataContextValue }) {
       return;
     }
 
-    await runMutation(
+    const persisted = await runMutation(
       () =>
         spendGoal({
           goalId: selectedGoal.id,
@@ -682,6 +877,11 @@ export function GoalsView({ data }: { data: DataContextValue }) {
         }),
       "Goal marked as spent.",
     );
+
+    if (persisted) {
+      setSpendDrawerOpen(false);
+      setGoalTab("receipt");
+    }
   };
 
   const handleUndoSpend = async () => {
@@ -689,14 +889,75 @@ export function GoalsView({ data }: { data: DataContextValue }) {
       setErrorMessage("Select a goal to undo.");
       return;
     }
-
-    await runMutation(() => undoSpend(selectedGoal.id), "Spend undone.");
+    const persisted = await runMutation(() => undoSpend(selectedGoal.id), "Spend undone.");
+    if (persisted) {
+      setGoalTab("details");
+    }
   };
 
-  const [historyDrawerOpen, setHistoryDrawerOpen] = useState(false);
+  const [historyItems, setHistoryItems] = useState<GoalHistoryItem[]>([]);
+  const [historyCursor, setHistoryCursor] = useState<string | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+
+  const loadInitialHistory = async (goalId: string) => {
+    setHistoryLoading(true);
+    setHistoryError(null);
+    try {
+      const page = await historyAdapter.loadInitial(goalId, HISTORY_PAGE_SIZE);
+      setHistoryItems(page.items);
+      setHistoryCursor(page.nextCursor);
+    } catch {
+      setHistoryItems([]);
+      setHistoryCursor(null);
+      setHistoryError("Could not load history.");
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const loadMoreHistory = async () => {
+    if (!selectedGoal || !historyCursor) {
+      return;
+    }
+    setHistoryLoading(true);
+    setHistoryError(null);
+    try {
+      const page = await historyAdapter.loadMore(selectedGoal.id, historyCursor, HISTORY_PAGE_SIZE);
+      setHistoryItems((prev) => [...prev, ...page.items]);
+      setHistoryCursor(page.nextCursor);
+    } catch {
+      setHistoryError("Could not load more history.");
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!selectedGoal || goalTab !== "history") {
+      return;
+    }
+    void loadInitialHistory(selectedGoal.id);
+  }, [goalTab, selectedGoal]);
+
+  const receipt = useMemo(() => {
+    if (!selectedGoal?.spentAt || !latestEvent || latestEvent.type !== "goal_spent") {
+      return null;
+    }
+    if (!isSpendPayload(latestEvent.payload)) {
+      return null;
+    }
+    if (latestEvent.payload.goalId !== selectedGoal.id) {
+      return null;
+    }
+    if (latestEvent.payload.spentAt !== selectedGoal.spentAt) {
+      return null;
+    }
+    return latestEvent.payload;
+  }, [latestEvent, selectedGoal]);
 
   const achievedSelectedGoal = useMemo(() => {
-    if (!selectedGoal) {
+    if (!selectedGoal || selectedGoal.spentAt) {
       return false;
     }
     return selectedGoalTotalAllocated >= selectedGoal.targetAmount;
@@ -715,20 +976,6 @@ export function GoalsView({ data }: { data: DataContextValue }) {
 
   return (
     <div className="section-stack goals-page">
-      <section className="app-surface">
-        <h1>Goals</h1>
-        <p className="app-muted">
-          {space.scope === "shared"
-            ? "Manage shared goals and allocations."
-            : "Manage savings goals and allocations."}
-        </p>
-        {space.scope === "shared" ? (
-          <div className="app-muted">
-            Shared space: {space.label} ({space.sharedId ?? "Unknown"})
-          </div>
-        ) : null}
-      </section>
-
       {editNotice ? (
         <div className="app-alert" role="status">
           <Text>{editNotice}</Text>
@@ -763,21 +1010,6 @@ export function GoalsView({ data }: { data: DataContextValue }) {
                 Manual allocation review required. {allocationNotice.directReasons.join(" ")}
               </Text>
             ) : null}
-            {allocationNotice.changes.length > 0 ? (
-              <div className="section-stack">
-                {allocationNotice.changes.map((change) => {
-                  const goalName = goalsById.get(change.goalId)?.name ?? "Unknown goal";
-                  const positionName =
-                    positionsById.get(change.positionId)?.label ?? "Unknown position";
-                  return (
-                    <div key={`${change.goalId}-${change.positionId}`}>
-                      {goalName} · {positionName}: {formatCurrency(change.before)} →{" "}
-                      {formatCurrency(change.after)}
-                    </div>
-                  );
-                })}
-              </div>
-            ) : null}
             <div className="app-actions">
               <Button
                 appearance="primary"
@@ -800,21 +1032,65 @@ export function GoalsView({ data }: { data: DataContextValue }) {
         <section className="app-surface goals-master-pane">
           <div className="goals-pane-header">
             <h2>Goal list</h2>
+            <Button
+              appearance="primary"
+              size="small"
+              onClick={() => setCreateGoalDrawerOpen(true)}
+              disabled={!canEdit || activity !== "idle"}
+            >
+              + New goal
+            </Button>
           </div>
 
-          {goalsSorted.length === 0 ? (
+          <div className="goals-filter-row" role="tablist" aria-label="Goal filters">
+            {(
+              [
+                ["active", "Active"],
+                ["closed", "Closed"],
+                ["spent", "Spent"],
+              ] as const
+            ).map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                className={`goals-filter-chip ${goalFilter === value ? "goals-filter-chip-active" : ""}`}
+                onClick={() => setGoalFilter(value)}
+                role="tab"
+                aria-selected={goalFilter === value}
+              >
+                <span>{label}</span>
+                <span className="goals-filter-count">{goalCounts[value]}</span>
+              </button>
+            ))}
+          </div>
+
+          {filteredGoals.length === 0 ? (
             <div className="goals-empty-card">
-              <h3>No goals yet</h3>
-              <p className="app-muted">Create your first goal to start tracking progress.</p>
+              <h3>No {goalFilter} goals</h3>
+              <p className="app-muted">
+                {goalsSorted.length === 0
+                  ? "Create your first goal to start tracking progress."
+                  : "Try another filter or create a new goal."}
+              </p>
+              {goalsSorted.length === 0 ? (
+                <Button
+                  appearance="primary"
+                  onClick={() => setCreateGoalDrawerOpen(true)}
+                  disabled={!canEdit || activity !== "idle"}
+                >
+                  + New goal
+                </Button>
+              ) : null}
             </div>
           ) : (
             <div className="section-stack" role="listbox" aria-label="Goal list">
-              {goalsSorted.map((goal) => {
+              {filteredGoals.map((goal) => {
                 const allocated = allocationTotalsByGoal[goal.id] ?? 0;
                 const ratio =
                   goal.targetAmount > 0 ? Math.min(1, allocated / goal.targetAmount) : 1;
                 const achieved = allocated >= goal.targetAmount;
                 const selected = selectedGoal?.id === goal.id;
+                const spent = Boolean(goal.spentAt);
 
                 return (
                   <button
@@ -826,8 +1102,10 @@ export function GoalsView({ data }: { data: DataContextValue }) {
                     <div className="goals-master-item-header">
                       <div className="goals-master-name">{goal.name}</div>
                       <div className="goals-status-group">
-                        {achieved ? <span className="goals-status-badge">Achieved</span> : null}
-                        {goal.spentAt ? (
+                        {achieved && !spent ? (
+                          <span className="goals-status-badge">Achieved</span>
+                        ) : null}
+                        {spent ? (
                           <span className="goals-status-chip">Spent</span>
                         ) : (
                           <span className="goals-status-chip">{goal.status}</span>
@@ -835,30 +1113,581 @@ export function GoalsView({ data }: { data: DataContextValue }) {
                       </div>
                     </div>
                     <div className="app-muted">Priority {goal.priority}</div>
-                    <div className="goals-progress-row">
-                      <span>
-                        {formatCurrency(allocated)} / {formatCurrency(goal.targetAmount)}
-                      </span>
-                      <span>{Math.round(ratio * 100)}%</span>
-                    </div>
-                    <div className="goals-progress-bar" aria-hidden>
-                      <div className="goals-progress-fill" style={{ width: `${ratio * 100}%` }} />
-                    </div>
+
+                    {spent ? (
+                      <div className="app-muted">Spent on {formatDateOnly(goal.spentAt ?? "")}</div>
+                    ) : (
+                      <>
+                        <div className="goals-progress-row">
+                          <span>
+                            {formatCurrency(allocated)} / {formatCurrency(goal.targetAmount)}
+                          </span>
+                          <span>{Math.round(ratio * 100)}%</span>
+                        </div>
+                        <div className="goals-progress-bar" aria-hidden>
+                          <div
+                            className="goals-progress-fill"
+                            style={{ width: `${ratio * 100}%` }}
+                          />
+                        </div>
+                      </>
+                    )}
                   </button>
                 );
               })}
             </div>
           )}
+        </section>
 
-          <div className="goals-create-card">
-            <h3>Create goal</h3>
+        <section className="app-surface goals-detail-pane">
+          {!selectedGoal ? (
+            <div className="goals-empty-card">
+              <h3>No goal selected</h3>
+              <p className="app-muted">Select a goal from the list to view details.</p>
+            </div>
+          ) : (
+            <div className="goals-detail-shell">
+              <div className="goals-detail-sticky">
+                <div className="goals-detail-header">
+                  <div>
+                    <h2>{selectedGoal.name}</h2>
+                    <div className="goals-status-group">
+                      {achievedSelectedGoal ? (
+                        <span className="goals-status-badge">Achieved</span>
+                      ) : null}
+                      {selectedGoal.spentAt ? (
+                        <span className="goals-status-chip">Spent</span>
+                      ) : (
+                        <span className="goals-status-chip">{selectedGoal.status}</span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="goals-progress-meta">
+                    <div>
+                      {formatCurrency(selectedGoalTotalAllocated)} /{" "}
+                      {formatCurrency(selectedGoal.targetAmount)}
+                    </div>
+                    <div className="app-muted">Priority {selectedGoal.priority}</div>
+                  </div>
+                </div>
+
+                <div className="goals-header-actions">
+                  {selectedGoal.spentAt ? (
+                    <Button
+                      appearance="primary"
+                      onClick={() => void handleUndoSpend()}
+                      disabled={!canEdit || !undoInfo.available || activity !== "idle"}
+                    >
+                      Undo spend
+                    </Button>
+                  ) : selectedGoal.status === "closed" ? (
+                    <Button
+                      appearance="primary"
+                      onClick={() => setSpendDrawerOpen(true)}
+                      disabled={!canEdit || activity !== "idle"}
+                    >
+                      Mark as spent...
+                    </Button>
+                  ) : null}
+                </div>
+
+                <TabList
+                  selectedValue={goalTab}
+                  onTabSelect={(_, value) => setGoalTab(value.value as GoalTab)}
+                >
+                  <Tab value="details">Details</Tab>
+                  <Tab value="allocations">Allocations</Tab>
+                  <Tab value="history">History</Tab>
+                  {selectedGoal.spentAt ? <Tab value="receipt">Receipt</Tab> : null}
+                </TabList>
+              </div>
+
+              <div className="goals-detail-content">
+                {goalTab === "details" ? (
+                  <div className="section-stack">
+                    {achievedSelectedGoal && !selectedGoal.spentAt ? (
+                      <div className="app-alert" role="status">
+                        <div className="section-stack">
+                          <Text>This goal reached 100% of the target.</Text>
+                          <div className="app-actions">
+                            {selectedGoal.status === "active" ? (
+                              <Button
+                                onClick={() =>
+                                  void runMutation(
+                                    () =>
+                                      updateGoal({
+                                        goalId: selectedGoal.id,
+                                        name: selectedGoal.name,
+                                        targetAmount: selectedGoal.targetAmount,
+                                        priority: selectedGoal.priority,
+                                        status: "closed",
+                                        startDate: selectedGoal.startDate,
+                                        endDate: selectedGoal.endDate,
+                                      }),
+                                    "Goal closed.",
+                                  )
+                                }
+                                disabled={!canEditSelectedGoal || activity !== "idle"}
+                              >
+                                Close goal
+                              </Button>
+                            ) : (
+                              <Button
+                                onClick={() => setSpendDrawerOpen(true)}
+                                disabled={!canEditSelectedGoal || activity !== "idle"}
+                              >
+                                Mark as spent...
+                              </Button>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    ) : null}
+
+                    <Field label="Goal name">
+                      <Input
+                        value={editGoalName}
+                        onChange={(_, value) => setEditGoalName(value.value)}
+                        disabled={!canEditSelectedGoal || activity !== "idle"}
+                      />
+                    </Field>
+
+                    <Field
+                      label="Target amount (JPY)"
+                      validationState={editGoalTargetError ? "error" : "none"}
+                      validationMessage={editGoalTargetError ?? undefined}
+                    >
+                      <Input
+                        inputMode="numeric"
+                        value={editGoalTargetAmount}
+                        onChange={(_, value) =>
+                          setEditGoalTargetAmount(formatIntegerInput(value.value))
+                        }
+                        disabled={!canEditSelectedGoal || activity !== "idle"}
+                      />
+                    </Field>
+
+                    <Field
+                      label="Priority"
+                      validationState={editGoalPriorityError ? "error" : "none"}
+                      validationMessage={editGoalPriorityError ?? undefined}
+                    >
+                      <Input
+                        inputMode="numeric"
+                        value={editGoalPriority}
+                        onChange={(_, value) =>
+                          setEditGoalPriority(formatIntegerInput(value.value))
+                        }
+                        disabled={!canEditSelectedGoal || activity !== "idle"}
+                      />
+                    </Field>
+
+                    <Field label="Status">
+                      <Dropdown
+                        selectedOptions={[editGoalStatus]}
+                        onOptionSelect={(_, value) => {
+                          const status = value.optionValue as "active" | "closed" | undefined;
+                          if (status) {
+                            setEditGoalStatus(status);
+                          }
+                        }}
+                        disabled={!canEditSelectedGoal || activity !== "idle"}
+                      >
+                        <Option value="active">Active</Option>
+                        <Option value="closed">Closed</Option>
+                      </Dropdown>
+                    </Field>
+
+                    <Field label="Start date (optional)">
+                      <Input
+                        type="date"
+                        value={editGoalStartDate}
+                        onChange={(_, value) => setEditGoalStartDate(value.value)}
+                        disabled={!canEditSelectedGoal || activity !== "idle"}
+                      />
+                    </Field>
+
+                    <Field label="End date (optional)">
+                      <Input
+                        type="date"
+                        value={editGoalEndDate}
+                        onChange={(_, value) => setEditGoalEndDate(value.value)}
+                        disabled={!canEditSelectedGoal || activity !== "idle"}
+                      />
+                    </Field>
+
+                    <div className="app-actions">
+                      <Button
+                        appearance="primary"
+                        onClick={() => void handleUpdateGoal()}
+                        disabled={
+                          !canEditSelectedGoal ||
+                          activity !== "idle" ||
+                          !!editGoalTargetError ||
+                          !!editGoalPriorityError ||
+                          editGoalName.trim().length === 0
+                        }
+                      >
+                        Save goal
+                      </Button>
+
+                      {goalDeleteStep === 0 ? (
+                        <Button
+                          onClick={() => setGoalDeleteStep(1)}
+                          disabled={!canEditSelectedGoal || activity !== "idle"}
+                        >
+                          Delete goal
+                        </Button>
+                      ) : null}
+                    </div>
+
+                    {goalDeleteStep === 1 ? (
+                      <div className="app-alert app-alert-error" role="alert">
+                        <Text>
+                          This deletes the goal and all related allocations. This cannot be undone.
+                        </Text>
+                        <div className="app-actions" style={{ marginTop: 12 }}>
+                          <Button
+                            appearance="primary"
+                            onClick={() => void handleDeleteGoal()}
+                            disabled={!canEditSelectedGoal || activity !== "idle"}
+                          >
+                            Delete permanently
+                          </Button>
+                          <Button onClick={() => setGoalDeleteStep(0)}>Cancel</Button>
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+
+                {goalTab === "allocations" ? (
+                  <div className="section-stack">
+                    <div className="app-actions">
+                      <Button
+                        appearance="primary"
+                        onClick={() => {
+                          setAddAllocationDrawerOpen(true);
+                          setAddAllocationAmount("0");
+                        }}
+                        disabled={!canEditSelectedGoal || activity !== "idle"}
+                      >
+                        + Add allocation
+                      </Button>
+                      <Button
+                        onClick={() => void handleRemoveAllAllocations()}
+                        disabled={!canEditSelectedGoal || activity !== "idle"}
+                      >
+                        Remove all allocations
+                      </Button>
+                    </div>
+
+                    {selectedGoalAllocatedPositions.length === 0 ? (
+                      <div className="goals-empty-card">
+                        <h3>No allocations yet</h3>
+                        <p className="app-muted">
+                          Use + Add allocation to assign funds from positions.
+                        </p>
+                      </div>
+                    ) : (
+                      selectedGoalAllocatedPositions.map(({ allocation, position }) => {
+                        const currentAmount = allocation.allocatedAmount;
+                        const totalForPosition = allocationTotalsByPosition[position.id] ?? 0;
+                        const available = Math.max(
+                          0,
+                          position.marketValue - (totalForPosition - currentAmount),
+                        );
+                        const maxByGoal = Math.max(
+                          0,
+                          selectedGoal.targetAmount - (selectedGoalTotalAllocated - currentAmount),
+                        );
+                        const maxAllowed = Math.min(available, maxByGoal);
+                        const draftRaw = allocationDrafts[position.id] ?? "0";
+                        const draftAmount = parseIntegerInput(draftRaw) ?? 0;
+                        const nextFree = Math.max(
+                          0,
+                          position.marketValue - (totalForPosition - currentAmount + draftAmount),
+                        );
+                        const accountName =
+                          accountsById.get(position.accountId)?.name ?? "Unknown account";
+                        const isHighlighted = highlightedAllocationPositionId === position.id;
+
+                        return (
+                          <div
+                            key={position.id}
+                            className={`app-surface goals-allocation-row ${isHighlighted ? "goals-allocation-row-highlight" : ""}`}
+                          >
+                            <div className="goals-master-item-header">
+                              <div>
+                                <div className="goals-master-name">{position.label}</div>
+                                <div className="app-muted">{accountName}</div>
+                              </div>
+                              <div className="app-muted">Available {formatCurrency(available)}</div>
+                            </div>
+
+                            <Field
+                              label="Allocation (JPY)"
+                              validationState={
+                                getIntegerInputError(draftRaw, { required: true }) ||
+                                draftAmount > maxAllowed
+                                  ? "error"
+                                  : "none"
+                              }
+                              validationMessage={
+                                getIntegerInputError(draftRaw, { required: true }) ??
+                                (draftAmount > maxAllowed
+                                  ? "Allocation exceeds the available amount for this position or goal."
+                                  : undefined)
+                              }
+                            >
+                              <Input
+                                inputMode="numeric"
+                                value={draftRaw}
+                                onChange={(_, value) =>
+                                  setAllocationDrafts((prev) => ({
+                                    ...prev,
+                                    [position.id]: formatIntegerInput(value.value),
+                                  }))
+                                }
+                                onKeyDown={(event) => {
+                                  if (event.key === "Enter") {
+                                    event.preventDefault();
+                                    void saveAllocationAbsolute(position.id);
+                                  }
+                                }}
+                                onBlur={() => {
+                                  void saveAllocationAbsolute(position.id);
+                                }}
+                                disabled={!canEditSelectedGoal || activity !== "idle"}
+                                placeholder="0 (JPY integer only)"
+                              />
+                            </Field>
+
+                            <div className="goals-allocation-meta">
+                              <span className="app-muted">
+                                After change: Free {formatCurrency(nextFree)}
+                              </span>
+                              <Button
+                                size="small"
+                                appearance="secondary"
+                                onClick={() =>
+                                  router.push(
+                                    buildEditPositionHref(position.id, position.accountId),
+                                  )
+                                }
+                              >
+                                Edit position
+                              </Button>
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                ) : null}
+
+                {goalTab === "history" ? (
+                  <div className="section-stack">
+                    {historyError ? (
+                      <div className="app-alert app-alert-error">{historyError}</div>
+                    ) : null}
+
+                    {historyItems.length === 0 && !historyLoading ? (
+                      <div className="goals-empty-card">
+                        <h3>No history yet</h3>
+                        <p className="app-muted">
+                          History UI is ready. Connect the adapter to start loading events.
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="section-stack">
+                        {historyItems.map((item) => (
+                          <div key={item.id} className="goals-history-item">
+                            <div className="goals-master-item-header">
+                              <strong>{item.eventType}</strong>
+                              <span className="app-muted">{formatDateTime(item.timestamp)}</span>
+                            </div>
+                            <div>{item.summary}</div>
+                            {typeof item.amountDelta === "number" ? (
+                              <div className="app-muted">{formatCurrency(item.amountDelta)}</div>
+                            ) : null}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    <div className="app-actions">
+                      <Button
+                        onClick={() => void loadMoreHistory()}
+                        disabled={!historyCursor || historyLoading}
+                      >
+                        Load more
+                      </Button>
+                      {historyLoading ? <span className="app-muted">Loading...</span> : null}
+                    </div>
+                  </div>
+                ) : null}
+
+                {goalTab === "receipt" && selectedGoal.spentAt ? (
+                  <div className="section-stack">
+                    <div className="app-surface goals-receipt-card">
+                      <div className="goals-master-item-header">
+                        <strong>Spent on {formatDateOnly(selectedGoal.spentAt)}</strong>
+                        <span className="goals-status-chip">Receipt</span>
+                      </div>
+
+                      {receipt ? (
+                        <>
+                          <div>Total spent: {formatCurrency(receipt.totalAmount)}</div>
+                          <div className="section-stack">
+                            {receipt.payments.map((payment, index) => {
+                              const position = positionsById.get(payment.positionId);
+                              return (
+                                <div
+                                  key={`${payment.positionId}-${index}`}
+                                  className="goals-receipt-row"
+                                >
+                                  <span>{position?.label ?? "Unknown position"}</span>
+                                  <span>{formatCurrency(payment.amount)}</span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </>
+                      ) : (
+                        <div className="app-muted">
+                          Receipt details are unavailable in the current cache.
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="app-alert" role="status">
+                      <Text>
+                        {undoInfo.message ?? "Undo is only available for 24 hours after spending."}
+                      </Text>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          )}
+        </section>
+      </div>
+
+      {addAllocationDrawerOpen ? (
+        <div className="goals-overlay" onClick={() => setAddAllocationDrawerOpen(false)}>
+          <section
+            className="goals-drawer"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Add allocation"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="goals-drawer-header">
+              <strong>Add allocation</strong>
+              <Button onClick={() => setAddAllocationDrawerOpen(false)}>Close</Button>
+            </header>
+
+            {!selectedGoal ? (
+              <div className="app-muted">Select a goal first.</div>
+            ) : addAllocationCandidates.length === 0 ? (
+              <div className="goals-empty-card">
+                <h3>No available positions</h3>
+                <p className="app-muted">
+                  Every position is already allocated or has no available amount.
+                </p>
+              </div>
+            ) : (
+              <div className="section-stack">
+                <Field label="Position">
+                  <Dropdown
+                    selectedOptions={addAllocationPositionId ? [addAllocationPositionId] : []}
+                    onOptionSelect={(_, value) =>
+                      setAddAllocationPositionId(value.optionValue ?? null)
+                    }
+                    disabled={!canEditSelectedGoal || activity !== "idle"}
+                  >
+                    {addAllocationCandidates.map((candidate) => {
+                      const text = `${candidate.position.label} · ${candidate.accountName} · Available ${formatCurrency(candidate.available)}`;
+                      return (
+                        <Option
+                          key={candidate.position.id}
+                          value={candidate.position.id}
+                          text={text}
+                        >
+                          {text}
+                        </Option>
+                      );
+                    })}
+                  </Dropdown>
+                </Field>
+
+                <Field
+                  label="Amount (JPY)"
+                  validationState={addAllocationAmountError ? "error" : "none"}
+                  validationMessage={addAllocationAmountError ?? undefined}
+                >
+                  <Input
+                    inputMode="numeric"
+                    value={addAllocationAmount}
+                    onChange={(_, value) => setAddAllocationAmount(formatIntegerInput(value.value))}
+                    disabled={!canEditSelectedGoal || activity !== "idle"}
+                    placeholder="0 (JPY integer only)"
+                  />
+                </Field>
+
+                <div className="app-muted">
+                  Available:{" "}
+                  {selectedAddAllocationCandidate
+                    ? formatCurrency(selectedAddAllocationCandidate.available)
+                    : "—"}
+                </div>
+                <div className="app-muted">
+                  Remaining to target: {formatCurrency(remainingToTarget)}
+                </div>
+
+                <div className="app-actions">
+                  <Button
+                    appearance="primary"
+                    onClick={() => void handleAddAllocation()}
+                    disabled={
+                      !canEditSelectedGoal ||
+                      activity !== "idle" ||
+                      !addAllocationPositionId ||
+                      !!addAllocationAmountError
+                    }
+                  >
+                    Add allocation
+                  </Button>
+                  <Button onClick={() => setAddAllocationDrawerOpen(false)}>Cancel</Button>
+                </div>
+              </div>
+            )}
+          </section>
+        </div>
+      ) : null}
+
+      {createGoalDrawerOpen ? (
+        <div className="goals-overlay" onClick={() => setCreateGoalDrawerOpen(false)}>
+          <section
+            className="goals-drawer"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Create goal"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="goals-drawer-header">
+              <strong>New goal</strong>
+              <Button onClick={() => setCreateGoalDrawerOpen(false)}>Close</Button>
+            </header>
+
             <div className="section-stack">
               <Field label="Goal name">
                 <Input
                   value={newGoalName}
                   onChange={(_, value) => setNewGoalName(value.value)}
-                  placeholder="Emergency fund"
                   disabled={!canEdit || activity !== "idle"}
+                  placeholder="Emergency fund"
                 />
               </Field>
 
@@ -923,476 +1752,107 @@ export function GoalsView({ data }: { data: DataContextValue }) {
                 />
               </Field>
 
-              <Button
-                appearance="primary"
-                onClick={() => void handleCreateGoal()}
-                disabled={
-                  !canEdit ||
-                  activity !== "idle" ||
-                  !!newGoalTargetError ||
-                  !!newGoalPriorityError ||
-                  newGoalName.trim().length === 0
-                }
-              >
-                Add goal
-              </Button>
-            </div>
-          </div>
-        </section>
-
-        <section className="app-surface goals-detail-pane">
-          {!selectedGoal ? (
-            <div className="goals-empty-card">
-              <h3>No goal selected</h3>
-              <p className="app-muted">Select a goal from the list to view details.</p>
-            </div>
-          ) : (
-            <div className="section-stack">
-              <div className="goals-detail-header">
-                <div>
-                  <h2>{selectedGoal.name}</h2>
-                  <div className="goals-status-group">
-                    {achievedSelectedGoal ? (
-                      <span className="goals-status-badge">Achieved</span>
-                    ) : null}
-                    {selectedGoal.spentAt ? (
-                      <span className="goals-status-chip">Spent</span>
-                    ) : (
-                      <span className="goals-status-chip">{selectedGoal.status}</span>
-                    )}
-                  </div>
-                </div>
-                <div className="goals-progress-meta">
-                  <div>
-                    {formatCurrency(selectedGoalTotalAllocated)} /{" "}
-                    {formatCurrency(selectedGoal.targetAmount)}
-                  </div>
-                  <div className="app-muted">Priority {selectedGoal.priority}</div>
-                </div>
-              </div>
-
-              <div className="goals-progress-bar" aria-hidden>
-                <div
-                  className="goals-progress-fill"
-                  style={{
-                    width: `${
-                      selectedGoal.targetAmount > 0
-                        ? Math.min(
-                            100,
-                            (selectedGoalTotalAllocated / selectedGoal.targetAmount) * 100,
-                          )
-                        : 100
-                    }%`,
+              <div className="app-actions">
+                <Button
+                  appearance="primary"
+                  onClick={() => void handleCreateGoal()}
+                  disabled={
+                    !canEdit ||
+                    activity !== "idle" ||
+                    !!newGoalTargetError ||
+                    !!newGoalPriorityError ||
+                    newGoalName.trim().length === 0
+                  }
+                >
+                  Create goal
+                </Button>
+                <Button
+                  onClick={() => {
+                    resetCreateGoalForm();
+                    setCreateGoalDrawerOpen(false);
                   }}
-                />
+                >
+                  Cancel
+                </Button>
               </div>
-
-              <TabList
-                selectedValue={goalTab}
-                onTabSelect={(_, value) => setGoalTab(value.value as GoalTab)}
-              >
-                <Tab value="details">Details</Tab>
-                <Tab value="allocations">Allocations</Tab>
-                <Tab value="history">History</Tab>
-                <Tab value="spend">Spend</Tab>
-              </TabList>
-
-              {goalTab === "details" ? (
-                <div className="section-stack">
-                  <Field label="Goal name">
-                    <Input
-                      value={editGoalName}
-                      onChange={(_, value) => setEditGoalName(value.value)}
-                      disabled={!canEditSelectedGoal || activity !== "idle"}
-                    />
-                  </Field>
-
-                  <Field
-                    label="Target amount (JPY)"
-                    validationState={editGoalTargetError ? "error" : "none"}
-                    validationMessage={editGoalTargetError ?? undefined}
-                  >
-                    <Input
-                      inputMode="numeric"
-                      value={editGoalTargetAmount}
-                      onChange={(_, value) =>
-                        setEditGoalTargetAmount(formatIntegerInput(value.value))
-                      }
-                      disabled={!canEditSelectedGoal || activity !== "idle"}
-                      placeholder="0 (JPY integer only)"
-                    />
-                  </Field>
-
-                  <Field
-                    label="Priority"
-                    validationState={editGoalPriorityError ? "error" : "none"}
-                    validationMessage={editGoalPriorityError ?? undefined}
-                  >
-                    <Input
-                      inputMode="numeric"
-                      value={editGoalPriority}
-                      onChange={(_, value) => setEditGoalPriority(formatIntegerInput(value.value))}
-                      disabled={!canEditSelectedGoal || activity !== "idle"}
-                    />
-                  </Field>
-
-                  <Field label="Status">
-                    <Dropdown
-                      selectedOptions={[editGoalStatus]}
-                      onOptionSelect={(_, value) => {
-                        const status = value.optionValue as "active" | "closed" | undefined;
-                        if (status) {
-                          setEditGoalStatus(status);
-                        }
-                      }}
-                      disabled={!canEditSelectedGoal || activity !== "idle"}
-                    >
-                      <Option value="active">Active</Option>
-                      <Option value="closed">Closed</Option>
-                    </Dropdown>
-                  </Field>
-
-                  <Field label="Start date (optional)">
-                    <Input
-                      type="date"
-                      value={editGoalStartDate}
-                      onChange={(_, value) => setEditGoalStartDate(value.value)}
-                      disabled={!canEditSelectedGoal || activity !== "idle"}
-                    />
-                  </Field>
-
-                  <Field label="End date (optional)">
-                    <Input
-                      type="date"
-                      value={editGoalEndDate}
-                      onChange={(_, value) => setEditGoalEndDate(value.value)}
-                      disabled={!canEditSelectedGoal || activity !== "idle"}
-                    />
-                  </Field>
-
-                  <div className="app-actions">
-                    <Button
-                      appearance="primary"
-                      onClick={() => void handleUpdateGoal()}
-                      disabled={
-                        !canEditSelectedGoal ||
-                        activity !== "idle" ||
-                        !!editGoalTargetError ||
-                        !!editGoalPriorityError ||
-                        editGoalName.trim().length === 0
-                      }
-                    >
-                      Save goal
-                    </Button>
-
-                    {goalDeleteStep === 0 ? (
-                      <Button
-                        onClick={() => setGoalDeleteStep(1)}
-                        disabled={!canEditSelectedGoal || activity !== "idle"}
-                      >
-                        Delete goal
-                      </Button>
-                    ) : null}
-                  </div>
-
-                  {goalDeleteStep === 1 ? (
-                    <div className="app-alert app-alert-error" role="alert">
-                      <Text>
-                        This deletes the goal and all related allocations. This cannot be undone.
-                      </Text>
-                      <div className="app-actions" style={{ marginTop: 12 }}>
-                        <Button
-                          appearance="primary"
-                          onClick={() => void handleDeleteGoal()}
-                          disabled={!canEditSelectedGoal || activity !== "idle"}
-                        >
-                          Delete permanently
-                        </Button>
-                        <Button onClick={() => setGoalDeleteStep(0)}>Cancel</Button>
-                      </div>
-                    </div>
-                  ) : null}
-
-                  {selectedGoal.spentAt ? (
-                    <div className="app-alert" role="status">
-                      <div className="section-stack">
-                        <Text>
-                          This goal was marked as spent on {formatDateTime(selectedGoal.spentAt)}.
-                        </Text>
-                        <Text>Editing is disabled for spent goals.</Text>
-                        <Text>Undo is unavailable if allocations were edited after spending.</Text>
-                        {undoInfo.message ? <Text>{undoInfo.message}</Text> : null}
-                        <div className="app-actions">
-                          <Button
-                            appearance="primary"
-                            onClick={() => void handleUndoSpend()}
-                            disabled={!canEdit || !undoInfo.available || activity !== "idle"}
-                          >
-                            Undo spend
-                          </Button>
-                        </div>
-                      </div>
-                    </div>
-                  ) : null}
-                </div>
-              ) : null}
-
-              {goalTab === "allocations" ? (
-                <div className="section-stack">
-                  {selectedGoalAllocations.length === 0 ? (
-                    <div className="app-muted">No allocations yet for this goal.</div>
-                  ) : (
-                    <div className="section-stack">
-                      {selectedGoalAllocations.map((allocation) => {
-                        const position = positionsById.get(allocation.positionId);
-                        const account = position ? accountsById.get(position.accountId) : null;
-                        const allocatedTotal =
-                          allocationTotalsByPosition[allocation.positionId] ?? 0;
-                        const available = position
-                          ? Math.max(
-                              0,
-                              position.marketValue - (allocatedTotal - allocation.allocatedAmount),
-                            )
-                          : 0;
-
-                        return (
-                          <div key={allocation.id} className="app-surface goals-allocation-card">
-                            <div className="goals-master-item-header">
-                              <div style={{ fontWeight: 600 }}>
-                                {position?.label ?? "Unknown position"}
-                              </div>
-                              <div className="app-muted">{account?.name ?? "Unknown account"}</div>
-                            </div>
-                            <div className="app-muted">Available {formatCurrency(available)}</div>
-
-                            <Field label="Allocated amount (JPY)">
-                              <Input
-                                inputMode="numeric"
-                                value={allocationEdits[allocation.id] ?? ""}
-                                onChange={(_, value) =>
-                                  setAllocationEdits((prev) => ({
-                                    ...prev,
-                                    [allocation.id]: formatIntegerInput(value.value),
-                                  }))
-                                }
-                                disabled={!canEditSelectedGoal || activity !== "idle"}
-                              />
-                            </Field>
-
-                            <Field
-                              label={`Reduce amount (current ${formatCurrency(allocation.allocatedAmount)})`}
-                            >
-                              <Input
-                                inputMode="numeric"
-                                value={allocationReductions[allocation.id] ?? "0"}
-                                onChange={(_, value) =>
-                                  setAllocationReductions((prev) => ({
-                                    ...prev,
-                                    [allocation.id]: formatIntegerInput(value.value),
-                                  }))
-                                }
-                                disabled={!canEditSelectedGoal || activity !== "idle"}
-                              />
-                            </Field>
-
-                            <div className="app-actions">
-                              <Button
-                                appearance="primary"
-                                onClick={() => void handleUpdateAllocation(allocation.id)}
-                                disabled={!canEditSelectedGoal || activity !== "idle"}
-                              >
-                                Save allocation
-                              </Button>
-                              <Button
-                                onClick={() => void handleDeleteAllocation(allocation.id)}
-                                disabled={!canEditSelectedGoal || activity !== "idle"}
-                              >
-                                Delete allocation
-                              </Button>
-                            </div>
-                          </div>
-                        );
-                      })}
-
-                      <div className="app-actions">
-                        <Button
-                          appearance="primary"
-                          onClick={() => void handleReduceAllocations()}
-                          disabled={!canEditSelectedGoal || activity !== "idle"}
-                        >
-                          Apply reductions
-                        </Button>
-                        <Button
-                          onClick={() => void handleRemoveAllAllocations()}
-                          disabled={!canEditSelectedGoal || activity !== "idle"}
-                        >
-                          Remove all allocations
-                        </Button>
-                      </div>
-                    </div>
-                  )}
-
-                  <div className="goals-create-card">
-                    <h3>Add allocation</h3>
-                    {positions.length === 0 ? (
-                      <div className="app-muted">Create a position before adding allocations.</div>
-                    ) : availablePositionsForGoal.length === 0 ? (
-                      <div className="app-muted">
-                        All positions are already allocated for this goal.
-                      </div>
-                    ) : (
-                      <div className="section-stack">
-                        <Field label="Position">
-                          <Dropdown
-                            selectedOptions={
-                              newAllocationPositionId ? [newAllocationPositionId] : []
-                            }
-                            onOptionSelect={(_, value) =>
-                              setNewAllocationPositionId(value.optionValue ?? null)
-                            }
-                            disabled={!canEditSelectedGoal || activity !== "idle"}
-                          >
-                            {availablePositionsForGoal.map((position) => {
-                              const account = accountsById.get(position.accountId);
-                              const allocated = allocationTotalsByPosition[position.id] ?? 0;
-                              const available = Math.max(0, position.marketValue - allocated);
-                              const optionText = `${position.label} · ${
-                                account?.name ?? "Account"
-                              } · Available ${formatCurrency(available)}`;
-
-                              return (
-                                <Option key={position.id} value={position.id} text={optionText}>
-                                  {optionText}
-                                </Option>
-                              );
-                            })}
-                          </Dropdown>
-                        </Field>
-
-                        <Field
-                          label="Allocated amount (JPY)"
-                          validationState={newAllocationAmountError ? "error" : "none"}
-                          validationMessage={newAllocationAmountError ?? undefined}
-                        >
-                          <Input
-                            inputMode="numeric"
-                            value={newAllocationAmount}
-                            onChange={(_, value) =>
-                              setNewAllocationAmount(formatIntegerInput(value.value))
-                            }
-                            disabled={!canEditSelectedGoal || activity !== "idle"}
-                            placeholder="0 (JPY integer only)"
-                          />
-                        </Field>
-
-                        <Button
-                          appearance="primary"
-                          onClick={() => void handleCreateAllocation()}
-                          disabled={
-                            !canEditSelectedGoal ||
-                            activity !== "idle" ||
-                            !newAllocationPositionId ||
-                            !!newAllocationAmountError
-                          }
-                        >
-                          Add allocation
-                        </Button>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              ) : null}
-
-              {goalTab === "history" ? (
-                <div className="section-stack">
-                  <div className="app-muted">
-                    Open History to review activity for this goal. Data connection and pagination
-                    will be added in Stage 5.
-                  </div>
-                  <div className="app-actions">
-                    <Button appearance="primary" onClick={() => setHistoryDrawerOpen(true)}>
-                      Open history
-                    </Button>
-                  </div>
-                </div>
-              ) : null}
-
-              {goalTab === "spend" ? (
-                <div className="section-stack">
-                  {selectedGoal.spentAt ? (
-                    <div className="app-muted">This goal is already marked as spent.</div>
-                  ) : selectedGoal.status !== "closed" ? (
-                    <div className="app-muted">Close the goal before marking it as spent.</div>
-                  ) : selectedGoalAllocations.length === 0 ? (
-                    <div className="app-muted">No allocations are available to spend.</div>
-                  ) : (
-                    <>
-                      <div>Total to spend: {formatCurrency(selectedGoalTotalAllocated)}</div>
-                      {selectedGoalAllocations.map((allocation) => {
-                        const position = positionsById.get(allocation.positionId);
-                        return (
-                          <Field
-                            key={allocation.id}
-                            label={`Pay from ${position?.label ?? "Position"} (allocated ${formatCurrency(
-                              allocation.allocatedAmount,
-                            )})`}
-                          >
-                            <Input
-                              inputMode="numeric"
-                              value={spendInputs[allocation.id] ?? "0"}
-                              onChange={(_, value) =>
-                                setSpendInputs((prev) => ({
-                                  ...prev,
-                                  [allocation.id]: formatIntegerInput(value.value),
-                                }))
-                              }
-                              disabled={!canEditSelectedGoal || activity !== "idle"}
-                            />
-                          </Field>
-                        );
-                      })}
-
-                      <Button
-                        appearance="primary"
-                        onClick={() => void handleSpendGoal()}
-                        disabled={!canEditSelectedGoal || activity !== "idle"}
-                      >
-                        Mark as spent
-                      </Button>
-                    </>
-                  )}
-                </div>
-              ) : null}
-            </div>
-          )}
-        </section>
-      </div>
-
-      {historyDrawerOpen ? (
-        <div className="goals-history-overlay" onClick={() => setHistoryDrawerOpen(false)}>
-          <section
-            className="goals-history-drawer"
-            role="dialog"
-            aria-modal="true"
-            aria-label="Goal history"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <header className="goals-history-header">
-              <strong>{selectedGoal ? `${selectedGoal.name} · History` : "Goal history"}</strong>
-              <Button onClick={() => setHistoryDrawerOpen(false)}>Close</Button>
-            </header>
-            <div className="section-stack">
-              <Text>History is coming soon.</Text>
-              <Text className="app-muted">This overlay is ready for Stage 5 data integration.</Text>
             </div>
           </section>
         </div>
       ) : null}
 
-      {conflictDialogOpen ? (
-        <div className="goals-history-overlay" onClick={() => setConflictDialogOpen(false)}>
+      {spendDrawerOpen ? (
+        <div className="goals-overlay" onClick={() => setSpendDrawerOpen(false)}>
           <section
-            className="goals-history-drawer"
+            className="goals-drawer"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Mark as spent"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="goals-drawer-header">
+              <strong>Mark as spent</strong>
+              <Button onClick={() => setSpendDrawerOpen(false)}>Close</Button>
+            </header>
+
+            {!selectedGoal ? (
+              <div className="app-muted">Select a goal first.</div>
+            ) : (
+              <div className="section-stack">
+                <div className="app-muted">
+                  Enter payment amounts per position. The total must match the goal allocation.
+                </div>
+                <div>Total to spend: {formatCurrency(selectedGoalTotalAllocated)}</div>
+
+                {selectedGoalAllocations.map((allocation) => {
+                  const position = positionsById.get(allocation.positionId);
+                  return (
+                    <Field
+                      key={allocation.id}
+                      label={`Pay from ${position?.label ?? "Position"} (allocated ${formatCurrency(
+                        allocation.allocatedAmount,
+                      )})`}
+                    >
+                      <Input
+                        inputMode="numeric"
+                        value={spendInputs[allocation.id] ?? "0"}
+                        onChange={(_, value) =>
+                          setSpendInputs((prev) => ({
+                            ...prev,
+                            [allocation.id]: formatIntegerInput(value.value),
+                          }))
+                        }
+                        disabled={!canEditSelectedGoal || activity !== "idle"}
+                      />
+                    </Field>
+                  );
+                })}
+
+                <div className="app-alert" role="status">
+                  <Text>
+                    {undoInfo.message ?? "Undo is only available for 24 hours after spending."}
+                  </Text>
+                </div>
+
+                <div className="app-actions">
+                  <Button
+                    appearance="primary"
+                    onClick={() => void handleSpendGoal()}
+                    disabled={!canEditSelectedGoal || activity !== "idle"}
+                  >
+                    Confirm spend
+                  </Button>
+                  <Button onClick={() => setSpendDrawerOpen(false)}>Cancel</Button>
+                </div>
+              </div>
+            )}
+          </section>
+        </div>
+      ) : null}
+
+      {conflictDialogOpen ? (
+        <div className="goals-overlay" onClick={() => setConflictDialogOpen(false)}>
+          <section
+            className="goals-drawer goals-dialog"
             role="dialog"
             aria-modal="true"
             onClick={(event) => event.stopPropagation()}

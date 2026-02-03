@@ -10,7 +10,8 @@ import {
   TabList,
   Text,
 } from "@fluentui/react-components";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DataContextValue, DomainActionOutcome } from "@/components/dataContext";
 import {
   formatCurrency,
@@ -142,6 +143,12 @@ export function AccountsView({ data }: { data: DataContextValue }) {
 
   const canEdit = isOnline && isSignedIn && canWrite;
   const editNotice = getEditNotice(data);
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+
+  const returnGoalId = searchParams.get("returnGoalId");
+  const returnTab = searchParams.get("returnTab") ?? "allocations";
 
   const accounts = useMemo(() => draftState?.accounts ?? [], [draftState?.accounts]);
   const positions = useMemo(() => draftState?.positions ?? [], [draftState?.positions]);
@@ -161,6 +168,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
   const inlineHintShownRef = useRef(false);
   const saveChangesRef = useRef(saveChanges);
   const discardChangesRef = useRef(discardChanges);
+  const skipQueryRestoreRef = useRef(false);
 
   const [accountFormName, setAccountFormName] = useState("");
   const [positionFormLabel, setPositionFormLabel] = useState("");
@@ -262,6 +270,47 @@ export function AccountsView({ data }: { data: DataContextValue }) {
         goalName: goals.find((goal) => goal.id === allocation.goalId)?.name ?? "Unknown goal",
       }));
   }, [allocations, goals, selectedPosition]);
+
+  const updateQuery = useCallback(
+    (mutator: (params: URLSearchParams) => void) => {
+      const params = new URLSearchParams(searchParams.toString());
+      mutator(params);
+      const next = params.toString();
+      router.replace(next.length > 0 ? `${pathname}?${next}` : pathname);
+    },
+    [pathname, router, searchParams],
+  );
+
+  const getReturnGoalsPath = useCallback(() => {
+    if (!returnGoalId) {
+      return null;
+    }
+    const goalsPath = pathname.endsWith("/accounts")
+      ? pathname.slice(0, pathname.length - "/accounts".length) + "/goals"
+      : "/goals";
+    const params = new URLSearchParams();
+    params.set("goalId", returnGoalId);
+    params.set("tab", returnTab);
+    return `${goalsPath}?${params.toString()}`;
+  }, [pathname, returnGoalId, returnTab]);
+
+  const navigateBackToGoal = useCallback(() => {
+    const target = getReturnGoalsPath();
+    if (!target) {
+      return;
+    }
+    router.push(target);
+  }, [getReturnGoalsPath, router]);
+
+  const positionDetailsDirty = Boolean(
+    selectedPosition &&
+    (positionDetailsLabel !== selectedPosition.label ||
+      positionDetailsAssetType !== selectedPosition.assetType ||
+      positionDetailsAllocationMode !== selectedPosition.allocationMode),
+  );
+
+  const [discardDialogOpen, setDiscardDialogOpen] = useState(false);
+  const pendingCloseActionRef = useRef<"close" | "back" | null>(null);
 
   const persistOperation = async (expectChanges: boolean): Promise<boolean> => {
     await new Promise((resolve) => window.setTimeout(resolve, 0));
@@ -395,17 +444,58 @@ export function AccountsView({ data }: { data: DataContextValue }) {
     setDrawer({ type: "editAccount", accountId });
   };
 
-  const openPositionDetailsDrawer = (position: Position) => {
+  const openPositionDetailsDrawer = (position: Position, options?: { fromQuery?: boolean }) => {
+    skipQueryRestoreRef.current = false;
     setPositionDetailsLabel(position.label);
     setPositionDetailsAssetType(position.assetType);
     setPositionDetailsAllocationMode(position.allocationMode);
     setPositionTab("details");
     setDrawer({ type: "positionDetails", positionId: position.id });
+    if (options?.fromQuery) {
+      return;
+    }
+    updateQuery((params) => {
+      params.set("drawer", "position");
+      params.set("positionId", position.id);
+      params.set("accountId", position.accountId);
+    });
   };
 
-  const closeDrawer = () => {
+  const finalizeCloseDrawer = useCallback(() => {
+    skipQueryRestoreRef.current = true;
     setDrawer({ type: "closed" });
-  };
+    updateQuery((params) => {
+      params.delete("drawer");
+      params.delete("positionId");
+      if (!returnGoalId) {
+        params.delete("returnGoalId");
+        params.delete("returnTab");
+      }
+    });
+    if (returnGoalId) {
+      navigateBackToGoal();
+    }
+  }, [navigateBackToGoal, returnGoalId, updateQuery]);
+
+  const requestClosePositionDrawer = useCallback(
+    (mode: "close" | "back") => {
+      if (positionDetailsDirty) {
+        pendingCloseActionRef.current = mode;
+        setDiscardDialogOpen(true);
+        return;
+      }
+      finalizeCloseDrawer();
+    },
+    [finalizeCloseDrawer, positionDetailsDirty],
+  );
+
+  const closeDrawer = useCallback(() => {
+    if (drawer.type === "positionDetails") {
+      requestClosePositionDrawer("close");
+      return;
+    }
+    setDrawer({ type: "closed" });
+  }, [drawer.type, requestClosePositionDrawer]);
 
   const retrySave = async () => {
     const persisted = await persistOperation(false);
@@ -413,6 +503,21 @@ export function AccountsView({ data }: { data: DataContextValue }) {
       setRetryPending(false);
     }
   };
+
+  useEffect(() => {
+    if (drawer.type === "closed") {
+      return;
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") {
+        return;
+      }
+      event.preventDefault();
+      closeDrawer();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [closeDrawer, drawer.type]);
 
   useEffect(() => {
     const pendingAccountIds = pendingNewAccountIdsRef.current;
@@ -448,6 +553,40 @@ export function AccountsView({ data }: { data: DataContextValue }) {
     const timerId = window.setTimeout(() => setHighlightedPositionId(null), 1800);
     return () => window.clearTimeout(timerId);
   }, [highlightedPositionId]);
+
+  useEffect(() => {
+    const timerId = window.setTimeout(() => {
+      const accountIdFromQuery = searchParams.get("accountId");
+      if (accountIdFromQuery && accounts.some((account) => account.id === accountIdFromQuery)) {
+        setSelectedAccountId(accountIdFromQuery);
+        setMobileScreen("account");
+      }
+
+      const drawerFromQuery = searchParams.get("drawer");
+      const positionIdFromQuery = searchParams.get("positionId");
+      if (drawerFromQuery !== "position" || !positionIdFromQuery) {
+        skipQueryRestoreRef.current = false;
+        return;
+      }
+      if (skipQueryRestoreRef.current) {
+        return;
+      }
+      const position = positions.find((item) => item.id === positionIdFromQuery);
+      if (!position) {
+        return;
+      }
+      if (drawer.type === "positionDetails" && drawer.positionId === position.id) {
+        return;
+      }
+      skipQueryRestoreRef.current = false;
+      setPositionDetailsLabel(position.label);
+      setPositionDetailsAssetType(position.assetType);
+      setPositionDetailsAllocationMode(position.allocationMode);
+      setPositionTab("details");
+      setDrawer({ type: "positionDetails", positionId: position.id });
+    }, 0);
+    return () => window.clearTimeout(timerId);
+  }, [accounts, drawer, positions, searchParams]);
 
   const submitAddAccount = () => {
     if (accountFormName.trim().length === 0) {
@@ -896,7 +1035,12 @@ export function AccountsView({ data }: { data: DataContextValue }) {
                       ? "Add position"
                       : (selectedPosition?.label ?? "Position details")}
               </strong>
-              <Button onClick={closeDrawer}>Close</Button>
+              <div className="app-actions">
+                {drawer.type === "positionDetails" && returnGoalId ? (
+                  <Button onClick={() => requestClosePositionDrawer("back")}>Back to goal</Button>
+                ) : null}
+                <Button onClick={closeDrawer}>Close</Button>
+              </div>
             </header>
 
             {drawer.type === "addAccount" ? (
@@ -1113,7 +1257,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
                             }),
                           ).then((persisted) => {
                             if (persisted) {
-                              closeDrawer();
+                              finalizeCloseDrawer();
                             }
                           });
                         }}
@@ -1126,7 +1270,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
                           void runMutation(() => deletePosition(selectedPosition.id)).then(
                             (persisted) => {
                               if (persisted) {
-                                closeDrawer();
+                                finalizeCloseDrawer();
                               }
                             },
                           );
@@ -1161,6 +1305,40 @@ export function AccountsView({ data }: { data: DataContextValue }) {
                 {positionTab === "history" ? <div className="app-muted">Coming later.</div> : null}
               </div>
             ) : null}
+          </section>
+        </div>
+      ) : null}
+
+      {discardDialogOpen ? (
+        <div className="accounts-drawer-overlay" onClick={() => setDiscardDialogOpen(false)}>
+          <section
+            className="accounts-dialog"
+            role="dialog"
+            aria-modal="true"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h3>Discard changes?</h3>
+            <p>You have unsaved changes in this position.</p>
+            <div className="app-actions">
+              <Button
+                appearance="primary"
+                onClick={() => {
+                  setDiscardDialogOpen(false);
+                  pendingCloseActionRef.current = null;
+                  finalizeCloseDrawer();
+                }}
+              >
+                Discard changes and go back
+              </Button>
+              <Button
+                onClick={() => {
+                  setDiscardDialogOpen(false);
+                  pendingCloseActionRef.current = null;
+                }}
+              >
+                Stay
+              </Button>
+            </div>
           </section>
         </div>
       ) : null}
