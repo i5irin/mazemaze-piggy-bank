@@ -50,6 +50,7 @@ export type DataContextValue = {
   leaseError: string | null;
   message: string | null;
   error: string | null;
+  isRevalidating?: boolean;
   allocationNotice: AllocationNotice | null;
   latestEvent: PendingEvent | null;
   refresh: () => Promise<void>;

@@ -10,8 +10,8 @@ import {
   TabList,
   Text,
 } from "@fluentui/react-components";
-import { useRouter, useSearchParams } from "next/navigation";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DataContextValue, DomainActionOutcome } from "@/components/dataContext";
 import {
   formatCurrency,
@@ -70,6 +70,8 @@ const historyAdapter: GoalHistoryAdapter = {
 const isActiveGoal = (goal: Goal): boolean => goal.status === "active" && !goal.spentAt;
 const isClosedGoal = (goal: Goal): boolean => goal.status === "closed" && !goal.spentAt;
 const isSpentGoal = (goal: Goal): boolean => Boolean(goal.spentAt);
+const isGoalTab = (value: string | null): value is GoalTab =>
+  value === "details" || value === "allocations" || value === "history" || value === "receipt";
 
 const formatDateTime = (value: string): string => {
   const parsed = new Date(value);
@@ -156,12 +158,14 @@ export function GoalsView({ data }: { data: DataContextValue }) {
     allocationNotice,
     clearAllocationNotice,
     latestEvent,
+    isRevalidating,
     saveChanges,
     discardChanges,
     space,
   } = data;
 
   const router = useRouter();
+  const pathname = usePathname();
   const searchParams = useSearchParams();
 
   const canEdit = isOnline && isSignedIn && canWrite;
@@ -217,9 +221,7 @@ export function GoalsView({ data }: { data: DataContextValue }) {
     [goals],
   );
 
-  const [selectedGoalId, setSelectedGoalId] = useState<string | null>(null);
   const [goalFilter, setGoalFilter] = useState<GoalFilter>("active");
-  const [goalTab, setGoalTab] = useState<GoalTab>("details");
   const [isHydrated, setIsHydrated] = useState(false);
 
   useEffect(() => {
@@ -246,27 +248,67 @@ export function GoalsView({ data }: { data: DataContextValue }) {
     [goalsSorted],
   );
 
-  useEffect(() => {
-    if (selectedGoalId && goals.some((goal) => goal.id === selectedGoalId)) {
-      return;
-    }
-    setSelectedGoalId(filteredGoals[0]?.id ?? goalsSorted[0]?.id ?? null);
-  }, [filteredGoals, goals, goalsSorted, selectedGoalId]);
+  const updateGoalsQuery = useCallback(
+    (mutator: (params: URLSearchParams) => void) => {
+      const params = new URLSearchParams(searchParams.toString());
+      mutator(params);
+      const next = params.toString();
+      router.replace(next.length > 0 ? `${pathname}?${next}` : pathname);
+    },
+    [pathname, router, searchParams],
+  );
 
-  const selectedGoal = goals.find((goal) => goal.id === selectedGoalId) ?? null;
+  const normalizeTabForGoal = useCallback((value: string | null, goal: Goal | null): GoalTab => {
+    const baseTab: GoalTab = isGoalTab(value) ? value : "details";
+    if (baseTab === "receipt" && !goal?.spentAt) {
+      return "details";
+    }
+    return baseTab;
+  }, []);
+
+  const queryGoalId = searchParams.get("goalId");
+  const selectedGoal = goals.find((goal) => goal.id === queryGoalId) ?? null;
+  const selectedGoalTab = normalizeTabForGoal(searchParams.get("tab"), selectedGoal);
   const selectedGoalSpent = Boolean(selectedGoal?.spentAt);
   const canEditSelectedGoal = canEdit && !selectedGoalSpent;
 
   useEffect(() => {
-    const queryGoalId = searchParams.get("goalId");
-    if (queryGoalId && goals.some((goal) => goal.id === queryGoalId)) {
-      setSelectedGoalId(queryGoalId);
+    if (goalsSorted.length === 0) {
+      if (searchParams.has("goalId") || searchParams.has("tab")) {
+        updateGoalsQuery((params) => {
+          params.delete("goalId");
+          params.delete("tab");
+        });
+      }
+      return;
     }
-    const queryTab = searchParams.get("tab");
-    if (queryTab === "allocations" || queryTab === "details" || queryTab === "history") {
-      setGoalTab(queryTab);
+
+    if (!selectedGoal) {
+      const fallbackGoal = filteredGoals[0] ?? goalsSorted[0];
+      if (!fallbackGoal) {
+        return;
+      }
+      updateGoalsQuery((params) => {
+        params.set("goalId", fallbackGoal.id);
+        params.set("tab", normalizeTabForGoal(params.get("tab"), fallbackGoal));
+      });
+      return;
     }
-  }, [goals, searchParams]);
+
+    if (searchParams.get("tab") !== selectedGoalTab) {
+      updateGoalsQuery((params) => {
+        params.set("tab", selectedGoalTab);
+      });
+    }
+  }, [
+    filteredGoals,
+    goalsSorted,
+    normalizeTabForGoal,
+    searchParams,
+    selectedGoal,
+    selectedGoalTab,
+    updateGoalsQuery,
+  ]);
 
   const selectedGoalAllocations = useMemo(() => {
     if (!selectedGoal) {
@@ -464,7 +506,10 @@ export function GoalsView({ data }: { data: DataContextValue }) {
     if (persisted) {
       setCreateGoalDrawerOpen(false);
       resetCreateGoalForm();
-      setSelectedGoalId(null);
+      updateGoalsQuery((params) => {
+        params.delete("goalId");
+        params.delete("tab");
+      });
     }
   };
 
@@ -503,7 +548,6 @@ export function GoalsView({ data }: { data: DataContextValue }) {
       setEditGoalStartDate(selectedGoal.startDate ?? "");
       setEditGoalEndDate(selectedGoal.endDate ?? "");
       setGoalDeleteStep(0);
-      setGoalTab(selectedGoal.spentAt ? "receipt" : "details");
       setRecentlyAddedPositionId(null);
       setHighlightedAllocationPositionId(null);
     }, 0);
@@ -552,7 +596,10 @@ export function GoalsView({ data }: { data: DataContextValue }) {
     const persisted = await runMutation(() => deleteGoal(selectedGoal.id), "Goal deleted.");
     if (persisted) {
       setGoalDeleteStep(0);
-      setSelectedGoalId(null);
+      updateGoalsQuery((params) => {
+        params.delete("goalId");
+        params.delete("tab");
+      });
     }
   };
 
@@ -880,7 +927,9 @@ export function GoalsView({ data }: { data: DataContextValue }) {
 
     if (persisted) {
       setSpendDrawerOpen(false);
-      setGoalTab("receipt");
+      updateGoalsQuery((params) => {
+        params.set("tab", "receipt");
+      });
     }
   };
 
@@ -891,7 +940,9 @@ export function GoalsView({ data }: { data: DataContextValue }) {
     }
     const persisted = await runMutation(() => undoSpend(selectedGoal.id), "Spend undone.");
     if (persisted) {
-      setGoalTab("details");
+      updateGoalsQuery((params) => {
+        params.set("tab", "details");
+      });
     }
   };
 
@@ -934,11 +985,11 @@ export function GoalsView({ data }: { data: DataContextValue }) {
   };
 
   useEffect(() => {
-    if (!selectedGoal || goalTab !== "history") {
+    if (!selectedGoal || selectedGoalTab !== "history") {
       return;
     }
     void loadInitialHistory(selectedGoal.id);
-  }, [goalTab, selectedGoal]);
+  }, [selectedGoal, selectedGoalTab]);
 
   const receipt = useMemo(() => {
     if (!selectedGoal?.spentAt || !latestEvent || latestEvent.type !== "goal_spent") {
@@ -988,6 +1039,12 @@ export function GoalsView({ data }: { data: DataContextValue }) {
         </div>
       ) : null}
 
+      {isRevalidating ? (
+        <div className="app-alert" role="status">
+          <Text>Refreshing...</Text>
+        </div>
+      ) : null}
+
       {errorMessage ? (
         <div className="app-alert app-alert-error" role="alert">
           <Text>{errorMessage}</Text>
@@ -1014,10 +1071,13 @@ export function GoalsView({ data }: { data: DataContextValue }) {
               <Button
                 appearance="primary"
                 onClick={() => {
-                  setGoalTab("allocations");
-                  if (allocationNotice.affectedGoalIds.length > 0) {
-                    setSelectedGoalId(allocationNotice.affectedGoalIds[0]);
-                  }
+                  const affectedGoalId = allocationNotice.affectedGoalIds[0];
+                  updateGoalsQuery((params) => {
+                    params.set("tab", "allocations");
+                    if (affectedGoalId) {
+                      params.set("goalId", affectedGoalId);
+                    }
+                  });
                 }}
               >
                 Review allocations
@@ -1097,7 +1157,12 @@ export function GoalsView({ data }: { data: DataContextValue }) {
                     key={goal.id}
                     type="button"
                     className={`goals-master-item ${selected ? "goals-master-item-selected" : ""}`}
-                    onClick={() => setSelectedGoalId(goal.id)}
+                    onClick={() => {
+                      updateGoalsQuery((params) => {
+                        params.set("goalId", goal.id);
+                        params.set("tab", normalizeTabForGoal(params.get("tab"), goal));
+                      });
+                    }}
                   >
                     <div className="goals-master-item-header">
                       <div className="goals-master-name">{goal.name}</div>
@@ -1192,8 +1257,13 @@ export function GoalsView({ data }: { data: DataContextValue }) {
                 </div>
 
                 <TabList
-                  selectedValue={goalTab}
-                  onTabSelect={(_, value) => setGoalTab(value.value as GoalTab)}
+                  selectedValue={selectedGoalTab}
+                  onTabSelect={(_, value) => {
+                    const nextTab = value.value as GoalTab;
+                    updateGoalsQuery((params) => {
+                      params.set("tab", nextTab);
+                    });
+                  }}
                 >
                   <Tab value="details">Details</Tab>
                   <Tab value="allocations">Allocations</Tab>
@@ -1203,7 +1273,7 @@ export function GoalsView({ data }: { data: DataContextValue }) {
               </div>
 
               <div className="goals-detail-content">
-                {goalTab === "details" ? (
+                {selectedGoalTab === "details" ? (
                   <div className="section-stack">
                     {achievedSelectedGoal && !selectedGoal.spentAt ? (
                       <div className="app-alert" role="status">
@@ -1361,7 +1431,7 @@ export function GoalsView({ data }: { data: DataContextValue }) {
                   </div>
                 ) : null}
 
-                {goalTab === "allocations" ? (
+                {selectedGoalTab === "allocations" ? (
                   <div className="section-stack">
                     <div className="app-actions">
                       <Button
@@ -1486,7 +1556,7 @@ export function GoalsView({ data }: { data: DataContextValue }) {
                   </div>
                 ) : null}
 
-                {goalTab === "history" ? (
+                {selectedGoalTab === "history" ? (
                   <div className="section-stack">
                     {historyError ? (
                       <div className="app-alert app-alert-error">{historyError}</div>
@@ -1528,7 +1598,7 @@ export function GoalsView({ data }: { data: DataContextValue }) {
                   </div>
                 ) : null}
 
-                {goalTab === "receipt" && selectedGoal.spentAt ? (
+                {selectedGoalTab === "receipt" && selectedGoal.spentAt ? (
                   <div className="section-stack">
                     <div className="app-surface goals-receipt-card">
                       <div className="goals-master-item-header">

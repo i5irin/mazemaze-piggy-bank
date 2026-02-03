@@ -9,6 +9,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { usePathname } from "next/navigation";
 import { useAuth } from "@/components/AuthProvider";
 import { getGraphScopes } from "@/lib/auth/msalConfig";
 import { createGraphClient } from "@/lib/graph/graphClient";
@@ -130,7 +131,16 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
   const [savedLatestEvent, setSavedLatestEvent] = useState<PendingEvent | null>(null);
   const [lease, setLease] = useState<LeaseRecord | null>(null);
   const [leaseError, setLeaseError] = useState<string | null>(null);
+  const [isRevalidating, setIsRevalidating] = useState(false);
   const pendingEventsRef = useRef<PendingEvent[]>([]);
+  const hasLocalDataRef = useRef(false);
+  const snapshotRecordRef = useRef<SnapshotRecord | null>(null);
+  const revalidateSequenceRef = useRef(0);
+  const loadFromRemoteRef = useRef<((options?: { background?: boolean }) => Promise<void>) | null>(
+    null,
+  );
+  const pathname = usePathname();
+  const prevPathnameRef = useRef(pathname);
 
   const graphScopes = useMemo(() => getGraphScopes(), []);
   const tokenProvider = useCallback((scopes: string[]) => getAccessToken(scopes), [getAccessToken]);
@@ -238,82 +248,113 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     }
   }, [applySnapshot, savedLatestEvent]);
 
-  const loadFromRemote = useCallback(async () => {
-    if (pendingEventsRef.current.length > 0) {
-      setMessage("Unsaved changes are present. Save or discard before syncing.");
-      return;
-    }
-    setStatus("loading");
-    setActivity("loading");
-    try {
-      await oneDrive.ensureAppRoot();
-      const result = await oneDrive.readPersonalSnapshot();
-      const latest = await loadLatestEventFromRemote();
+  const loadFromRemote = useCallback(
+    async (options?: { background?: boolean }) => {
+      const shouldRunInBackground = Boolean(options?.background && snapshotRecordRef.current);
+      const sequence = shouldRunInBackground ? ++revalidateSequenceRef.current : null;
       if (pendingEventsRef.current.length > 0) {
-        setStatus("ready");
         setMessage("Unsaved changes are present. Save or discard before syncing.");
         return;
       }
-      applySnapshot(result.snapshot, result.etag, "remote", "Synced from OneDrive.", latest);
-      void loadLeaseFromRemote();
-      await writeSnapshotCache({
-        key: "personal",
-        snapshot: result.snapshot,
-        etag: result.etag,
-        cachedAt: new Date().toISOString(),
-      });
-    } catch (err) {
-      if (isGraphError(err) && err.status === 404) {
-        try {
-          const now = new Date().toISOString();
-          const emptySnapshot = createEmptySnapshot(now);
-          const result = await oneDrive.writePersonalSnapshot(emptySnapshot);
-          applySnapshot(
-            emptySnapshot,
-            result.etag,
-            "remote",
-            "No snapshot found yet. Add accounts or goals to create your first snapshot.",
-            null,
-          );
-          await writeSnapshotCache({
-            key: "personal",
-            snapshot: emptySnapshot,
-            etag: result.etag,
-            cachedAt: now,
-          });
-          setActivity("idle");
-          return;
-        } catch (creationError) {
-          setStatus("error");
-          setSource("empty");
-          setMessage(null);
-          setError(formatGraphError(creationError));
+      if (shouldRunInBackground) {
+        setIsRevalidating(true);
+      } else {
+        setStatus("loading");
+        setActivity("loading");
+      }
+      try {
+        await oneDrive.ensureAppRoot();
+        const result = await oneDrive.readPersonalSnapshot();
+        const latest = await loadLatestEventFromRemote();
+        if (pendingEventsRef.current.length > 0) {
+          setStatus("ready");
+          setMessage("Unsaved changes are present. Save or discard before syncing.");
           return;
         }
+        applySnapshot(result.snapshot, result.etag, "remote", "Synced from OneDrive.", latest);
+        void loadLeaseFromRemote();
+        await writeSnapshotCache({
+          key: "personal",
+          snapshot: result.snapshot,
+          etag: result.etag,
+          cachedAt: new Date().toISOString(),
+        });
+      } catch (err) {
+        if (isGraphError(err) && err.status === 404) {
+          try {
+            const now = new Date().toISOString();
+            const emptySnapshot = createEmptySnapshot(now);
+            const result = await oneDrive.writePersonalSnapshot(emptySnapshot);
+            applySnapshot(
+              emptySnapshot,
+              result.etag,
+              "remote",
+              "No snapshot found yet. Add accounts or goals to create your first snapshot.",
+              null,
+            );
+            await writeSnapshotCache({
+              key: "personal",
+              snapshot: emptySnapshot,
+              etag: result.etag,
+              cachedAt: now,
+            });
+            setActivity("idle");
+            return;
+          } catch (creationError) {
+            setStatus("error");
+            setSource("empty");
+            setMessage(null);
+            setError(formatGraphError(creationError));
+            return;
+          }
+        }
+        if (isGraphError(err) && err.code === "network_error") {
+          if (shouldRunInBackground) {
+            setMessage("Offline mode. Showing cached data.");
+            return;
+          }
+          await loadFromCache();
+          setMessage("Offline mode. Showing cached data.");
+          return;
+        }
+        setStatus("error");
+        setSource("empty");
+        setMessage(null);
+        setError(formatGraphError(err));
+      } finally {
+        if (shouldRunInBackground) {
+          if (sequence === revalidateSequenceRef.current) {
+            setIsRevalidating(false);
+          }
+        } else {
+          setActivity("idle");
+        }
       }
-      if (isGraphError(err) && err.code === "network_error") {
-        await loadFromCache();
-        setMessage("Offline mode. Showing cached data.");
-        return;
-      }
-      setStatus("error");
-      setSource("empty");
-      setMessage(null);
-      setError(formatGraphError(err));
-    } finally {
-      setActivity("idle");
-    }
-  }, [applySnapshot, loadFromCache, loadLatestEventFromRemote, loadLeaseFromRemote, oneDrive]);
+    },
+    [applySnapshot, loadFromCache, loadLatestEventFromRemote, loadLeaseFromRemote, oneDrive],
+  );
   useEffect(() => {
     pendingEventsRef.current = pendingEvents;
   }, [pendingEvents]);
+
+  useEffect(() => {
+    hasLocalDataRef.current = Boolean(draftState);
+  }, [draftState]);
+
+  useEffect(() => {
+    snapshotRecordRef.current = snapshotRecord;
+  }, [snapshotRecord]);
+
+  useEffect(() => {
+    loadFromRemoteRef.current = loadFromRemote;
+  }, [loadFromRemote]);
 
   const refresh = useCallback(async () => {
     if (!isOnline || !isSignedIn) {
       await loadFromCache();
       return;
     }
-    await loadFromRemote();
+    await loadFromRemote({ background: true });
   }, [isOnline, isSignedIn, loadFromCache, loadFromRemote]);
 
   const discardChanges = useCallback(() => {
@@ -892,9 +933,23 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
 
   useEffect(() => {
     if (isOnline && isSignedIn) {
-      void loadFromRemote();
+      void loadFromRemoteRef.current?.();
     }
-  }, [isOnline, isSignedIn, loadFromRemote]);
+  }, [isOnline, isSignedIn]);
+
+  useEffect(() => {
+    if (prevPathnameRef.current === pathname) {
+      return;
+    }
+    prevPathnameRef.current = pathname;
+    if (!isOnline || !isSignedIn) {
+      return;
+    }
+    if (!hasLocalDataRef.current) {
+      return;
+    }
+    void loadFromRemoteRef.current?.({ background: true });
+  }, [isOnline, isSignedIn, pathname]);
 
   const value = useMemo(
     () => ({
@@ -913,6 +968,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       leaseError,
       message,
       error,
+      isRevalidating,
       allocationNotice,
       latestEvent,
       refresh,
@@ -957,6 +1013,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       leaseError,
       latestEvent,
       message,
+      isRevalidating,
       pendingEvents.length,
       reduceAllocations,
       readOnlyReason,

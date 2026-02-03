@@ -130,6 +130,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
     isOnline,
     isSignedIn,
     canWrite,
+    isRevalidating,
     activity,
     createAccount,
     updateAccount,
@@ -155,7 +156,6 @@ export function AccountsView({ data }: { data: DataContextValue }) {
   const allocations = useMemo(() => draftState?.allocations ?? [], [draftState?.allocations]);
   const goals = useMemo(() => draftState?.goals ?? [], [draftState?.goals]);
 
-  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
   const [drawer, setDrawer] = useState<DrawerState>({ type: "closed" });
   const [positionTab, setPositionTab] = useState<"details" | "allocations" | "history">("details");
   const [mobileScreen, setMobileScreen] = useState<MobileScreen>("accounts");
@@ -196,12 +196,13 @@ export function AccountsView({ data }: { data: DataContextValue }) {
     return totals;
   }, [allocations]);
 
+  const queryAccountId = searchParams.get("accountId");
   const effectiveAccountId = useMemo(() => {
-    if (selectedAccountId && accounts.some((account) => account.id === selectedAccountId)) {
-      return selectedAccountId;
+    if (queryAccountId && accounts.some((account) => account.id === queryAccountId)) {
+      return queryAccountId;
     }
     return accounts[0]?.id ?? null;
-  }, [accounts, selectedAccountId]);
+  }, [accounts, queryAccountId]);
 
   const selectedAccount = accounts.find((account) => account.id === effectiveAccountId) ?? null;
 
@@ -280,6 +281,24 @@ export function AccountsView({ data }: { data: DataContextValue }) {
     },
     [pathname, router, searchParams],
   );
+
+  useEffect(() => {
+    if (accounts.length === 0) {
+      return;
+    }
+    if (queryAccountId && accounts.some((account) => account.id === queryAccountId)) {
+      return;
+    }
+    const fallbackAccountId = accounts[0]?.id;
+    if (!fallbackAccountId) {
+      return;
+    }
+    updateQuery((params) => {
+      params.set("accountId", fallbackAccountId);
+      params.delete("drawer");
+      params.delete("positionId");
+    });
+  }, [accounts, queryAccountId, updateQuery]);
 
   const getReturnGoalsPath = useCallback(() => {
     if (!returnGoalId) {
@@ -461,6 +480,19 @@ export function AccountsView({ data }: { data: DataContextValue }) {
     });
   };
 
+  const selectAccount = useCallback(
+    (accountId: string) => {
+      setInlineEdit(null);
+      setMobileScreen("account");
+      updateQuery((params) => {
+        params.set("accountId", accountId);
+        params.delete("drawer");
+        params.delete("positionId");
+      });
+    },
+    [updateQuery],
+  );
+
   const finalizeCloseDrawer = useCallback(() => {
     skipQueryRestoreRef.current = true;
     setDrawer({ type: "closed" });
@@ -524,12 +556,11 @@ export function AccountsView({ data }: { data: DataContextValue }) {
     if (pendingAccountIds) {
       const created = accounts.find((account) => !pendingAccountIds.has(account.id));
       if (created) {
-        setSelectedAccountId(created.id);
-        setMobileScreen("account");
+        selectAccount(created.id);
         pendingNewAccountIdsRef.current = null;
       }
     }
-  }, [accounts]);
+  }, [accounts, selectAccount]);
 
   useEffect(() => {
     const pendingPosition = pendingNewPositionIdsRef.current;
@@ -556,12 +587,6 @@ export function AccountsView({ data }: { data: DataContextValue }) {
 
   useEffect(() => {
     const timerId = window.setTimeout(() => {
-      const accountIdFromQuery = searchParams.get("accountId");
-      if (accountIdFromQuery && accounts.some((account) => account.id === accountIdFromQuery)) {
-        setSelectedAccountId(accountIdFromQuery);
-        setMobileScreen("account");
-      }
-
       const drawerFromQuery = searchParams.get("drawer");
       const positionIdFromQuery = searchParams.get("positionId");
       if (drawerFromQuery !== "position" || !positionIdFromQuery) {
@@ -651,6 +676,12 @@ export function AccountsView({ data }: { data: DataContextValue }) {
         </div>
       ) : null}
 
+      {isRevalidating ? (
+        <div className="app-alert" role="status">
+          <Text>Refreshing...</Text>
+        </div>
+      ) : null}
+
       <div className="accounts-mobile-only section-stack">
         {mobileScreen === "accounts" ? (
           <section className="app-surface">
@@ -673,8 +704,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
                     type="button"
                     className="accounts-mobile-account-card"
                     onClick={() => {
-                      setSelectedAccountId(account.id);
-                      setMobileScreen("account");
+                      selectAccount(account.id);
                     }}
                   >
                     <div>
@@ -832,16 +862,12 @@ export function AccountsView({ data }: { data: DataContextValue }) {
                     tabIndex={0}
                     aria-selected={selected}
                     onClick={() => {
-                      setSelectedAccountId(account.id);
-                      setInlineEdit(null);
-                      setMobileScreen("account");
+                      selectAccount(account.id);
                     }}
                     onKeyDown={(event) => {
                       if (event.key === "Enter" || event.key === " ") {
                         event.preventDefault();
-                        setSelectedAccountId(account.id);
-                        setInlineEdit(null);
-                        setMobileScreen("account");
+                        selectAccount(account.id);
                       }
                     }}
                   >
