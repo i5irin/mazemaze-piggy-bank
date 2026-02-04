@@ -19,6 +19,7 @@ import {
   getIntegerInputError,
   parseIntegerInput,
 } from "@/lib/numberFormat";
+import type { HistoryItem } from "@/lib/persistence/history";
 import type { Allocation, Goal } from "@/lib/persistence/types";
 
 type GoalFilter = "active" | "closed" | "spent";
@@ -29,29 +30,12 @@ type SaveFailureReason =
   | "unauthenticated"
   | "read_only"
   | "invalid_space"
+  | "partial_failure"
   | "no_snapshot"
   | "no_changes"
   | "missing_etag"
   | "conflict"
   | "error";
-
-type GoalHistoryItem = {
-  id: string;
-  timestamp: string;
-  eventType: string;
-  summary: string;
-  amountDelta?: number;
-};
-
-type GoalHistoryPage = {
-  items: GoalHistoryItem[];
-  nextCursor: string | null;
-};
-
-type GoalHistoryAdapter = {
-  loadInitial: (goalId: string, limit: number) => Promise<GoalHistoryPage>;
-  loadMore: (goalId: string, cursor: string, limit: number) => Promise<GoalHistoryPage>;
-};
 
 type SpendEventPayload = {
   goalId: string;
@@ -61,11 +45,6 @@ type SpendEventPayload = {
 };
 
 const HISTORY_PAGE_SIZE = 20;
-
-const historyAdapter: GoalHistoryAdapter = {
-  loadInitial: async () => ({ items: [], nextCursor: null }),
-  loadMore: async () => ({ items: [], nextCursor: null }),
-};
 
 const isActiveGoal = (goal: Goal): boolean => goal.status === "active" && !goal.spentAt;
 const isClosedGoal = (goal: Goal): boolean => goal.status === "closed" && !goal.spentAt;
@@ -88,6 +67,9 @@ const formatDateOnly = (value: string): string => {
   }
   return parsed.toLocaleDateString("en-US");
 };
+
+const toHistoryOriginLabel = (origin: HistoryItem["origin"]): string =>
+  origin === "system" ? "System" : "User";
 
 const getEditNotice = (data: DataContextValue): string | null => {
   if (!data.isOnline) {
@@ -114,6 +96,12 @@ const toSaveFailureMessage = (reason: SaveFailureReason, fallback?: string): str
   }
   if (reason === "missing_etag") {
     return "Missing server version. Reload and try again.";
+  }
+  if (reason === "partial_failure") {
+    return (
+      fallback ??
+      "Save partially failed: data was saved, but history upload failed. Retry is required."
+    );
   }
   return fallback ?? "Could not save changes.";
 };
@@ -158,6 +146,7 @@ export function GoalsView({ data }: { data: DataContextValue }) {
     allocationNotice,
     clearAllocationNotice,
     latestEvent,
+    loadHistoryPage,
     isRevalidating,
     saveChanges,
     discardChanges,
@@ -281,6 +270,7 @@ export function GoalsView({ data }: { data: DataContextValue }) {
 
   const queryGoalId = searchParams.get("goalId");
   const selectedGoal = goals.find((goal) => goal.id === queryGoalId) ?? null;
+  const selectedGoalHistoryId = selectedGoal?.id ?? null;
   const selectedGoalTab = normalizeTabForGoal(searchParams.get("tab"), selectedGoal);
   const showGoalListPane = !isMobileViewport || !selectedGoal;
   const showGoalDetailPane = !isMobileViewport || Boolean(selectedGoal);
@@ -1013,50 +1003,86 @@ export function GoalsView({ data }: { data: DataContextValue }) {
     }
   };
 
-  const [historyItems, setHistoryItems] = useState<GoalHistoryItem[]>([]);
+  const [historyItems, setHistoryItems] = useState<HistoryItem[]>([]);
   const [historyCursor, setHistoryCursor] = useState<string | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
+  const historyRequestSeqRef = useRef(0);
 
-  const loadInitialHistory = async (goalId: string) => {
-    setHistoryLoading(true);
-    setHistoryError(null);
-    try {
-      const page = await historyAdapter.loadInitial(goalId, HISTORY_PAGE_SIZE);
-      setHistoryItems(page.items);
-      setHistoryCursor(page.nextCursor);
-    } catch {
+  const loadInitialHistory = useCallback(
+    async (goalId: string) => {
+      const requestId = historyRequestSeqRef.current + 1;
+      historyRequestSeqRef.current = requestId;
       setHistoryItems([]);
       setHistoryCursor(null);
-      setHistoryError("Could not load history.");
-    } finally {
-      setHistoryLoading(false);
-    }
-  };
+      setHistoryLoading(true);
+      setHistoryError(null);
+      try {
+        const page = await loadHistoryPage({
+          limit: HISTORY_PAGE_SIZE,
+          filter: { goalId },
+        });
+        if (historyRequestSeqRef.current !== requestId) {
+          return;
+        }
+        setHistoryItems(page.items);
+        setHistoryCursor(page.nextCursor);
+      } catch (err) {
+        if (historyRequestSeqRef.current !== requestId) {
+          return;
+        }
+        setHistoryItems([]);
+        setHistoryCursor(null);
+        setHistoryError(err instanceof Error ? err.message : "Could not load history.");
+      } finally {
+        if (historyRequestSeqRef.current === requestId) {
+          setHistoryLoading(false);
+        }
+      }
+    },
+    [loadHistoryPage],
+  );
 
-  const loadMoreHistory = async () => {
-    if (!selectedGoal || !historyCursor) {
+  const loadMoreHistory = useCallback(async () => {
+    if (!selectedGoalHistoryId || !historyCursor) {
       return;
     }
+    const requestId = historyRequestSeqRef.current;
     setHistoryLoading(true);
     setHistoryError(null);
     try {
-      const page = await historyAdapter.loadMore(selectedGoal.id, historyCursor, HISTORY_PAGE_SIZE);
+      const page = await loadHistoryPage({
+        limit: HISTORY_PAGE_SIZE,
+        cursor: historyCursor,
+        filter: { goalId: selectedGoalHistoryId },
+      });
+      if (historyRequestSeqRef.current !== requestId) {
+        return;
+      }
       setHistoryItems((prev) => [...prev, ...page.items]);
       setHistoryCursor(page.nextCursor);
-    } catch {
-      setHistoryError("Could not load more history.");
+    } catch (err) {
+      if (historyRequestSeqRef.current === requestId) {
+        setHistoryError(err instanceof Error ? err.message : "Could not load more history.");
+      }
     } finally {
-      setHistoryLoading(false);
+      if (historyRequestSeqRef.current === requestId) {
+        setHistoryLoading(false);
+      }
     }
-  };
+  }, [historyCursor, loadHistoryPage, selectedGoalHistoryId]);
 
   useEffect(() => {
-    if (!selectedGoal || selectedGoalTab !== "history") {
+    if (!selectedGoalHistoryId || selectedGoalTab !== "history") {
+      historyRequestSeqRef.current += 1;
+      setHistoryItems([]);
+      setHistoryCursor(null);
+      setHistoryError(null);
+      setHistoryLoading(false);
       return;
     }
-    void loadInitialHistory(selectedGoal.id);
-  }, [selectedGoal, selectedGoalTab]);
+    void loadInitialHistory(selectedGoalHistoryId);
+  }, [loadInitialHistory, selectedGoalHistoryId, selectedGoalTab]);
 
   const receipt = useMemo(() => {
     if (!selectedGoal?.spentAt || !latestEvent || latestEvent.type !== "goal_spent") {
@@ -1677,15 +1703,23 @@ export function GoalsView({ data }: { data: DataContextValue }) {
 
                   {selectedGoalTab === "history" ? (
                     <div className="section-stack">
+                      <div className="app-muted">Source: OneDrive event log.</div>
+
                       {historyError ? (
                         <div className="app-alert app-alert-error">{historyError}</div>
                       ) : null}
 
+                      {historyLoading && historyItems.length === 0 ? (
+                        <div className="app-muted">Loading history from OneDrive...</div>
+                      ) : null}
+
                       {historyItems.length === 0 && !historyLoading ? (
                         <div className="goals-empty-card">
-                          <h3>No history yet</h3>
+                          <h3>{historyCursor ? "Load more history" : "No history yet"}</h3>
                           <p className="app-muted">
-                            History UI is ready. Connect the adapter to start loading events.
+                            {historyCursor
+                              ? "No matching entries in recent chunks. Use Load more to continue."
+                              : "No history entries match this goal yet."}
                           </p>
                         </div>
                       ) : (
@@ -1693,7 +1727,18 @@ export function GoalsView({ data }: { data: DataContextValue }) {
                           {historyItems.map((item) => (
                             <div key={item.id} className="goals-history-item">
                               <div className="goals-master-item-header">
-                                <strong>{item.eventType}</strong>
+                                <div className="history-event-header">
+                                  <strong>{item.eventType}</strong>
+                                  <span
+                                    className={`history-origin-badge ${
+                                      item.origin === "system"
+                                        ? "history-origin-badge-system"
+                                        : "history-origin-badge-user"
+                                    }`}
+                                  >
+                                    {toHistoryOriginLabel(item.origin)}
+                                  </span>
+                                </div>
                                 <span className="app-muted">{formatDateTime(item.timestamp)}</span>
                               </div>
                               <div>{item.summary}</div>

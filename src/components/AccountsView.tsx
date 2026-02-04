@@ -19,6 +19,7 @@ import {
   getIntegerInputError,
   parseIntegerInput,
 } from "@/lib/numberFormat";
+import type { HistoryItem } from "@/lib/persistence/history";
 import type { AssetType, Position } from "@/lib/persistence/types";
 
 const assetTypeOptions: { value: AssetType; label: string }[] = [
@@ -50,6 +51,8 @@ type DrawerState =
   | { type: "addPosition"; accountId: string }
   | { type: "positionDetails"; positionId: string };
 
+type PositionTab = "details" | "allocations" | "history";
+
 type InlineEditState = {
   positionId: string;
   value: string;
@@ -58,6 +61,11 @@ type InlineEditState = {
 };
 
 type MobileScreen = "accounts" | "account";
+
+const isPositionTab = (value: string | null): value is PositionTab =>
+  value === "details" || value === "allocations" || value === "history";
+
+const HISTORY_PAGE_SIZE = 20;
 
 const getEditNotice = (data: DataContextValue): string | null => {
   if (!data.isOnline) {
@@ -108,6 +116,9 @@ const formatRelativeTimestamp = (value: string): string => {
   return parsed.toLocaleDateString("en-US");
 };
 
+const toHistoryOriginLabel = (origin: HistoryItem["origin"]): string =>
+  origin === "system" ? "System" : "User";
+
 const toSaveFailureMessage = (reason: string, fallback?: string): string => {
   if (reason === "offline") {
     return "Offline mode is view-only. Please reconnect and try again.";
@@ -120,6 +131,12 @@ const toSaveFailureMessage = (reason: string, fallback?: string): string => {
   }
   if (reason === "missing_etag") {
     return "Missing server version. Reload and try again.";
+  }
+  if (reason === "partial_failure") {
+    return (
+      fallback ??
+      "Save partially failed: data was saved, but history upload failed. Retry is required."
+    );
   }
   return fallback ?? "Could not save changes.";
 };
@@ -138,6 +155,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
     createPosition,
     updatePosition,
     deletePosition,
+    loadHistoryPage,
     saveChanges,
     discardChanges,
   } = data;
@@ -157,7 +175,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
   const goals = useMemo(() => draftState?.goals ?? [], [draftState?.goals]);
 
   const [drawer, setDrawer] = useState<DrawerState>({ type: "closed" });
-  const [positionTab, setPositionTab] = useState<"details" | "allocations" | "history">("details");
+  const [positionTab, setPositionTab] = useState<PositionTab>("details");
   const [mobileScreen, setMobileScreen] = useState<MobileScreen>("accounts");
   const [isFabMenuOpen, setIsFabMenuOpen] = useState(false);
   const [inlineEdit, setInlineEdit] = useState<InlineEditState | null>(null);
@@ -197,6 +215,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
   }, [allocations]);
 
   const queryAccountId = searchParams.get("accountId");
+  const queryPositionTab = searchParams.get("positionTab");
   const effectiveAccountId = useMemo(() => {
     if (queryAccountId && accounts.some((account) => account.id === queryAccountId)) {
       return queryAccountId;
@@ -259,6 +278,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
     drawer.type === "positionDetails"
       ? (positions.find((position) => position.id === drawer.positionId) ?? null)
       : null;
+  const selectedPositionId = selectedPosition?.id ?? null;
 
   const selectedPositionAllocations = useMemo(() => {
     if (!selectedPosition) {
@@ -271,6 +291,12 @@ export function AccountsView({ data }: { data: DataContextValue }) {
         goalName: goals.find((goal) => goal.id === allocation.goalId)?.name ?? "Unknown goal",
       }));
   }, [allocations, goals, selectedPosition]);
+
+  const [historyItems, setHistoryItems] = useState<HistoryItem[]>([]);
+  const [historyCursor, setHistoryCursor] = useState<string | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const historyRequestSeqRef = useRef(0);
 
   const updateQuery = useCallback(
     (mutator: (params: URLSearchParams) => void) => {
@@ -297,6 +323,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
       params.set("accountId", fallbackAccountId);
       params.delete("drawer");
       params.delete("positionId");
+      params.delete("positionTab");
     });
   }, [accounts, queryAccountId, updateQuery]);
 
@@ -463,12 +490,16 @@ export function AccountsView({ data }: { data: DataContextValue }) {
     setDrawer({ type: "editAccount", accountId });
   };
 
-  const openPositionDetailsDrawer = (position: Position, options?: { fromQuery?: boolean }) => {
+  const openPositionDetailsDrawer = (
+    position: Position,
+    options?: { fromQuery?: boolean; tab?: PositionTab },
+  ) => {
     skipQueryRestoreRef.current = false;
     setPositionDetailsLabel(position.label);
     setPositionDetailsAssetType(position.assetType);
     setPositionDetailsAllocationMode(position.allocationMode);
-    setPositionTab("details");
+    const nextTab = options?.tab ?? "details";
+    setPositionTab(nextTab);
     setDrawer({ type: "positionDetails", positionId: position.id });
     if (options?.fromQuery) {
       return;
@@ -477,6 +508,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
       params.set("drawer", "position");
       params.set("positionId", position.id);
       params.set("accountId", position.accountId);
+      params.set("positionTab", nextTab);
     });
   };
 
@@ -488,6 +520,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
         params.set("accountId", accountId);
         params.delete("drawer");
         params.delete("positionId");
+        params.delete("positionTab");
       });
     },
     [updateQuery],
@@ -499,6 +532,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
     updateQuery((params) => {
       params.delete("drawer");
       params.delete("positionId");
+      params.delete("positionTab");
       if (!returnGoalId) {
         params.delete("returnGoalId");
         params.delete("returnTab");
@@ -535,6 +569,69 @@ export function AccountsView({ data }: { data: DataContextValue }) {
       setRetryPending(false);
     }
   };
+
+  const loadInitialHistory = useCallback(
+    async (positionId: string) => {
+      const requestId = historyRequestSeqRef.current + 1;
+      historyRequestSeqRef.current = requestId;
+      setHistoryItems([]);
+      setHistoryCursor(null);
+      setHistoryLoading(true);
+      setHistoryError(null);
+      try {
+        const page = await loadHistoryPage({
+          limit: HISTORY_PAGE_SIZE,
+          filter: { positionId },
+        });
+        if (historyRequestSeqRef.current !== requestId) {
+          return;
+        }
+        setHistoryItems(page.items);
+        setHistoryCursor(page.nextCursor);
+      } catch (err) {
+        if (historyRequestSeqRef.current !== requestId) {
+          return;
+        }
+        setHistoryItems([]);
+        setHistoryCursor(null);
+        setHistoryError(err instanceof Error ? err.message : "Could not load history.");
+      } finally {
+        if (historyRequestSeqRef.current === requestId) {
+          setHistoryLoading(false);
+        }
+      }
+    },
+    [loadHistoryPage],
+  );
+
+  const loadMoreHistory = useCallback(async () => {
+    if (!selectedPositionId || !historyCursor) {
+      return;
+    }
+    const requestId = historyRequestSeqRef.current;
+    setHistoryLoading(true);
+    setHistoryError(null);
+    try {
+      const page = await loadHistoryPage({
+        limit: HISTORY_PAGE_SIZE,
+        cursor: historyCursor,
+        filter: { positionId: selectedPositionId },
+      });
+      if (historyRequestSeqRef.current !== requestId) {
+        return;
+      }
+      setHistoryItems((prev) => [...prev, ...page.items]);
+      setHistoryCursor(page.nextCursor);
+    } catch (err) {
+      if (historyRequestSeqRef.current === requestId) {
+        setHistoryError(err instanceof Error ? err.message : "Could not load more history.");
+      }
+    } finally {
+      if (historyRequestSeqRef.current === requestId) {
+        setHistoryLoading(false);
+      }
+    }
+  }, [historyCursor, loadHistoryPage, selectedPositionId]);
 
   useEffect(() => {
     if (drawer.type === "closed") {
@@ -607,11 +704,23 @@ export function AccountsView({ data }: { data: DataContextValue }) {
       setPositionDetailsLabel(position.label);
       setPositionDetailsAssetType(position.assetType);
       setPositionDetailsAllocationMode(position.allocationMode);
-      setPositionTab("details");
+      setPositionTab(isPositionTab(queryPositionTab) ? queryPositionTab : "details");
       setDrawer({ type: "positionDetails", positionId: position.id });
     }, 0);
     return () => window.clearTimeout(timerId);
-  }, [accounts, drawer, positions, searchParams]);
+  }, [accounts, drawer, positions, queryPositionTab, searchParams]);
+
+  useEffect(() => {
+    if (!selectedPositionId || positionTab !== "history") {
+      historyRequestSeqRef.current += 1;
+      setHistoryItems([]);
+      setHistoryCursor(null);
+      setHistoryError(null);
+      setHistoryLoading(false);
+      return;
+    }
+    void loadInitialHistory(selectedPositionId);
+  }, [loadInitialHistory, positionTab, selectedPositionId]);
 
   const submitAddAccount = () => {
     if (accountFormName.trim().length === 0) {
@@ -1197,9 +1306,15 @@ export function AccountsView({ data }: { data: DataContextValue }) {
               <div className="section-stack">
                 <TabList
                   selectedValue={positionTab}
-                  onTabSelect={(_, eventData) =>
-                    setPositionTab(eventData.value as "details" | "allocations" | "history")
-                  }
+                  onTabSelect={(_, eventData) => {
+                    const nextTab = eventData.value as PositionTab;
+                    setPositionTab(nextTab);
+                    updateQuery((params) => {
+                      if (drawer.type === "positionDetails") {
+                        params.set("positionTab", nextTab);
+                      }
+                    });
+                  }}
                 >
                   <Tab value="details">Details</Tab>
                   <Tab value="allocations">Allocations</Tab>
@@ -1328,7 +1443,65 @@ export function AccountsView({ data }: { data: DataContextValue }) {
                   )
                 ) : null}
 
-                {positionTab === "history" ? <div className="app-muted">Coming later.</div> : null}
+                {positionTab === "history" ? (
+                  <div className="section-stack">
+                    <div className="app-muted">Source: OneDrive event log.</div>
+
+                    {historyError ? (
+                      <div className="app-alert app-alert-error">{historyError}</div>
+                    ) : null}
+
+                    {historyLoading && historyItems.length === 0 ? (
+                      <div className="app-muted">Loading history from OneDrive...</div>
+                    ) : null}
+
+                    {historyItems.length === 0 && !historyLoading ? (
+                      <div className="app-muted">
+                        {historyCursor
+                          ? "No matching entries in recent chunks. Use Load more to continue."
+                          : "No history entries for this position yet."}
+                      </div>
+                    ) : (
+                      <div className="section-stack">
+                        {historyItems.map((item) => (
+                          <div key={item.id} className="goals-history-item">
+                            <div className="goals-master-item-header">
+                              <div className="history-event-header">
+                                <strong>{item.eventType}</strong>
+                                <span
+                                  className={`history-origin-badge ${
+                                    item.origin === "system"
+                                      ? "history-origin-badge-system"
+                                      : "history-origin-badge-user"
+                                  }`}
+                                >
+                                  {toHistoryOriginLabel(item.origin)}
+                                </span>
+                              </div>
+                              <span className="app-muted">
+                                {formatAbsoluteTimestamp(item.timestamp)}
+                              </span>
+                            </div>
+                            <div>{item.summary}</div>
+                            {typeof item.amountDelta === "number" ? (
+                              <div className="app-muted">{formatCurrency(item.amountDelta)}</div>
+                            ) : null}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    <div className="app-actions">
+                      <Button
+                        onClick={() => void loadMoreHistory()}
+                        disabled={!historyCursor || historyLoading}
+                      >
+                        Load more
+                      </Button>
+                      {historyLoading ? <span className="app-muted">Loading...</span> : null}
+                    </div>
+                  </div>
+                ) : null}
               </div>
             ) : null}
           </section>

@@ -21,6 +21,7 @@ jest.mock("@/components/PersonalDataProvider", () => ({
     error: null,
     allocationNotice: null,
     latestEvent: null,
+    loadHistoryPage: jest.fn().mockResolvedValue({ items: [], nextCursor: null }),
     refresh: jest.fn(),
     createAccount: jest.fn(),
     updateAccount: jest.fn(),

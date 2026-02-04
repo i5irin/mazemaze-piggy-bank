@@ -86,6 +86,7 @@ export function DashboardView({ data }: { data: DataContextValue }) {
   const deviceId = useMemo(() => getDeviceId(), []);
   const isLocalLease = Boolean(lease?.deviceId && deviceId && lease.deviceId === deviceId);
   const now = useNow(1000);
+  const [historyTab, setHistoryTab] = useState<"goals" | "positions">("goals");
   const isActiveLease = (() => {
     if (!lease?.leaseUntil) {
       return false;
@@ -98,6 +99,26 @@ export function DashboardView({ data }: { data: DataContextValue }) {
   })();
   const showLeaseBanner = Boolean(lease?.holderLabel && isActiveLease && !isLocalLease);
   const scopeLabel = space.scope === "shared" ? "Shared" : "Personal";
+  const goalHistoryHref = useMemo(() => {
+    const params = new URLSearchParams();
+    params.set("tab", "history");
+    if (goals[0]?.id) {
+      params.set("goalId", goals[0].id);
+    }
+    return `/goals?${params.toString()}`;
+  }, [goals]);
+  const positionHistoryHref = useMemo(() => {
+    const target = recentPositions[0];
+    if (!target) {
+      return "/accounts";
+    }
+    const params = new URLSearchParams();
+    params.set("accountId", target.accountId);
+    params.set("drawer", "position");
+    params.set("positionId", target.id);
+    params.set("positionTab", "history");
+    return `/accounts?${params.toString()}`;
+  }, [recentPositions]);
 
   return (
     <div className="section-stack dashboard-root">
@@ -315,6 +336,55 @@ export function DashboardView({ data }: { data: DataContextValue }) {
               </div>
             ) : (
               <div className="app-muted">No recent changes yet.</div>
+            )}
+          </section>
+
+          <section className="app-surface dashboard-section">
+            <div className="dashboard-section-header">
+              <h2>History</h2>
+            </div>
+            <div className="dashboard-tabs" role="tablist" aria-label="History shortcuts">
+              <button
+                type="button"
+                className={`dashboard-tab ${historyTab === "goals" ? "is-active" : ""}`}
+                onClick={() => setHistoryTab("goals")}
+                role="tab"
+                aria-selected={historyTab === "goals"}
+              >
+                Goals
+              </button>
+              <button
+                type="button"
+                className={`dashboard-tab ${historyTab === "positions" ? "is-active" : ""}`}
+                onClick={() => setHistoryTab("positions")}
+                role="tab"
+                aria-selected={historyTab === "positions"}
+              >
+                Positions
+              </button>
+            </div>
+            {historyTab === "goals" ? (
+              <div className="section-stack">
+                <div className="app-muted">
+                  {goals.length === 0
+                    ? "No goals available yet."
+                    : "Open the Goals history tab to review recent changes."}
+                </div>
+                <Link href={goalHistoryHref} className="dashboard-link">
+                  Open goal history
+                </Link>
+              </div>
+            ) : (
+              <div className="section-stack">
+                <div className="app-muted">
+                  {recentPositions.length === 0
+                    ? "No positions available yet."
+                    : "Open position history from the selected position drawer."}
+                </div>
+                <Link href={positionHistoryHref} className="dashboard-link">
+                  Open position history
+                </Link>
+              </div>
             )}
           </section>
 

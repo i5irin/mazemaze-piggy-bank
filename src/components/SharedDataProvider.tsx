@@ -38,6 +38,7 @@ import {
   serializeEventChunk,
   type PendingEvent,
 } from "@/lib/persistence/eventChunk";
+import { createHistoryLoader, type HistoryPage } from "@/lib/persistence/history";
 import {
   createAccount as createAccountDomain,
   createAllocation as createAllocationDomain,
@@ -73,6 +74,11 @@ const LEASE_EDIT_EVENT_TYPES = new Set<string>(["state_repaired"]);
 type SnapshotRecord = {
   snapshot: Snapshot;
   etag: string | null;
+};
+
+type QueuedChunkWrite = {
+  chunkId: number;
+  content: string;
 };
 
 type SharedRootState = {
@@ -115,6 +121,32 @@ const buildEventMeta = () => ({
   createdAt: new Date().toISOString(),
 });
 
+const buildPartialFailureMessage = (pendingChunkCount: number): string => {
+  const noun = pendingChunkCount === 1 ? "chunk" : "chunks";
+  return `Save partially failed: ${pendingChunkCount} history ${noun} still need upload. Retry is required.`;
+};
+
+const buildPartialFailureDetail = (pendingChunkCount: number, cause: string): string =>
+  `${buildPartialFailureMessage(pendingChunkCount)} Last error: ${cause}`;
+
+const withTimeout = async <T,>(task: Promise<T>, timeoutMs: number): Promise<T> => {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race<T>([
+      task,
+      new Promise<T>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          reject(new Error("History request timed out. Please retry."));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+};
+
 const resolveSharedReference = (sharedId: string): SharedRootReference | null => {
   const decoded = decodeSharedId(sharedId);
   if (!decoded) {
@@ -153,6 +185,7 @@ export function SharedDataProvider({
   const [lease, setLease] = useState<LeaseRecord | null>(null);
   const [leaseError, setLeaseError] = useState<string | null>(null);
   const pendingEventsRef = useRef<PendingEvent[]>([]);
+  const pendingHistoryChunksRef = useRef<QueuedChunkWrite[]>([]);
   const [rootState, setRootState] = useState<SharedRootState | null>(null);
 
   const graphScopes = useMemo(() => getGraphScopes(), []);
@@ -448,6 +481,55 @@ export function SharedDataProvider({
     setMessage("Discarded local edits.");
   }, [savedLatestEvent, snapshotRecord]);
 
+  const loadHistoryPage = useCallback(
+    async (input: {
+      limit: number;
+      cursor?: string | null;
+      filter?: { goalId?: string; positionId?: string };
+    }): Promise<HistoryPage> => {
+      if (!isOnline) {
+        throw new Error("History is unavailable offline.");
+      }
+      if (!isSignedIn) {
+        throw new Error("Sign in to load history.");
+      }
+      if (!sharedReference) {
+        throw new Error("Invalid shared space id.");
+      }
+      const root = await ensureRootInfo();
+      const loader = createHistoryLoader({
+        listChunkIds: () => oneDrive.listSharedEventChunkIds(root.reference),
+        readChunk: (chunkId) => oneDrive.readSharedEventChunk(root.reference, chunkId),
+      });
+      return withTimeout(loader(input), 12_000);
+    },
+    [ensureRootInfo, isOnline, isSignedIn, oneDrive, sharedReference],
+  );
+
+  const flushPendingHistoryChunks = useCallback(
+    async (
+      root: SharedRootReference,
+      queue: QueuedChunkWrite[],
+    ): Promise<
+      { ok: true } | { ok: false; failedQueue: QueuedChunkWrite[]; errorMessage: string }
+    > => {
+      for (let index = 0; index < queue.length; index += 1) {
+        const chunk = queue[index];
+        try {
+          await oneDrive.writeSharedEventChunk(root, chunk.chunkId, chunk.content);
+        } catch (err) {
+          return {
+            ok: false,
+            failedQueue: queue.slice(index),
+            errorMessage: formatGraphError(err),
+          };
+        }
+      }
+      return { ok: true };
+    },
+    [oneDrive],
+  );
+
   const handleConflict = useCallback(async () => {
     await loadFromRemote();
     setMessage(
@@ -476,48 +558,84 @@ export function SharedDataProvider({
       setError("No snapshot is loaded yet.");
       return { ok: false, reason: "no_snapshot" };
     }
-    if (pendingEvents.length === 0) {
+    const hasPendingHistoryChunks = pendingHistoryChunksRef.current.length > 0;
+    if (pendingEvents.length === 0 && !hasPendingHistoryChunks) {
       setMessage("No changes to save.");
       return { ok: false, reason: "no_changes" };
     }
-    if (!snapshotRecord.etag) {
+    if (pendingEvents.length > 0 && !snapshotRecord.etag) {
       setError("Missing server version. Please reload and try again.");
       return { ok: false, reason: "missing_etag" };
     }
 
     setActivity("saving");
-    const now = new Date().toISOString();
-    const repair = repairStateOnLoad(draftState, buildEventMeta());
-    const hasRepair = repair.events.length > 0;
-    const repairWarningMessage =
-      hasRepair && repair.warnings.length > 0 ? repair.warnings.join(" ") : null;
-    const repairedState = hasRepair ? repair.nextState : draftState;
-    const eventsToSave = hasRepair ? [...pendingEvents, ...repair.events] : pendingEvents;
-    if (hasRepair) {
-      setDraftState(repair.nextState);
-      setPendingEvents(eventsToSave);
-      setAllocationNotice(repair.notice ?? null);
-    }
-    const versionedEvents = assignEventVersions(eventsToSave, snapshotRecord.snapshot.version);
-    const nextVersion = snapshotRecord.snapshot.version + eventsToSave.length;
-    const nextSnapshot: Snapshot = {
-      version: nextVersion,
-      stateJson: repairedState,
-      updatedAt: now,
-    };
 
     try {
       const root = await ensureRootInfo();
       await oneDrive.ensureSharedEventsFolder(root.reference);
+
+      if (hasPendingHistoryChunks) {
+        const retryResult = await flushPendingHistoryChunks(
+          root.reference,
+          pendingHistoryChunksRef.current,
+        );
+        if (!retryResult.ok) {
+          pendingHistoryChunksRef.current = retryResult.failedQueue;
+          const partialMessage = buildPartialFailureMessage(retryResult.failedQueue.length);
+          const partialDetail = buildPartialFailureDetail(
+            retryResult.failedQueue.length,
+            retryResult.errorMessage,
+          );
+          setMessage(partialMessage);
+          setError(partialDetail);
+          return {
+            ok: false,
+            reason: "partial_failure",
+            error: partialDetail,
+          };
+        }
+        pendingHistoryChunksRef.current = [];
+        if (pendingEvents.length === 0) {
+          setMessage("History sync completed.");
+          setError(null);
+          return { ok: true };
+        }
+      }
+
+      const now = new Date().toISOString();
+      const repair = repairStateOnLoad(draftState, buildEventMeta());
+      const hasRepair = repair.events.length > 0;
+      const repairWarningMessage =
+        hasRepair && repair.warnings.length > 0 ? repair.warnings.join(" ") : null;
+      const repairedState = hasRepair ? repair.nextState : draftState;
+      const eventsToSave = hasRepair ? [...pendingEvents, ...repair.events] : pendingEvents;
+      if (hasRepair) {
+        setDraftState(repair.nextState);
+        setPendingEvents(eventsToSave);
+        setAllocationNotice(repair.notice ?? null);
+      }
+      const versionedEvents = assignEventVersions(eventsToSave, snapshotRecord.snapshot.version);
+      const nextVersion = snapshotRecord.snapshot.version + eventsToSave.length;
+      const nextSnapshot: Snapshot = {
+        version: nextVersion,
+        stateJson: repairedState,
+        updatedAt: now,
+      };
+      const currentEtag = snapshotRecord.etag;
+      if (!currentEtag) {
+        setError("Missing server version. Please reload and try again.");
+        return { ok: false, reason: "missing_etag" };
+      }
+
       const chunkIds = await oneDrive.listSharedEventChunkIds(root.reference);
       const nextChunkId = chunkIds.length === 0 ? 1 : Math.max(...chunkIds) + 1;
       const chunks = buildEventChunks(versionedEvents, nextChunkId, MAX_EVENTS_PER_CHUNK, now);
 
       const writeResult = await oneDrive.writeSharedSnapshot(root.reference, nextSnapshot, {
-        ifMatch: snapshotRecord.etag,
+        ifMatch: currentEtag,
       });
 
-      const nextEtag = writeResult.etag ?? snapshotRecord.etag;
+      const nextEtag = writeResult.etag ?? currentEtag;
       setSnapshotRecord({ snapshot: nextSnapshot, etag: nextEtag });
       setDraftState(nextSnapshot.stateJson);
       setPendingEvents([]);
@@ -545,20 +663,27 @@ export function SharedDataProvider({
         etag: nextEtag,
         cachedAt: now,
       });
-      try {
-        for (const chunk of chunks) {
-          await oneDrive.writeSharedEventChunk(
-            root.reference,
-            chunk.chunkId,
-            serializeEventChunk(chunk),
-          );
-        }
-      } catch (eventError) {
-        setMessage(
-          "Snapshot saved, but event log update failed. Please retry when the connection is stable.",
+      const uploadQueue: QueuedChunkWrite[] = chunks.map((chunk) => ({
+        chunkId: chunk.chunkId,
+        content: serializeEventChunk(chunk),
+      }));
+      const uploadResult = await flushPendingHistoryChunks(root.reference, uploadQueue);
+      if (!uploadResult.ok) {
+        pendingHistoryChunksRef.current = uploadResult.failedQueue;
+        const partialMessage = buildPartialFailureMessage(uploadResult.failedQueue.length);
+        const partialDetail = buildPartialFailureDetail(
+          uploadResult.failedQueue.length,
+          uploadResult.errorMessage,
         );
-        setError(formatGraphError(eventError));
+        setMessage(partialMessage);
+        setError(partialDetail);
+        return {
+          ok: false,
+          reason: "partial_failure",
+          error: partialDetail,
+        };
       }
+      pendingHistoryChunksRef.current = [];
       return { ok: true };
     } catch (err) {
       if (isPreconditionFailed(err)) {
@@ -575,6 +700,7 @@ export function SharedDataProvider({
     canWrite,
     draftState,
     ensureRootInfo,
+    flushPendingHistoryChunks,
     handleConflict,
     isOnline,
     isSignedIn,
@@ -1037,6 +1163,7 @@ export function SharedDataProvider({
       error,
       allocationNotice,
       latestEvent,
+      loadHistoryPage,
       refresh,
       createAccount,
       updateAccount,
@@ -1078,6 +1205,7 @@ export function SharedDataProvider({
       lease,
       leaseError,
       latestEvent,
+      loadHistoryPage,
       message,
       pendingEvents.length,
       readOnlyReason,

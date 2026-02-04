@@ -1367,13 +1367,21 @@ export const reduceAllocations = (
       };
     }),
   );
+  const affectedGoalIds = Array.from(new Set(normalized.map((item) => item.allocation.goalId)));
+  const affectedPositionIds = Array.from(
+    new Set(normalized.map((item) => item.allocation.positionId)),
+  );
 
   return {
     nextState: { ...state, allocations: nextAllocations },
     events: [
       buildEvent(meta, "allocations_reduced", {
+        affectedGoalIds,
+        affectedPositionIds,
         reductions: normalized.map((item) => ({
           allocationId: item.allocation.id,
+          goalId: item.allocation.goalId,
+          positionId: item.allocation.positionId,
           amount: item.amount,
         })),
       }),
@@ -1522,6 +1530,7 @@ export const repairStateOnLoad = (
   const repairedAllocations = removeZeroAllocations(Array.from(nextById.values()));
   const changes = buildAllocationChanges(cleanedAllocations, repairedAllocations);
   const reducedChanges = changes.filter((change) => change.after < change.before);
+  const affectedGoalIds = Array.from(new Set(reducedChanges.map((change) => change.goalId)));
   const affectedPositionIds = Array.from(
     new Set(reducedChanges.map((change) => change.positionId)),
   );
@@ -1544,6 +1553,8 @@ export const repairStateOnLoad = (
         removedDuplicates: duplicateRemoved,
         allocationChanges: reducedChanges.length,
         correctedNegative,
+        affectedGoalIds,
+        affectedPositionIds,
       }),
     );
   }

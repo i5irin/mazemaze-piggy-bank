@@ -111,6 +111,60 @@ a {
   gap: var(--space-2);
 }
 
+.scope-switcher {
+  display: grid;
+  gap: 6px;
+}
+
+.scope-switcher-mobile {
+  min-width: 150px;
+}
+
+.scope-switcher-desktop {
+  display: none;
+}
+
+.scope-pivot {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  border: 1px solid var(--app-border);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--app-surface) 92%, transparent);
+  width: fit-content;
+}
+
+.scope-pivot-button {
+  border: 0;
+  background: transparent;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--app-subtle);
+  cursor: pointer;
+}
+
+.scope-pivot-button.is-active {
+  background: var(--app-accent);
+  color: #1a1a1a;
+}
+
+.scope-select {
+  border: 1px solid var(--app-border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--app-surface) 96%, transparent);
+  color: var(--app-text);
+  min-height: 30px;
+  font-size: 12px;
+  padding: 4px 8px;
+  min-width: 150px;
+}
+
+.app-nav-scope {
+  display: none;
+}
+
 .brand-link {
   display: flex;
   gap: 8px;
@@ -673,6 +727,10 @@ a {
     display: none;
   }
 
+  .scope-switcher-mobile {
+    display: none;
+  }
+
   .app-nav {
     grid-column: 1;
     grid-row: 2;
@@ -692,6 +750,16 @@ a {
   .app-nav-brand {
     display: flex;
     padding: 4px 4px 0;
+  }
+
+  .app-nav-scope {
+    display: block;
+    width: 100%;
+    padding: 0 4px;
+  }
+
+  .scope-switcher-desktop {
+    display: grid;
   }
 
   .app-nav-links {
@@ -1358,6 +1426,33 @@ a {
   padding: var(--space-3);
   display: grid;
   gap: 6px;
+}
+
+.history-event-header {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.history-origin-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--app-border);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.history-origin-badge-user {
+  border-color: color-mix(in srgb, #4c9f70 55%, var(--app-border));
+  background: color-mix(in srgb, #4c9f70 14%, var(--app-surface));
+}
+
+.history-origin-badge-system {
+  border-color: color-mix(in srgb, #b36f2b 58%, var(--app-border));
+  background: color-mix(in srgb, #b36f2b 16%, var(--app-surface));
 }
 
 .goals-receipt-card {

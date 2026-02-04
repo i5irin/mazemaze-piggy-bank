@@ -1,6 +1,5 @@
 "use client";
 
-import { Button } from "@fluentui/react-components";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useMemo } from "react";
@@ -32,11 +31,6 @@ export function SharedShell({ children }: SharedShellProps) {
         <div style={{ fontWeight: 600 }}>{space.label}</div>
         <div className="app-muted">Shared ID: {space.sharedId ?? "Unknown"}</div>
         <div className="app-muted">Access: {canWrite ? "Editable" : "Read-only"}</div>
-        <div className="app-actions" style={{ marginTop: 12 }}>
-          <Link href="/shared">
-            <Button>Back to shared list</Button>
-          </Link>
-        </div>
       </section>
 
       <nav className="app-subnav" aria-label="Shared navigation">

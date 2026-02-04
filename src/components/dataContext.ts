@@ -1,5 +1,6 @@
 import type { LeaseRecord } from "@/lib/onedrive/oneDriveService";
 import type { PendingEvent } from "@/lib/persistence/eventChunk";
+import type { HistoryFilter, HistoryPage } from "@/lib/persistence/history";
 import type { Snapshot } from "@/lib/persistence/snapshot";
 import type { Goal, NormalizedState, Position } from "@/lib/persistence/types";
 import type { AllocationNotice } from "@/lib/persistence/domain";
@@ -16,6 +17,7 @@ export type SaveChangesReason =
   | "unauthenticated"
   | "read_only"
   | "invalid_space"
+  | "partial_failure"
   | "no_snapshot"
   | "no_changes"
   | "missing_etag"
@@ -53,6 +55,11 @@ export type DataContextValue = {
   isRevalidating?: boolean;
   allocationNotice: AllocationNotice | null;
   latestEvent: PendingEvent | null;
+  loadHistoryPage: (input: {
+    limit: number;
+    cursor?: string | null;
+    filter?: HistoryFilter;
+  }) => Promise<HistoryPage>;
   refresh: () => Promise<void>;
   createAccount: (name: string) => DomainActionOutcome;
   updateAccount: (accountId: string, name: string) => DomainActionOutcome;

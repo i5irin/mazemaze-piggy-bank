@@ -1,9 +1,5 @@
-import SharedClient from "@/app/shared/SharedClient";
-
-export const metadata = {
-  title: "Shared",
-};
+import { redirect } from "next/navigation";
 
 export default function SharedPage() {
-  return <SharedClient />;
+  redirect("/dashboard");
 }

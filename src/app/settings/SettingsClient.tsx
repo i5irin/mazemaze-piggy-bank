@@ -1,9 +1,11 @@
 "use client";
 
 import { Button, Radio, RadioGroup, Spinner, Text } from "@fluentui/react-components";
+import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useAuth } from "@/components/AuthProvider";
 import { type ThemePreference, useTheme } from "@/components/AppProviders";
+import { usePersonalData } from "@/components/PersonalDataProvider";
 import { useSharedSelection } from "@/components/SharedSelectionProvider";
 import { isAuthError } from "@/lib/auth/authErrors";
 import { getGraphScopes } from "@/lib/auth/msalConfig";
@@ -124,6 +126,31 @@ const getUserMessage = (error: unknown): string => {
   return "Something went wrong. Please try again.";
 };
 
+const getSaveErrorMessage = (reason: string, fallback?: string): string => {
+  if (reason === "offline") {
+    return "Offline mode is view-only. Reconnect and try again.";
+  }
+  if (reason === "unauthenticated") {
+    return "Sign in to save changes.";
+  }
+  if (reason === "read_only") {
+    return "This space is read-only.";
+  }
+  if (reason === "missing_etag") {
+    return "Missing server version. Reload and try again.";
+  }
+  if (reason === "partial_failure") {
+    return (
+      fallback ??
+      "Save partially failed: data was saved, but history upload failed. Retry is required."
+    );
+  }
+  if (reason === "conflict") {
+    return "Data changed elsewhere. Reloaded latest data.";
+  }
+  return fallback ?? "Could not save changes.";
+};
+
 const buildExportTimestamp = (): string => new Date().toISOString().replace(/[:.]/g, "-");
 
 const downloadBlob = (blob: Blob, filename: string) => {
@@ -136,8 +163,10 @@ const downloadBlob = (blob: Blob, filename: string) => {
 };
 
 export function SettingsClient() {
+  const router = useRouter();
   const { status, account, error, signIn, signOut, getAccessToken } = useAuth();
   const { preference, setPreference, mode } = useTheme();
+  const data = usePersonalData();
   const { selection } = useSharedSelection();
   const [isMounted] = useState(() => typeof window !== "undefined");
   const [driveState, setDriveState] = useState<OperationState>({
@@ -147,6 +176,19 @@ export function SettingsClient() {
   const [exportState, setExportState] = useState<OperationState>({
     status: "idle",
     message: null,
+  });
+  const [syncState, setSyncState] = useState<OperationState>({
+    status: "idle",
+    message: null,
+  });
+  const [sharedAccess, setSharedAccess] = useState<{
+    status: "idle" | "loading" | "ready" | "error";
+    message: string | null;
+    canWrite: boolean | null;
+  }>({
+    status: "idle",
+    message: null,
+    canWrite: null,
   });
 
   const graphScopes = useMemo(() => getGraphScopes(), []);
@@ -207,6 +249,86 @@ export function SettingsClient() {
   const isExportWorking = exportState.status === "working";
   const isAuthLoading = status === "loading";
   const isAuthBlocked = status === "error";
+  const syncStatusLabel =
+    data.activity === "saving"
+      ? "Saving"
+      : data.status === "loading"
+        ? "Loading"
+        : data.error
+          ? "Failed"
+          : "Ready";
+  const sourceLabel =
+    data.source === "remote" ? "OneDrive" : data.source === "cache" ? "Cache" : "Empty";
+
+  const handleRefreshData = useCallback(async () => {
+    setSyncState({
+      status: "working",
+      message: "Refreshing sync status...",
+    });
+    try {
+      await data.refresh();
+      setSyncState({
+        status: "success",
+        message: "Sync status refreshed.",
+      });
+    } catch (err) {
+      setSyncState({
+        status: "error",
+        message: getUserMessage(err),
+      });
+    }
+  }, [data]);
+
+  const handleSaveData = useCallback(async () => {
+    setSyncState({
+      status: "working",
+      message: "Saving pending changes...",
+    });
+    try {
+      const result = await data.saveChanges();
+      if (result.ok) {
+        setSyncState({
+          status: "success",
+          message: "Saved to OneDrive.",
+        });
+        return;
+      }
+      if (result.reason === "no_changes") {
+        setSyncState({
+          status: "success",
+          message: "No pending changes.",
+        });
+        return;
+      }
+      setSyncState({
+        status: "error",
+        message: getSaveErrorMessage(result.reason, result.error),
+      });
+    } catch (err) {
+      setSyncState({
+        status: "error",
+        message: getUserMessage(err),
+      });
+    }
+  }, [data]);
+
+  const handleDiscardData = useCallback(() => {
+    data.discardChanges();
+    setSyncState({
+      status: "success",
+      message: "Discarded local edits.",
+    });
+  }, [data]);
+
+  const handleReviewAllocations = useCallback(() => {
+    const params = new URLSearchParams();
+    params.set("tab", "allocations");
+    const affectedGoalId = data.allocationNotice?.affectedGoalIds[0];
+    if (affectedGoalId) {
+      params.set("goalId", affectedGoalId);
+    }
+    router.push(`/goals?${params.toString()}`);
+  }, [data.allocationNotice, router]);
 
   const handleEnsureRoot = useCallback(async () => {
     setDriveState({
@@ -233,8 +355,8 @@ export function SettingsClient() {
       setDriveState({ status: "error", message: "Sign in to retry sync." });
       return;
     }
-    void handleEnsureRoot();
-  }, [handleEnsureRoot, isSignedIn]);
+    void handleRefreshData();
+  }, [handleRefreshData, isSignedIn]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -253,6 +375,46 @@ export function SettingsClient() {
     window.addEventListener("sync-retry", handler);
     return () => window.removeEventListener("sync-retry", handler);
   }, [handleRetrySync]);
+
+  useEffect(() => {
+    if (!isSignedIn || !sharedRoot) {
+      return;
+    }
+    let active = true;
+    const run = async () => {
+      if (active) {
+        setSharedAccess({
+          status: "loading",
+          message: "Checking shared access...",
+          canWrite: null,
+        });
+      }
+      try {
+        const info = await oneDrive.getSharedRootInfo(sharedRoot);
+        if (!active) {
+          return;
+        }
+        setSharedAccess({
+          status: "ready",
+          message: info.canWrite ? "Editable" : "View-only",
+          canWrite: info.canWrite,
+        });
+      } catch (err) {
+        if (!active) {
+          return;
+        }
+        setSharedAccess({
+          status: "error",
+          message: getUserMessage(err),
+          canWrite: null,
+        });
+      }
+    };
+    void run();
+    return () => {
+      active = false;
+    };
+  }, [isSignedIn, oneDrive, sharedRoot]);
 
   const handleWriteTestFile = useCallback(async () => {
     setDriveState({
@@ -420,29 +582,112 @@ export function SettingsClient() {
 
       <section className="app-surface" id="sync-status">
         <h2>Sync & connection</h2>
-        <p className="app-muted">
-          Check your sign-in status, OneDrive locations, and offline availability.
-        </p>
+        <p className="app-muted">Check sync health and use recovery actions when needed.</p>
         <div className="card-grid">
           <div className="app-surface">
             <div className="app-muted">Sign-in</div>
             <div style={{ fontWeight: 600 }}>{signInStatus}</div>
           </div>
           <div className="app-surface">
-            <div className="app-muted">Personal data location</div>
-            <div style={{ fontWeight: 600 }}>{appRootLabel}</div>
+            <div className="app-muted">Sync status</div>
+            <div style={{ fontWeight: 600 }}>{syncStatusLabel}</div>
           </div>
           <div className="app-surface">
-            <div className="app-muted">Shared data location</div>
-            <div style={{ fontWeight: 600 }}>{sharedLocationLabel}</div>
+            <div className="app-muted">Source</div>
+            <div style={{ fontWeight: 600 }}>{sourceLabel}</div>
           </div>
           <div className="app-surface">
-            <div className="app-muted">Offline mode</div>
-            <div style={{ fontWeight: 600 }}>View-only</div>
+            <div className="app-muted">Snapshot version</div>
+            <div style={{ fontWeight: 600 }}>{data.snapshot?.version ?? "—"}</div>
+          </div>
+          <div className="app-surface">
+            <div className="app-muted">Last sync time</div>
+            <div style={{ fontWeight: 600 }}>
+              {data.snapshot?.updatedAt
+                ? new Date(data.snapshot.updatedAt).toLocaleString("en-US")
+                : "—"}
+            </div>
+          </div>
+          <div className="app-surface">
+            <div className="app-muted">Online</div>
+            <div style={{ fontWeight: 600 }}>
+              {data.isOnline ? "Online" : "Offline (view-only)"}
+            </div>
+          </div>
+          <div className="app-surface">
+            <div className="app-muted">Unsaved changes</div>
+            <div style={{ fontWeight: 600 }}>{data.isDirty ? "Yes" : "No"}</div>
+          </div>
+          <div className="app-surface">
+            <div className="app-muted">Shared access</div>
+            <div style={{ fontWeight: 600 }}>
+              {!selection
+                ? "No shared folder selected"
+                : !isSignedIn
+                  ? "Sign in to check access"
+                  : sharedAccess.status === "loading"
+                    ? "Checking..."
+                    : (sharedAccess.message ?? "Unknown")}
+            </div>
           </div>
           <div className="app-surface">
             <div className="app-muted">Account type</div>
             <div style={{ fontWeight: 600 }}>Personal Microsoft accounts only</div>
+          </div>
+        </div>
+        <div className="app-actions" style={{ marginTop: 12 }}>
+          <Button onClick={() => void handleRefreshData()} disabled={data.activity !== "idle"}>
+            Refresh sync status
+          </Button>
+          <Button
+            appearance="primary"
+            onClick={() => void handleSaveData()}
+            disabled={
+              !data.isDirty || data.activity !== "idle" || !data.isOnline || !data.isSignedIn
+            }
+          >
+            Retry save
+          </Button>
+          <Button onClick={handleDiscardData} disabled={!data.isDirty || data.activity !== "idle"}>
+            Discard local edits
+          </Button>
+          <Button onClick={handleReviewAllocations} disabled={!data.allocationNotice}>
+            Review allocations
+          </Button>
+        </div>
+        {syncState.message ? (
+          <div
+            className={`app-alert ${syncState.status === "error" ? "app-alert-error" : ""}`}
+            role="status"
+          >
+            <Text>{syncState.message}</Text>
+          </div>
+        ) : null}
+        {data.message ? (
+          <div className="app-alert" role="status">
+            <Text>{data.message}</Text>
+          </div>
+        ) : null}
+        {data.error ? (
+          <div className="app-alert app-alert-error" role="alert">
+            <Text>{data.error}</Text>
+          </div>
+        ) : null}
+      </section>
+
+      <section className="app-surface" id="shared-scopes">
+        <h2>Shared scopes</h2>
+        <p className="app-muted">
+          Use the Personal/Shared pivot in the header or sidebar to switch context.
+        </p>
+        <div className="card-grid">
+          <div className="app-surface">
+            <div className="app-muted">Selected shared folder</div>
+            <div style={{ fontWeight: 600 }}>{sharedLocationLabel}</div>
+          </div>
+          <div className="app-surface">
+            <div className="app-muted">Personal data location</div>
+            <div style={{ fontWeight: 600 }}>{appRootLabel}</div>
           </div>
         </div>
       </section>
