@@ -167,6 +167,18 @@ const downloadBlob = (blob: Blob, filename: string) => {
   window.URL.revokeObjectURL(url);
 };
 
+const copyToClipboard = async (value: string): Promise<boolean> => {
+  if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
+    return false;
+  }
+  try {
+    await navigator.clipboard.writeText(value);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 const formatAbsoluteTimestamp = (value: string): string => {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) {
@@ -218,6 +230,7 @@ export function SettingsClient() {
   const { selection, setSelection, clearSelection } = useSharedSelection();
   const now = useNow(60_000);
   const [isMounted] = useState(() => typeof window !== "undefined");
+  const [isSelectionHydrated, setIsSelectionHydrated] = useState(false);
 
   const [driveState, setDriveState] = useState<OperationState>({
     status: "idle",
@@ -235,6 +248,11 @@ export function SettingsClient() {
     status: "idle",
     message: null,
   });
+  const [shareLinkState, setShareLinkState] = useState<OperationState>({
+    status: "idle",
+    message: null,
+  });
+  const [shareLinkUrl, setShareLinkUrl] = useState("");
   const [dangerState, setDangerState] = useState<OperationState>({
     status: "idle",
     message: null,
@@ -288,16 +306,17 @@ export function SettingsClient() {
   );
 
   const appRootLabel = process.env.NEXT_PUBLIC_ONEDRIVE_APP_ROOT ?? "/Apps/MazemazePiggyBank/";
+  const effectiveSelection = isSelectionHydrated ? selection : null;
   const sharedRoot = useMemo<SharedRootReference | null>(() => {
-    if (!selection) {
+    if (!effectiveSelection) {
       return null;
     }
     return {
-      sharedId: selection.sharedId,
-      driveId: selection.driveId,
-      itemId: selection.itemId,
+      sharedId: effectiveSelection.sharedId,
+      driveId: effectiveSelection.driveId,
+      itemId: effectiveSelection.itemId,
     };
-  }, [selection]);
+  }, [effectiveSelection]);
 
   const signInStatus =
     status === "loading"
@@ -313,6 +332,7 @@ export function SettingsClient() {
   const isExportWorking = exportState.status === "working";
   const isSyncWorking = syncState.status === "working";
   const isSharedWorking = sharedState.status === "working";
+  const isShareLinkWorking = shareLinkState.status === "working";
   const isDangerWorking = dangerState.status === "working";
   const isAuthLoading = status === "loading";
   const isAuthBlocked = status === "error";
@@ -331,7 +351,48 @@ export function SettingsClient() {
     ? formatAbsoluteTimestamp(data.snapshot.updatedAt)
     : null;
 
-  const selectedSharedId = selection?.sharedId ?? "";
+  const selectedSharedId = effectiveSelection?.sharedId ?? "";
+  const selectedSharedRoot = sharedRoots.find((root) => root.sharedId === selectedSharedId) ?? null;
+  const selectedSharedWebUrl = effectiveSelection?.webUrl ?? selectedSharedRoot?.webUrl ?? null;
+  const retryNowDisabled =
+    isSyncWorking || !isSignedIn || !data.isOnline || !data.canWrite || data.retryQueueCount <= 0;
+  const retryNowDisabledReason = useMemo(() => {
+    if (isSyncWorking) {
+      return "Sync is already running.";
+    }
+    if (!isSignedIn) {
+      return "Sign in to retry.";
+    }
+    if (!data.isOnline) {
+      return "You're offline.";
+    }
+    if (!data.canWrite) {
+      return "Read-only mode.";
+    }
+    if (data.retryQueueCount <= 0) {
+      return "No queued retries.";
+    }
+    return null;
+  }, [data.canWrite, data.isOnline, data.retryQueueCount, isSignedIn, isSyncWorking]);
+  const shareLinkDisabledReason = useMemo(() => {
+    if (!isSignedIn) {
+      return "Sign in to create share links.";
+    }
+    if (!data.isOnline) {
+      return "Reconnect to create share links.";
+    }
+    if (!sharedRoot) {
+      return "Select a shared folder first.";
+    }
+    if (isSharedWorking) {
+      return "Wait for shared folder updates to finish.";
+    }
+    if (isShareLinkWorking) {
+      return "Creating share link...";
+    }
+    return null;
+  }, [data.isOnline, isShareLinkWorking, isSharedWorking, isSignedIn, sharedRoot]);
+  const isShareLinkDisabled = Boolean(shareLinkDisabledReason);
 
   const loadSharedRoots = useCallback(async () => {
     if (!isSignedIn || !data.isOnline) {
@@ -552,6 +613,8 @@ export function SettingsClient() {
 
   const handleSharedSelectionChange = useCallback(
     (nextSharedId: string) => {
+      setShareLinkUrl("");
+      setShareLinkState({ status: "idle", message: null });
       if (!nextSharedId) {
         setSelection(null);
         return;
@@ -596,6 +659,76 @@ export function SettingsClient() {
       setSharedState({ status: "error", message: getUserMessage(err) });
     }
   }, [createFolderName, data.isOnline, isSignedIn, oneDrive]);
+
+  const handleCreateShareLink = useCallback(
+    async (permission: "view" | "edit") => {
+      if (!isSignedIn) {
+        setShareLinkState({ status: "error", message: "Sign in to create share links." });
+        return;
+      }
+      if (!data.isOnline) {
+        setShareLinkState({ status: "error", message: "Reconnect to create share links." });
+        return;
+      }
+      if (!sharedRoot) {
+        setShareLinkState({ status: "error", message: "Select a shared folder first." });
+        return;
+      }
+      setShareLinkState({ status: "working", message: "Creating share link..." });
+      try {
+        const result = await oneDrive.createShareLink(sharedRoot, permission);
+        setShareLinkUrl(result.webUrl);
+        const copied = await copyToClipboard(result.webUrl);
+        setShareLinkState({
+          status: "success",
+          message: copied ? "Share link copied." : "Share link created.",
+        });
+      } catch (err) {
+        const message = getUserMessage(err);
+        setShareLinkState({
+          status: "error",
+          message: `Could not create share link. ${message}`,
+        });
+      }
+    },
+    [data.isOnline, isSignedIn, oneDrive, sharedRoot],
+  );
+
+  const handleCopyShareLink = useCallback(async () => {
+    if (!shareLinkUrl) {
+      setShareLinkState({ status: "error", message: "Create a share link first." });
+      return;
+    }
+    const copied = await copyToClipboard(shareLinkUrl);
+    if (copied) {
+      setShareLinkState({ status: "success", message: "Copied." });
+      return;
+    }
+    setShareLinkState({ status: "error", message: "Copy failed. Copy the link manually." });
+  }, [shareLinkUrl]);
+
+  const handleOpenInOneDrive = useCallback(async () => {
+    if (selectedSharedWebUrl) {
+      window.open(selectedSharedWebUrl, "_blank", "noopener,noreferrer");
+      return;
+    }
+    if (!sharedRoot) {
+      setShareLinkState({ status: "error", message: "Select a shared folder first." });
+      return;
+    }
+    setShareLinkState({ status: "working", message: "Resolving OneDrive link..." });
+    try {
+      const info = await oneDrive.getSharedRootInfo(sharedRoot);
+      if (!info.webUrl) {
+        setShareLinkState({ status: "error", message: "Could not resolve OneDrive link." });
+        return;
+      }
+      window.open(info.webUrl, "_blank", "noopener,noreferrer");
+      setShareLinkState({ status: "success", message: "Opened in OneDrive." });
+    } catch (err) {
+      setShareLinkState({ status: "error", message: getUserMessage(err) });
+    }
+  }, [oneDrive, selectedSharedWebUrl, sharedRoot]);
 
   const openDeleteDialog = () => {
     setDeleteDialogOpen(true);
@@ -649,6 +782,15 @@ export function SettingsClient() {
   }, []);
 
   useEffect(() => {
+    const timerId = window.setTimeout(() => {
+      setIsSelectionHydrated(true);
+    }, 0);
+    return () => {
+      window.clearTimeout(timerId);
+    };
+  }, []);
+
+  useEffect(() => {
     scrollToHashTarget();
     window.addEventListener("hashchange", scrollToHashTarget);
     return () => window.removeEventListener("hashchange", scrollToHashTarget);
@@ -697,12 +839,7 @@ export function SettingsClient() {
 
   return (
     <div className="section-stack">
-      <section className="app-surface">
-        <h1>Settings</h1>
-        <p className="app-muted">
-          Manage provider access, connection health, sharing, and recovery.
-        </p>
-      </section>
+      <h1 className="settings-page-title">Settings</h1>
 
       <section className="app-surface settings-anchor" id="provider-sign-in">
         <h2>Provider &amp; sign-in</h2>
@@ -763,12 +900,23 @@ export function SettingsClient() {
           </div>
         </div>
         <div className="app-actions" style={{ marginTop: 12 }}>
-          <Button
-            onClick={() => void handleRetryNow()}
-            disabled={data.retryQueueCount <= 0 || isSyncWorking}
-          >
-            Retry now
-          </Button>
+          {retryNowDisabled && retryNowDisabledReason ? (
+            <span
+              className="settings-tooltip-target"
+              tabIndex={0}
+              role="note"
+              aria-label={retryNowDisabledReason}
+              title={retryNowDisabledReason}
+            >
+              <Button onClick={() => void handleRetryNow()} disabled>
+                Retry now
+              </Button>
+            </span>
+          ) : (
+            <Button onClick={() => void handleRetryNow()} disabled={retryNowDisabled}>
+              Retry now
+            </Button>
+          )}
           <Button onClick={() => void handleClearCacheAndReload()} disabled={isSyncWorking}>
             Clear cache &amp; reload
           </Button>
@@ -780,6 +928,9 @@ export function SettingsClient() {
           </Button>
           {isSyncWorking ? <Spinner size="tiny" /> : null}
         </div>
+        {retryNowDisabled && retryNowDisabledReason ? (
+          <p className="app-muted settings-help-text">{retryNowDisabledReason}</p>
+        ) : null}
         {syncState.message ? (
           <div
             className={`app-alert ${syncState.status === "error" ? "app-alert-error" : ""}`}
@@ -806,7 +957,9 @@ export function SettingsClient() {
         <div className="settings-row-grid" role="list">
           <div className="settings-row" role="listitem">
             <span className="app-muted">Selected folder</span>
-            <strong>{selection ? selection.name : "No shared folder selected"}</strong>
+            <strong>
+              {effectiveSelection ? effectiveSelection.name : "No shared folder selected"}
+            </strong>
           </div>
           <div className="settings-row" role="listitem">
             <span className="app-muted">Location</span>
@@ -815,7 +968,7 @@ export function SettingsClient() {
           <div className="settings-row" role="listitem">
             <span className="app-muted">Access</span>
             <strong>
-              {!selection
+              {!effectiveSelection
                 ? "Not selected"
                 : sharedAccess.status === "loading"
                   ? "Checking..."
@@ -870,6 +1023,44 @@ export function SettingsClient() {
             <Spinner size="tiny" />
           ) : null}
         </div>
+        <div className="settings-share-link-panel">
+          <p className="app-muted">Create and copy a share link for the selected folder.</p>
+          <div className="app-actions" style={{ marginTop: 12 }}>
+            <Button
+              onClick={() => void handleCreateShareLink("view")}
+              disabled={isShareLinkDisabled}
+            >
+              Create share link (View)
+            </Button>
+            <Button
+              onClick={() => void handleCreateShareLink("edit")}
+              disabled={isShareLinkDisabled}
+            >
+              Create share link (Edit)
+            </Button>
+            {isShareLinkWorking ? <Spinner size="tiny" /> : null}
+          </div>
+          {shareLinkDisabledReason ? (
+            <p className="app-muted settings-help-text">{shareLinkDisabledReason}</p>
+          ) : null}
+          {shareLinkUrl ? (
+            <div className="settings-share-link-row">
+              <input
+                className="settings-text-input settings-share-link-input"
+                value={shareLinkUrl}
+                readOnly
+                aria-label="Share link"
+              />
+              <Button onClick={() => void handleCopyShareLink()} disabled={isShareLinkWorking}>
+                Copy
+              </Button>
+            </div>
+          ) : null}
+          <p className="app-muted" style={{ marginTop: 10 }}>
+            Creating a link doesn&apos;t share it automatically - only people you send the link to
+            can access it.
+          </p>
+        </div>
         {sharedRootsState.message ? (
           <div
             className={`app-alert ${sharedRootsState.status === "error" ? "app-alert-error" : ""}`}
@@ -880,6 +1071,21 @@ export function SettingsClient() {
         {sharedState.message ? (
           <div className={`app-alert ${sharedState.status === "error" ? "app-alert-error" : ""}`}>
             <Text>{sharedState.message}</Text>
+          </div>
+        ) : null}
+        {shareLinkState.message ? (
+          <div
+            className={`app-alert ${shareLinkState.status === "error" ? "app-alert-error" : ""}`}
+            role="status"
+          >
+            <Text>{shareLinkState.message}</Text>
+            {shareLinkState.status === "error" && sharedRoot ? (
+              <div className="app-actions" style={{ marginTop: 8 }}>
+                <Button onClick={() => void handleOpenInOneDrive()} disabled={isShareLinkWorking}>
+                  Open in OneDrive
+                </Button>
+              </div>
+            ) : null}
           </div>
         ) : null}
       </section>

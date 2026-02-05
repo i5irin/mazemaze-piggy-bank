@@ -49,7 +49,6 @@ export function DashboardView({ data }: { data: DataContextValue }) {
     saveChanges,
     discardChanges,
     canWrite,
-    space,
     lease,
     leaseError,
     allocationNotice,
@@ -98,7 +97,6 @@ export function DashboardView({ data }: { data: DataContextValue }) {
     return expiresAt > now;
   })();
   const showLeaseBanner = Boolean(lease?.holderLabel && isActiveLease && !isLocalLease);
-  const scopeLabel = space.scope === "shared" ? "Shared" : "Personal";
   const goalHistoryHref = useMemo(() => {
     const params = new URLSearchParams();
     params.set("tab", "history");
@@ -133,20 +131,6 @@ export function DashboardView({ data }: { data: DataContextValue }) {
           <div>
             <h1>Dashboard</h1>
             <p className="app-muted">Warm precision at a glance.</p>
-          </div>
-          <div className="dashboard-hero-meta">
-            {space.scope === "shared" ? (
-              <div className="dashboard-shared-meta">
-                <Link href="/shared" className="dashboard-link">
-                  Back to Shared
-                </Link>
-                <div className="dashboard-scope-pill">{scopeLabel}</div>
-                <div className="dashboard-shared-label">{space.label}</div>
-                <div className="app-muted">Shared ID: {space.sharedId ?? "Unknown"}</div>
-              </div>
-            ) : (
-              <div className="dashboard-scope-pill">{scopeLabel}</div>
-            )}
           </div>
         </div>
 

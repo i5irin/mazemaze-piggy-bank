@@ -57,6 +57,13 @@ export type SharedRootListItem = SharedRootReference & {
   isFolder: boolean;
 };
 
+export type ShareLinkPermission = "view" | "edit";
+
+export type ShareLinkResult = {
+  permission: ShareLinkPermission;
+  webUrl: string;
+};
+
 const encodeDrivePath = (path: string) => encodeURIComponent(path).replace(/%2F/g, "/");
 
 const buildPathFromSegments = (segments: string[]) => encodeDrivePath(segments.join("/"));
@@ -314,6 +321,17 @@ const toSharedRootListItem = (item: DriveItemInfo): SharedRootListItem => ({
   webUrl: item.webUrl,
   isFolder: item.isFolder,
 });
+
+const parseShareLinkWebUrl = (data: unknown): string | null => {
+  if (!isRecord(data)) {
+    return null;
+  }
+  const link = data.link;
+  if (isRecord(link) && isString(link.webUrl)) {
+    return link.webUrl;
+  }
+  return isString(data.webUrl) ? data.webUrl : null;
+};
 
 type EnsureSharedRootFolderOptions = {
   repairConflict?: boolean;
@@ -611,6 +629,42 @@ export const createOneDriveService = (client: GraphClient, scopes: string[]) => 
       return toSharedRootListItem(fallbackParsed);
     }
     throw new Error("Failed to create shared folder.");
+  },
+  createShareLink: async (
+    root: SharedRootReference,
+    permission: ShareLinkPermission,
+  ): Promise<ShareLinkResult> => {
+    const path = `${buildSharedRootPath(root)}/createLink`;
+    let response: unknown;
+    try {
+      response = await client.postJson(
+        path,
+        {
+          type: permission,
+          scope: "anonymous",
+        },
+        scopes,
+      );
+    } catch (error) {
+      if (!isGraphError(error) || error.status !== 400) {
+        throw error;
+      }
+      response = await client.postJson(
+        path,
+        {
+          type: permission,
+        },
+        scopes,
+      );
+    }
+    const webUrl = parseShareLinkWebUrl(response);
+    if (!webUrl) {
+      throw new Error("Share link is unavailable.");
+    }
+    return {
+      permission,
+      webUrl,
+    };
   },
   deleteAppCloudData: async () => {
     try {

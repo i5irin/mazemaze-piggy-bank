@@ -259,6 +259,10 @@ a {
   scroll-margin-top: 84px;
 }
 
+.settings-page-title {
+  margin: 0;
+}
+
 .settings-row-grid {
   display: grid;
   gap: 10px;
@@ -340,6 +344,32 @@ a {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+}
+
+.settings-tooltip-target {
+  display: inline-flex;
+}
+
+.settings-help-text {
+  margin: 8px 0 0;
+}
+
+.settings-share-link-panel {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--app-border);
+}
+
+.settings-share-link-row {
+  margin-top: 10px;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.settings-share-link-input {
+  flex: 1;
+  min-width: 0;
 }
 
 .app-nav {

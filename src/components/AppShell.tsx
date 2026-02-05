@@ -92,6 +92,8 @@ export function AppShell({ children }: AppShellProps) {
   const router = useRouter();
   const { status: authStatus, getAccessToken } = useAuth();
   const { selection, setSelection } = useSharedSelection();
+  const [isHydrated, setIsHydrated] = useState(false);
+  const effectiveSelection = isHydrated ? selection : null;
   const isOnline = useOnlineStatus();
   const isSignedIn = authStatus === "signed_in";
   const [sharedRoots, setSharedRoots] = useState<SharedRootListItem[]>([]);
@@ -117,7 +119,7 @@ export function AppShell({ children }: AppShellProps) {
 
   const pathSegments = useMemo(() => pathname.split("/").filter(Boolean), [pathname]);
   const isSharedRoute = pathSegments[0] === "shared" && pathSegments.length >= 2;
-  const activeSharedId = isSharedRoute ? decodeURIComponent(pathSegments[1]) : null;
+  const routeSharedId = isSharedRoute ? decodeURIComponent(pathSegments[1]) : null;
   const sectionCandidate = isSharedRoute
     ? (pathSegments[2] ?? "dashboard")
     : (pathSegments[0] ?? "dashboard");
@@ -128,21 +130,27 @@ export function AppShell({ children }: AppShellProps) {
     sectionCandidate === "dashboard"
       ? sectionCandidate
       : "dashboard";
-  const activeScope: "personal" | "shared" = isSharedRoute ? "shared" : "personal";
+  const isSettingsRoute = !isSharedRoute && currentSection === "settings";
+  const activeScope: "personal" | "shared" =
+    isSharedRoute || (isSettingsRoute && Boolean(effectiveSelection?.sharedId))
+      ? "shared"
+      : "personal";
+  const activeSharedId =
+    routeSharedId ?? (activeScope === "shared" ? (effectiveSelection?.sharedId ?? null) : null);
 
   const sharedOptions = useMemo(() => {
-    const selectedOption = selection
+    const selectedOption = effectiveSelection
       ? {
-          sharedId: selection.sharedId,
-          driveId: selection.driveId,
-          itemId: selection.itemId,
-          name: selection.name,
-          webUrl: selection.webUrl,
+          sharedId: effectiveSelection.sharedId,
+          driveId: effectiveSelection.driveId,
+          itemId: effectiveSelection.itemId,
+          name: effectiveSelection.name,
+          webUrl: effectiveSelection.webUrl,
         }
       : null;
     return mergeSharedOptions(selectedOption, sharedRoots, activeSharedId);
-  }, [activeSharedId, selection, sharedRoots]);
-  const selectedSharedId = activeSharedId ?? selection?.sharedId ?? "";
+  }, [activeSharedId, effectiveSelection, sharedRoots]);
+  const selectedSharedId = activeSharedId ?? effectiveSelection?.sharedId ?? "";
   const activeSyncSignal = useMemo(() => {
     if (activeScope === "shared" && activeSharedId) {
       return syncSignals[buildSharedSyncSignalKey(activeSharedId)] ?? null;
@@ -207,6 +215,15 @@ export function AppShell({ children }: AppShellProps) {
       return [];
     }
   }, [isOnline, isSignedIn, oneDrive]);
+
+  useEffect(() => {
+    const timerId = window.setTimeout(() => {
+      setIsHydrated(true);
+    }, 0);
+    return () => {
+      window.clearTimeout(timerId);
+    };
+  }, []);
 
   useEffect(() => {
     const timerId = window.setTimeout(() => {
@@ -306,6 +323,15 @@ export function AppShell({ children }: AppShellProps) {
   const renderScopeSwitcher = (className?: string) =>
     (() => {
       const isSharedScope = activeScope === "shared";
+      const selectedSharedAccessLabel =
+        isSharedScope && selectedSharedId
+          ? activeSyncSignal?.canWriteKnown
+            ? activeSyncSignal.canWrite
+              ? "Editable"
+              : "Read-only"
+            : "Checking access..."
+          : null;
+      const scopeSelectValue = isSharedScope ? selectedSharedId : "";
       const sharedSelectDisabled =
         !isSharedScope ||
         !isSignedIn ||
@@ -343,7 +369,7 @@ export function AppShell({ children }: AppShellProps) {
           </div>
           <select
             className="scope-select"
-            value={selectedSharedId}
+            value={scopeSelectValue}
             onChange={(event) => handleSharedSelect(event.target.value)}
             onFocus={() => {
               if (sharedRootsStatus === "idle") {
@@ -356,7 +382,9 @@ export function AppShell({ children }: AppShellProps) {
             <option value="">{sharedPlaceholder}</option>
             {sharedOptions.map((option) => (
               <option key={option.sharedId} value={option.sharedId}>
-                {option.name}
+                {isSharedScope && option.sharedId === selectedSharedId && selectedSharedAccessLabel
+                  ? `${option.name} (${selectedSharedAccessLabel})`
+                  : option.name}
               </option>
             ))}
           </select>
