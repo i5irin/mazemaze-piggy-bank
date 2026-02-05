@@ -45,6 +45,7 @@ export type DataContextValue = {
   isOnline: boolean;
   isSignedIn: boolean;
   isDirty: boolean;
+  retryQueueCount: number;
   canWrite: boolean;
   readOnlyReason: string | null;
   space: SpaceInfo;

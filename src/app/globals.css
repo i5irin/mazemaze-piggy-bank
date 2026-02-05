@@ -255,6 +255,93 @@ a {
   white-space: pre-wrap;
 }
 
+.settings-anchor {
+  scroll-margin-top: 84px;
+}
+
+.settings-row-grid {
+  display: grid;
+  gap: 10px;
+}
+
+.settings-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  border: 1px solid var(--app-border);
+  border-radius: var(--radius-2);
+  padding: 10px 12px;
+  background: color-mix(in srgb, var(--app-surface) 94%, transparent);
+}
+
+.settings-status-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--app-border);
+  border-radius: var(--radius-2);
+  background: color-mix(in srgb, var(--app-surface) 94%, transparent);
+}
+
+.settings-details {
+  border: 1px solid var(--app-border);
+  border-radius: var(--radius-2);
+  padding: 12px;
+  background: color-mix(in srgb, var(--app-surface) 95%, transparent);
+}
+
+.settings-details summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.danger-zone {
+  border-color: color-mix(in srgb, #d13438 35%, var(--app-border));
+  background: color-mix(in srgb, #d13438 7%, var(--app-surface));
+}
+
+.settings-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: color-mix(in srgb, #000 42%, transparent);
+  display: grid;
+  place-items: center;
+  z-index: 120;
+  padding: 24px;
+}
+
+.settings-modal {
+  width: min(460px, 100%);
+  border-radius: var(--radius-3);
+  border: 1px solid var(--app-border);
+  background: var(--app-surface);
+  box-shadow: var(--app-shadow);
+  padding: 18px;
+}
+
+.settings-text-input {
+  width: 100%;
+  border: 1px solid var(--app-border);
+  border-radius: var(--radius-2);
+  padding: 10px 12px;
+  font: inherit;
+  color: inherit;
+  background: color-mix(in srgb, var(--app-surface) 96%, transparent);
+}
+
+.settings-text-input:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--app-accent) 60%, transparent);
+  outline-offset: 2px;
+}
+
+.settings-checkbox-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .app-nav {
   display: grid;
   grid-auto-flow: column;
@@ -340,7 +427,7 @@ a {
 .cloud-status {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   padding: 6px 8px;
   border-radius: 999px;
   border: 1px solid var(--app-border);
@@ -356,49 +443,29 @@ a {
   align-items: center;
   gap: 6px;
   color: inherit;
+  font-weight: 600;
 }
 
 .status-dot {
   width: 8px;
   height: 8px;
   border-radius: 999px;
-  background: var(--app-accent);
 }
 
-.cloud-status[data-state="offline"] .status-dot {
-  background: var(--app-border);
+.status-dot-green {
+  background: #319b4f;
 }
 
-.cloud-status[data-state="offline"] {
-  color: var(--app-subtle);
+.status-dot-yellow {
+  background: #c99613;
+}
+
+.status-dot-red {
+  background: #c43b3b;
 }
 
 .status-label {
   font-weight: 600;
-}
-
-.status-indicator-header .status-label {
-  display: none;
-}
-
-.status-indicator-header .sync-button {
-  padding: 6px 8px;
-}
-
-.sync-button {
-  border: 0;
-  background: var(--app-accent);
-  color: #1a1a1a;
-  padding: 6px 10px;
-  border-radius: 999px;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.sync-button:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
 }
 
 .dashboard-root {

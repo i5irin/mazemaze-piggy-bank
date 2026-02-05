@@ -46,6 +46,7 @@ import {
 import { createId } from "@/lib/persistence/id";
 import { createEmptySnapshot, type Snapshot } from "@/lib/persistence/snapshot";
 import { readSnapshotCache, writeSnapshotCache } from "@/lib/persistence/snapshotCache";
+import { PERSONAL_SYNC_SIGNAL_KEY, upsertSyncSignal } from "@/lib/persistence/syncSignalStore";
 import { useOnlineStatus } from "@/lib/persistence/useOnlineStatus";
 import type { Goal, NormalizedState, Position } from "@/lib/persistence/types";
 import { getDeviceId } from "@/lib/lease/deviceId";
@@ -164,6 +165,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
   const [lease, setLease] = useState<LeaseRecord | null>(null);
   const [leaseError, setLeaseError] = useState<string | null>(null);
   const [isRevalidating, setIsRevalidating] = useState(false);
+  const [retryQueueCount, setRetryQueueCount] = useState(0);
   const pendingEventsRef = useRef<PendingEvent[]>([]);
   const pendingHistoryChunksRef = useRef<QueuedChunkWrite[]>([]);
   const hasLocalDataRef = useRef(false);
@@ -294,7 +296,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       const shouldRunInBackground = Boolean(options?.background && snapshotRecordRef.current);
       const sequence = shouldRunInBackground ? ++revalidateSequenceRef.current : null;
       if (pendingEventsRef.current.length > 0) {
-        setMessage("Unsaved changes are present. Save or discard before syncing.");
+        setMessage("Pending local changes are still processing. Try again shortly.");
         return;
       }
       if (shouldRunInBackground) {
@@ -309,7 +311,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
         const latest = await loadLatestEventFromRemote();
         if (pendingEventsRef.current.length > 0) {
           setStatus("ready");
-          setMessage("Unsaved changes are present. Save or discard before syncing.");
+          setMessage("Pending local changes are still processing. Try again shortly.");
           return;
         }
         applySnapshot(result.snapshot, result.etag, "remote", "Synced from OneDrive.", latest);
@@ -407,7 +409,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     setPendingEvents(repair.events);
     setAllocationNotice(repair.notice ?? null);
     setLatestEvent(savedLatestEvent);
-    setMessage("Discarded local edits.");
+    setMessage("Local pending edits were cleared.");
   }, [savedLatestEvent, snapshotRecord]);
 
   const loadHistoryPage = useCallback(
@@ -472,7 +474,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     }
     const hasPendingHistoryChunks = pendingHistoryChunksRef.current.length > 0;
     if (pendingEvents.length === 0 && !hasPendingHistoryChunks) {
-      setMessage("No changes to save.");
+      setMessage("No pending sync work.");
       return { ok: false, reason: "no_changes" };
     }
     if (pendingEvents.length > 0 && !snapshotRecord.etag) {
@@ -490,6 +492,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
         const retryResult = await flushPendingHistoryChunks(pendingHistoryChunksRef.current);
         if (!retryResult.ok) {
           pendingHistoryChunksRef.current = retryResult.failedQueue;
+          setRetryQueueCount(retryResult.failedQueue.length);
           const partialMessage = buildPartialFailureMessage(retryResult.failedQueue.length);
           const partialDetail = buildPartialFailureDetail(
             retryResult.failedQueue.length,
@@ -504,6 +507,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
           };
         }
         pendingHistoryChunksRef.current = [];
+        setRetryQueueCount(0);
         if (pendingEvents.length === 0) {
           setMessage("History sync completed.");
           setError(null);
@@ -579,6 +583,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       const uploadResult = await flushPendingHistoryChunks(uploadQueue);
       if (!uploadResult.ok) {
         pendingHistoryChunksRef.current = uploadResult.failedQueue;
+        setRetryQueueCount(uploadResult.failedQueue.length);
         const partialMessage = buildPartialFailureMessage(uploadResult.failedQueue.length);
         const partialDetail = buildPartialFailureDetail(
           uploadResult.failedQueue.length,
@@ -593,6 +598,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
         };
       }
       pendingHistoryChunksRef.current = [];
+      setRetryQueueCount(0);
       return { ok: true };
     } catch (err) {
       if (isPreconditionFailed(err)) {
@@ -721,7 +727,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
         { id: createId(), name, scope: "personal" },
         meta,
       );
-      return applyDomainResult(result, "Account created in draft.");
+      return applyDomainResult(result, "Account created locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -736,7 +742,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       }
       const meta = buildEventMeta();
       const result = updateAccountDomain(editable.state, { id: accountId, name }, meta);
-      return applyDomainResult(result, "Account updated in draft.");
+      return applyDomainResult(result, "Account updated locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -751,7 +757,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       }
       const meta = buildEventMeta();
       const result = deleteAccountDomain(editable.state, accountId, meta);
-      return applyDomainResult(result, "Account deleted in draft.");
+      return applyDomainResult(result, "Account deleted locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -783,7 +789,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
         },
         meta,
       );
-      return applyDomainResult(result, "Position created in draft.");
+      return applyDomainResult(result, "Position created locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -814,7 +820,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
         },
         meta,
       );
-      return applyDomainResult(result, "Position updated in draft.");
+      return applyDomainResult(result, "Position updated locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -829,7 +835,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       }
       const meta = buildEventMeta();
       const result = deletePositionDomain(editable.state, positionId, meta);
-      return applyDomainResult(result, "Position deleted in draft.");
+      return applyDomainResult(result, "Position deleted locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -864,7 +870,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
         },
         meta,
       );
-      return applyDomainResult(result, "Goal created in draft.");
+      return applyDomainResult(result, "Goal created locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -899,7 +905,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
         },
         meta,
       );
-      return applyDomainResult(result, "Goal updated in draft.");
+      return applyDomainResult(result, "Goal updated locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -914,7 +920,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       }
       const meta = buildEventMeta();
       const result = deleteGoalDomain(editable.state, goalId, meta);
-      return applyDomainResult(result, "Goal deleted in draft.");
+      return applyDomainResult(result, "Goal deleted locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -942,7 +948,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
         },
         meta,
       );
-      return applyDomainResult(result, "Allocation created in draft.");
+      return applyDomainResult(result, "Allocation created locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -961,7 +967,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
         { id: allocationId, allocatedAmount },
         meta,
       );
-      return applyDomainResult(result, "Allocation updated in draft.");
+      return applyDomainResult(result, "Allocation updated locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -976,7 +982,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       }
       const meta = buildEventMeta();
       const result = deleteAllocationDomain(editable.state, allocationId, meta);
-      return applyDomainResult(result, "Allocation deleted in draft.");
+      return applyDomainResult(result, "Allocation deleted locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -991,7 +997,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       }
       const meta = buildEventMeta();
       const result = reduceAllocationsDomain(editable.state, { reductions }, meta);
-      return applyDomainResult(result, "Allocations reduced in draft.");
+      return applyDomainResult(result, "Allocations reduced locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -1006,7 +1012,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       }
       const meta = buildEventMeta();
       const result = spendGoalDomain(editable.state, input, meta);
-      return applyDomainResult(result, "Goal marked as spent in draft.");
+      return applyDomainResult(result, "Goal marked as spent locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -1048,7 +1054,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       }
       const meta = buildEventMeta();
       const result = undoSpendDomain(editable.state, { payload: latestEvent.payload }, meta);
-      return applyDomainResult(result, "Spend undone in draft.");
+      return applyDomainResult(result, "Spend undone locally.");
     },
     [applyDomainResult, ensureEditableState, latestEvent],
   );
@@ -1077,6 +1083,17 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     void loadFromRemoteRef.current?.({ background: true });
   }, [isOnline, isSignedIn, pathname]);
 
+  useEffect(() => {
+    upsertSyncSignal({
+      key: PERSONAL_SYNC_SIGNAL_KEY,
+      activity,
+      retryQueueCount,
+      canWrite,
+      canWriteKnown: true,
+      lastSyncedAt: snapshotRecord?.snapshot.updatedAt ?? null,
+    });
+  }, [activity, canWrite, retryQueueCount, snapshotRecord?.snapshot.updatedAt]);
+
   const value = useMemo(
     () => ({
       status,
@@ -1087,6 +1104,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       isOnline,
       isSignedIn,
       isDirty: pendingEvents.length > 0,
+      retryQueueCount,
       canWrite,
       readOnlyReason,
       space,
@@ -1143,6 +1161,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       message,
       isRevalidating,
       pendingEvents.length,
+      retryQueueCount,
       reduceAllocations,
       readOnlyReason,
       refresh,

@@ -412,7 +412,7 @@ export function DashboardView({ data }: { data: DataContextValue }) {
           <section className="app-surface dashboard-section">
             <div className="dashboard-section-header">
               <h2>Sync status</h2>
-              <Link href="/settings#sync-status" className="dashboard-link">
+              <Link href="/settings#connection-health" className="dashboard-link">
                 Open settings
               </Link>
             </div>
@@ -429,7 +429,7 @@ export function DashboardView({ data }: { data: DataContextValue }) {
               <div>{isOnline ? "Yes" : "No"}</div>
               <div className="app-muted">Signed in</div>
               <div>{isSignedIn ? "Yes" : "No"}</div>
-              <div className="app-muted">Unsaved changes</div>
+              <div className="app-muted">Pending changes</div>
               <div>{isDirty ? "Yes" : "No"}</div>
             </div>
             <div className="app-actions" style={{ marginTop: 12 }}>

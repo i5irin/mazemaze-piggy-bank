@@ -13,10 +13,18 @@ import { usePathname, useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { useAuth } from "@/components/AuthProvider";
 import { useSharedSelection } from "@/components/SharedSelectionProvider";
-import { CloudStatus } from "@/components/StatusIndicator";
+import { StatusIndicator } from "@/components/StatusIndicator";
 import { getGraphScopes } from "@/lib/auth/msalConfig";
 import { createGraphClient } from "@/lib/graph/graphClient";
 import { createOneDriveService, type SharedRootListItem } from "@/lib/onedrive/oneDriveService";
+import {
+  PERSONAL_SYNC_SIGNAL_KEY,
+  buildSharedSyncSignalKey,
+  getSyncSignalsSnapshot,
+  subscribeSyncSignals,
+  type SyncSignalEntry,
+} from "@/lib/persistence/syncSignalStore";
+import { resolveSyncIndicatorState } from "@/lib/persistence/syncStatus";
 import { useOnlineStatus } from "@/lib/persistence/useOnlineStatus";
 
 type AppShellProps = {
@@ -90,6 +98,9 @@ export function AppShell({ children }: AppShellProps) {
   const [sharedRootsStatus, setSharedRootsStatus] = useState<
     "idle" | "loading" | "ready" | "error"
   >("idle");
+  const [syncSignals, setSyncSignals] = useState<Record<string, SyncSignalEntry>>(() =>
+    getSyncSignalsSnapshot(),
+  );
   const graphScopes = useMemo(() => getGraphScopes(), []);
   const tokenProvider = useCallback((scopes: string[]) => getAccessToken(scopes), [getAccessToken]);
   const graphClient = useMemo(
@@ -132,6 +143,24 @@ export function AppShell({ children }: AppShellProps) {
     return mergeSharedOptions(selectedOption, sharedRoots, activeSharedId);
   }, [activeSharedId, selection, sharedRoots]);
   const selectedSharedId = activeSharedId ?? selection?.sharedId ?? "";
+  const activeSyncSignal = useMemo(() => {
+    if (activeScope === "shared" && activeSharedId) {
+      return syncSignals[buildSharedSyncSignalKey(activeSharedId)] ?? null;
+    }
+    return syncSignals[PERSONAL_SYNC_SIGNAL_KEY] ?? null;
+  }, [activeScope, activeSharedId, syncSignals]);
+  const syncIndicatorState = useMemo(
+    () =>
+      resolveSyncIndicatorState({
+        isOnline,
+        isSaving: activeSyncSignal?.activity === "saving",
+        retryQueueCount: activeSyncSignal?.retryQueueCount ?? 0,
+        isViewOnly:
+          activeScope === "shared" &&
+          Boolean(activeSyncSignal?.canWriteKnown && !activeSyncSignal.canWrite),
+      }),
+    [activeScope, activeSyncSignal, isOnline],
+  );
 
   const toScopedPath = useCallback(
     (scope: "personal" | "shared", sharedId?: string): string => {
@@ -193,6 +222,8 @@ export function AppShell({ children }: AppShellProps) {
     };
   }, [isOnline, isSignedIn, loadSharedRoots]);
 
+  useEffect(() => subscribeSyncSignals(() => setSyncSignals(getSyncSignalsSnapshot())), []);
+
   const resolveSharedTarget = useCallback(
     async (preferredId?: string): Promise<SharedOption | null> => {
       if (preferredId) {
@@ -238,7 +269,7 @@ export function AppShell({ children }: AppShellProps) {
       void (async () => {
         const target = await resolveSharedTarget(activeSharedId ?? selection?.sharedId);
         if (!target) {
-          router.push("/settings#shared-scopes");
+          router.push("/settings#shared");
           return;
         }
         setSelection({
@@ -271,17 +302,6 @@ export function AppShell({ children }: AppShellProps) {
     },
     [router, setSelection, sharedOptions, toScopedPath],
   );
-
-  const handleRetrySync = () => {
-    if (typeof window === "undefined") {
-      return;
-    }
-    window.sessionStorage.setItem("sync-retry", String(Date.now()));
-    window.dispatchEvent(new Event("sync-retry"));
-    if (!pathname.startsWith("/settings")) {
-      router.push("/settings#sync-status");
-    }
-  };
 
   const renderScopeSwitcher = (className?: string) =>
     (() => {
@@ -369,7 +389,7 @@ export function AppShell({ children }: AppShellProps) {
           </Link>
         </div>
         <div className="app-header-right">
-          <CloudStatus className="status-indicator-header" onRetrySync={handleRetrySync} />
+          <StatusIndicator state={syncIndicatorState} className="status-indicator-header" />
         </div>
       </header>
       <main className="app-main">{children}</main>
@@ -428,7 +448,7 @@ export function AppShell({ children }: AppShellProps) {
           })}
         </div>
         <div className="app-nav-footer">
-          <CloudStatus showLabel onRetrySync={handleRetrySync} />
+          <StatusIndicator state={syncIndicatorState} />
         </div>
       </nav>
     </div>

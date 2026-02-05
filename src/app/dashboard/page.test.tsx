@@ -12,6 +12,7 @@ jest.mock("@/components/PersonalDataProvider", () => ({
     isOnline: true,
     isSignedIn: true,
     isDirty: false,
+    retryQueueCount: 0,
     canWrite: true,
     readOnlyReason: null,
     space: { scope: "personal", label: "Personal" },

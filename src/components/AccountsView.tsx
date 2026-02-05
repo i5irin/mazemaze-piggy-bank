@@ -1517,7 +1517,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
             onClick={(event) => event.stopPropagation()}
           >
             <h3>Discard changes?</h3>
-            <p>You have unsaved changes in this position.</p>
+            <p>You have pending edits in this position.</p>
             <div className="app-actions">
               <Button
                 appearance="primary"

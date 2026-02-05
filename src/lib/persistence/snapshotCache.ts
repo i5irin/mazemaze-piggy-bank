@@ -57,3 +57,20 @@ export const writeSnapshotCache = async (record: CachedSnapshot): Promise<void> 
     tx.onerror = () => db.close();
   });
 };
+
+export const clearSnapshotCache = async (): Promise<void> => {
+  if (typeof indexedDB === "undefined") {
+    return;
+  }
+  const db = await openDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    const store = tx.objectStore(STORE_NAME);
+    const request = store.clear();
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+    tx.oncomplete = () => db.close();
+    tx.onabort = () => db.close();
+    tx.onerror = () => db.close();
+  });
+};
