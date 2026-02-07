@@ -44,12 +44,14 @@ type SharedOption = {
 const navItems: {
   section: AppSection;
   label: string;
+  mobileLabel?: string;
   icon: typeof Grid24Regular;
   mobileIcon?: typeof Grid24Regular;
 }[] = [
   {
     section: "dashboard",
     label: "Dashboard",
+    mobileLabel: "Home",
     icon: Grid24Regular,
     mobileIcon: Home24Regular,
   },
@@ -457,6 +459,7 @@ export function AppShell({ children }: AppShellProps) {
                 : currentSection === item.section;
             const Icon = item.icon;
             const MobileIcon = item.mobileIcon ?? item.icon;
+            const mobileLabel = item.mobileLabel ?? item.label;
             return (
               <Link
                 key={item.section}
@@ -470,7 +473,8 @@ export function AppShell({ children }: AppShellProps) {
                 <span className="nav-icon nav-icon-desktop" aria-hidden>
                   <Icon />
                 </span>
-                <span>{item.label}</span>
+                <span className="nav-label nav-label-mobile">{mobileLabel}</span>
+                <span className="nav-label nav-label-desktop">{item.label}</span>
               </Link>
             );
           })}
