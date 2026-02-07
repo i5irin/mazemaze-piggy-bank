@@ -1,10 +1,9 @@
-const CACHE_NAME = "piggy-bank-static-v1";
+const CACHE_NAME = "mazemaze-piggy-bank-static-v2";
 const STATIC_ASSETS = [
   "/",
   "/dashboard",
   "/accounts",
   "/goals",
-  "/shared",
   "/settings",
   "/manifest.webmanifest",
   "/icons/icon-192.png",
@@ -35,6 +34,10 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const { request } = event;
   if (request.method !== "GET") {
+    return;
+  }
+  const requestUrl = new URL(request.url);
+  if (requestUrl.origin !== self.location.origin) {
     return;
   }
 

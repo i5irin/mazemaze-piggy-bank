@@ -1,5 +1,5 @@
 {
-  "name": "piggy-bank",
+  "name": "mazemaze-piggy-bank",
   "version": "0.1.0",
   "private": true,
   "scripts": {
@@ -16,6 +16,7 @@
   "dependencies": {
     "@azure/msal-browser": "^3.0.0",
     "@fluentui/react-components": "^9.72.10",
+    "@fluentui/react-icons": "^2.0.0",
     "next": "16.1.4",
     "react": "19.2.3",
     "react-dom": "19.2.3"

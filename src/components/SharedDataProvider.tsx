@@ -17,6 +17,7 @@ import type {
   DataSource,
   DataStatus,
   DomainActionOutcome,
+  SaveChangesOutcome,
   SpaceInfo,
 } from "@/components/dataContext";
 import { getGraphScopes } from "@/lib/auth/msalConfig";
@@ -37,6 +38,7 @@ import {
   serializeEventChunk,
   type PendingEvent,
 } from "@/lib/persistence/eventChunk";
+import { createHistoryLoader, type HistoryPage } from "@/lib/persistence/history";
 import {
   createAccount as createAccountDomain,
   createAllocation as createAllocationDomain,
@@ -60,16 +62,28 @@ import {
 import { createId } from "@/lib/persistence/id";
 import { createEmptySnapshot, type Snapshot } from "@/lib/persistence/snapshot";
 import { readSnapshotCache, writeSnapshotCache } from "@/lib/persistence/snapshotCache";
+import {
+  buildSharedSyncSignalKey,
+  clearSyncSignal,
+  upsertSyncSignal,
+} from "@/lib/persistence/syncSignalStore";
 import { useOnlineStatus } from "@/lib/persistence/useOnlineStatus";
 import type { Goal, NormalizedState, Position } from "@/lib/persistence/types";
+import { getDeviceId } from "@/lib/lease/deviceId";
 
 const MAX_EVENTS_PER_CHUNK = 500;
 const LEASE_DURATION_MS = 90_000;
 const LEASE_REFRESH_MS = 60_000;
+const LEASE_EDIT_EVENT_TYPES = new Set<string>(["state_repaired"]);
 
 type SnapshotRecord = {
   snapshot: Snapshot;
   etag: string | null;
+};
+
+type QueuedChunkWrite = {
+  chunkId: number;
+  content: string;
 };
 
 type SharedRootState = {
@@ -112,6 +126,32 @@ const buildEventMeta = () => ({
   createdAt: new Date().toISOString(),
 });
 
+const buildPartialFailureMessage = (pendingChunkCount: number): string => {
+  const noun = pendingChunkCount === 1 ? "chunk" : "chunks";
+  return `Save partially failed: ${pendingChunkCount} history ${noun} still need upload. Retry is required.`;
+};
+
+const buildPartialFailureDetail = (pendingChunkCount: number, cause: string): string =>
+  `${buildPartialFailureMessage(pendingChunkCount)} Last error: ${cause}`;
+
+const withTimeout = async <T,>(task: Promise<T>, timeoutMs: number): Promise<T> => {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race<T>([
+      task,
+      new Promise<T>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          reject(new Error("History request timed out. Please retry."));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+};
+
 const resolveSharedReference = (sharedId: string): SharedRootReference | null => {
   const decoded = decodeSharedId(sharedId);
   if (!decoded) {
@@ -149,7 +189,9 @@ export function SharedDataProvider({
   const [savedLatestEvent, setSavedLatestEvent] = useState<PendingEvent | null>(null);
   const [lease, setLease] = useState<LeaseRecord | null>(null);
   const [leaseError, setLeaseError] = useState<string | null>(null);
+  const [retryQueueCount, setRetryQueueCount] = useState(0);
   const pendingEventsRef = useRef<PendingEvent[]>([]);
+  const pendingHistoryChunksRef = useRef<QueuedChunkWrite[]>([]);
   const [rootState, setRootState] = useState<SharedRootState | null>(null);
 
   const graphScopes = useMemo(() => getGraphScopes(), []);
@@ -169,6 +211,7 @@ export function SharedDataProvider({
   );
 
   const sharedReference = useMemo(() => resolveSharedReference(sharedId), [sharedId]);
+  const syncSignalKey = useMemo(() => buildSharedSyncSignalKey(sharedId), [sharedId]);
 
   const canWrite = rootState?.info.canWrite ?? false;
   const readOnlyReason =
@@ -205,8 +248,10 @@ export function SharedDataProvider({
   const buildLeasePayload = useCallback((): LeaseRecord => {
     const now = new Date();
     const holderLabel = account?.name ?? account?.username ?? "Anonymous";
+    const deviceId = getDeviceId() ?? undefined;
     return {
       holderLabel,
+      deviceId,
       leaseUntil: new Date(now.getTime() + LEASE_DURATION_MS).toISOString(),
       updatedAt: now.toISOString(),
     };
@@ -322,8 +367,6 @@ export function SharedDataProvider({
           "Loaded cached data.",
           savedLatestEvent,
         );
-        setLease(null);
-        setLeaseError(null);
       } else {
         setStatus("error");
         setSource("empty");
@@ -341,8 +384,8 @@ export function SharedDataProvider({
   }, [applySnapshot, savedLatestEvent, sharedReference]);
 
   const loadFromRemote = useCallback(async () => {
-    if (pendingEvents.length > 0) {
-      setMessage("Unsaved changes are present. Save or discard before syncing.");
+    if (pendingEventsRef.current.length > 0) {
+      setMessage("Pending local changes are still processing. Try again shortly.");
       return;
     }
     setStatus("loading");
@@ -353,7 +396,7 @@ export function SharedDataProvider({
       const latest = await loadLatestEventFromRemote(root.reference);
       if (pendingEventsRef.current.length > 0) {
         setStatus("ready");
-        setMessage("Unsaved changes are present. Save or discard before syncing.");
+        setMessage("Pending local changes are still processing. Try again shortly.");
         return;
       }
       applySnapshot(result.snapshot, result.etag, "remote", "Synced from OneDrive.", latest);
@@ -420,7 +463,6 @@ export function SharedDataProvider({
     loadLatestEventFromRemote,
     loadLeaseFromRemote,
     oneDrive,
-    pendingEvents.length,
   ]);
   useEffect(() => {
     pendingEventsRef.current = pendingEvents;
@@ -443,8 +485,57 @@ export function SharedDataProvider({
     setPendingEvents(repair.events);
     setAllocationNotice(repair.notice ?? null);
     setLatestEvent(savedLatestEvent);
-    setMessage("Discarded local edits.");
+    setMessage("Local pending edits were cleared.");
   }, [savedLatestEvent, snapshotRecord]);
+
+  const loadHistoryPage = useCallback(
+    async (input: {
+      limit: number;
+      cursor?: string | null;
+      filter?: { goalId?: string; positionId?: string };
+    }): Promise<HistoryPage> => {
+      if (!isOnline) {
+        throw new Error("History is unavailable offline.");
+      }
+      if (!isSignedIn) {
+        throw new Error("Sign in to load history.");
+      }
+      if (!sharedReference) {
+        throw new Error("Invalid shared space id.");
+      }
+      const root = await ensureRootInfo();
+      const loader = createHistoryLoader({
+        listChunkIds: () => oneDrive.listSharedEventChunkIds(root.reference),
+        readChunk: (chunkId) => oneDrive.readSharedEventChunk(root.reference, chunkId),
+      });
+      return withTimeout(loader(input), 12_000);
+    },
+    [ensureRootInfo, isOnline, isSignedIn, oneDrive, sharedReference],
+  );
+
+  const flushPendingHistoryChunks = useCallback(
+    async (
+      root: SharedRootReference,
+      queue: QueuedChunkWrite[],
+    ): Promise<
+      { ok: true } | { ok: false; failedQueue: QueuedChunkWrite[]; errorMessage: string }
+    > => {
+      for (let index = 0; index < queue.length; index += 1) {
+        const chunk = queue[index];
+        try {
+          await oneDrive.writeSharedEventChunk(root, chunk.chunkId, chunk.content);
+        } catch (err) {
+          return {
+            ok: false,
+            failedQueue: queue.slice(index),
+            errorMessage: formatGraphError(err),
+          };
+        }
+      }
+      return { ok: true };
+    },
+    [oneDrive],
+  );
 
   const handleConflict = useCallback(async () => {
     await loadFromRemote();
@@ -453,69 +544,107 @@ export function SharedDataProvider({
     );
   }, [loadFromRemote]);
 
-  const saveChanges = useCallback(async () => {
+  const saveChanges = useCallback(async (): Promise<SaveChangesOutcome> => {
     if (!isOnline) {
       setMessage("Offline mode is view-only. Please reconnect to save changes.");
-      return;
+      return { ok: false, reason: "offline" };
     }
     if (!isSignedIn) {
       setMessage("Sign in to save changes.");
-      return;
+      return { ok: false, reason: "unauthenticated" };
     }
     if (!sharedReference) {
       setError("Invalid shared space id.");
-      return;
+      return { ok: false, reason: "invalid_space" };
     }
     if (!canWrite) {
       setMessage("This shared space is read-only.");
-      return;
+      return { ok: false, reason: "read_only" };
     }
     if (!snapshotRecord || !draftState) {
       setError("No snapshot is loaded yet.");
-      return;
+      return { ok: false, reason: "no_snapshot" };
     }
-    if (pendingEvents.length === 0) {
-      setMessage("No changes to save.");
-      return;
+    const hasPendingHistoryChunks = pendingHistoryChunksRef.current.length > 0;
+    if (pendingEvents.length === 0 && !hasPendingHistoryChunks) {
+      setMessage("No pending sync work.");
+      return { ok: false, reason: "no_changes" };
     }
-    if (!snapshotRecord.etag) {
+    if (pendingEvents.length > 0 && !snapshotRecord.etag) {
       setError("Missing server version. Please reload and try again.");
-      return;
+      return { ok: false, reason: "missing_etag" };
     }
 
     setActivity("saving");
-    const now = new Date().toISOString();
-    const repair = repairStateOnLoad(draftState, buildEventMeta());
-    const hasRepair = repair.events.length > 0;
-    const repairWarningMessage =
-      hasRepair && repair.warnings.length > 0 ? repair.warnings.join(" ") : null;
-    const repairedState = hasRepair ? repair.nextState : draftState;
-    const eventsToSave = hasRepair ? [...pendingEvents, ...repair.events] : pendingEvents;
-    if (hasRepair) {
-      setDraftState(repair.nextState);
-      setPendingEvents(eventsToSave);
-      setAllocationNotice(repair.notice ?? null);
-    }
-    const versionedEvents = assignEventVersions(eventsToSave, snapshotRecord.snapshot.version);
-    const nextVersion = snapshotRecord.snapshot.version + eventsToSave.length;
-    const nextSnapshot: Snapshot = {
-      version: nextVersion,
-      stateJson: repairedState,
-      updatedAt: now,
-    };
 
     try {
       const root = await ensureRootInfo();
       await oneDrive.ensureSharedEventsFolder(root.reference);
+
+      if (hasPendingHistoryChunks) {
+        const retryResult = await flushPendingHistoryChunks(
+          root.reference,
+          pendingHistoryChunksRef.current,
+        );
+        if (!retryResult.ok) {
+          pendingHistoryChunksRef.current = retryResult.failedQueue;
+          setRetryQueueCount(retryResult.failedQueue.length);
+          const partialMessage = buildPartialFailureMessage(retryResult.failedQueue.length);
+          const partialDetail = buildPartialFailureDetail(
+            retryResult.failedQueue.length,
+            retryResult.errorMessage,
+          );
+          setMessage(partialMessage);
+          setError(partialDetail);
+          return {
+            ok: false,
+            reason: "partial_failure",
+            error: partialDetail,
+          };
+        }
+        pendingHistoryChunksRef.current = [];
+        setRetryQueueCount(0);
+        if (pendingEvents.length === 0) {
+          setMessage("History sync completed.");
+          setError(null);
+          return { ok: true };
+        }
+      }
+
+      const now = new Date().toISOString();
+      const repair = repairStateOnLoad(draftState, buildEventMeta());
+      const hasRepair = repair.events.length > 0;
+      const repairWarningMessage =
+        hasRepair && repair.warnings.length > 0 ? repair.warnings.join(" ") : null;
+      const repairedState = hasRepair ? repair.nextState : draftState;
+      const eventsToSave = hasRepair ? [...pendingEvents, ...repair.events] : pendingEvents;
+      if (hasRepair) {
+        setDraftState(repair.nextState);
+        setPendingEvents(eventsToSave);
+        setAllocationNotice(repair.notice ?? null);
+      }
+      const versionedEvents = assignEventVersions(eventsToSave, snapshotRecord.snapshot.version);
+      const nextVersion = snapshotRecord.snapshot.version + eventsToSave.length;
+      const nextSnapshot: Snapshot = {
+        version: nextVersion,
+        stateJson: repairedState,
+        updatedAt: now,
+      };
+      const currentEtag = snapshotRecord.etag;
+      if (!currentEtag) {
+        setError("Missing server version. Please reload and try again.");
+        return { ok: false, reason: "missing_etag" };
+      }
+
       const chunkIds = await oneDrive.listSharedEventChunkIds(root.reference);
       const nextChunkId = chunkIds.length === 0 ? 1 : Math.max(...chunkIds) + 1;
       const chunks = buildEventChunks(versionedEvents, nextChunkId, MAX_EVENTS_PER_CHUNK, now);
 
       const writeResult = await oneDrive.writeSharedSnapshot(root.reference, nextSnapshot, {
-        ifMatch: snapshotRecord.etag,
+        ifMatch: currentEtag,
       });
 
-      const nextEtag = writeResult.etag ?? snapshotRecord.etag;
+      const nextEtag = writeResult.etag ?? currentEtag;
       setSnapshotRecord({ snapshot: nextSnapshot, etag: nextEtag });
       setDraftState(nextSnapshot.stateJson);
       setPendingEvents([]);
@@ -543,26 +672,38 @@ export function SharedDataProvider({
         etag: nextEtag,
         cachedAt: now,
       });
-      try {
-        for (const chunk of chunks) {
-          await oneDrive.writeSharedEventChunk(
-            root.reference,
-            chunk.chunkId,
-            serializeEventChunk(chunk),
-          );
-        }
-      } catch (eventError) {
-        setMessage(
-          "Snapshot saved, but event log update failed. Please retry when the connection is stable.",
+      const uploadQueue: QueuedChunkWrite[] = chunks.map((chunk) => ({
+        chunkId: chunk.chunkId,
+        content: serializeEventChunk(chunk),
+      }));
+      const uploadResult = await flushPendingHistoryChunks(root.reference, uploadQueue);
+      if (!uploadResult.ok) {
+        pendingHistoryChunksRef.current = uploadResult.failedQueue;
+        setRetryQueueCount(uploadResult.failedQueue.length);
+        const partialMessage = buildPartialFailureMessage(uploadResult.failedQueue.length);
+        const partialDetail = buildPartialFailureDetail(
+          uploadResult.failedQueue.length,
+          uploadResult.errorMessage,
         );
-        setError(formatGraphError(eventError));
+        setMessage(partialMessage);
+        setError(partialDetail);
+        return {
+          ok: false,
+          reason: "partial_failure",
+          error: partialDetail,
+        };
       }
+      pendingHistoryChunksRef.current = [];
+      setRetryQueueCount(0);
+      return { ok: true };
     } catch (err) {
       if (isPreconditionFailed(err)) {
         await handleConflict();
-        return;
+        return { ok: false, reason: "conflict" };
       }
-      setError(formatGraphError(err));
+      const message = formatGraphError(err);
+      setError(message);
+      return { ok: false, reason: "error", error: message };
     } finally {
       setActivity("idle");
     }
@@ -570,6 +711,7 @@ export function SharedDataProvider({
     canWrite,
     draftState,
     ensureRootInfo,
+    flushPendingHistoryChunks,
     handleConflict,
     isOnline,
     isSignedIn,
@@ -582,6 +724,10 @@ export function SharedDataProvider({
 
   useEffect(() => {
     if (pendingEvents.length === 0 || !isOnline || !isSignedIn || !canWrite || !sharedReference) {
+      return;
+    }
+    const hasUserEdits = pendingEvents.some((event) => !LEASE_EDIT_EVENT_TYPES.has(event.type));
+    if (!hasUserEdits) {
       return;
     }
     let isActive = true;
@@ -608,15 +754,7 @@ export function SharedDataProvider({
       isActive = false;
       window.clearInterval(intervalId);
     };
-  }, [
-    buildLeasePayload,
-    canWrite,
-    isOnline,
-    isSignedIn,
-    oneDrive,
-    pendingEvents.length,
-    sharedReference,
-  ]);
+  }, [buildLeasePayload, canWrite, isOnline, isSignedIn, oneDrive, pendingEvents, sharedReference]);
 
   const ensureEditableState = useCallback((): { state: NormalizedState } | { error: string } => {
     if (!isOnline) {
@@ -675,7 +813,7 @@ export function SharedDataProvider({
         { id: createId(), name, scope: "shared" },
         meta,
       );
-      return applyDomainResult(result, "Account created in draft.");
+      return applyDomainResult(result, "Account created locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -690,7 +828,7 @@ export function SharedDataProvider({
       }
       const meta = buildEventMeta();
       const result = updateAccountDomain(editable.state, { id: accountId, name }, meta);
-      return applyDomainResult(result, "Account updated in draft.");
+      return applyDomainResult(result, "Account updated locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -705,7 +843,7 @@ export function SharedDataProvider({
       }
       const meta = buildEventMeta();
       const result = deleteAccountDomain(editable.state, accountId, meta);
-      return applyDomainResult(result, "Account deleted in draft.");
+      return applyDomainResult(result, "Account deleted locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -737,7 +875,7 @@ export function SharedDataProvider({
         },
         meta,
       );
-      return applyDomainResult(result, "Position created in draft.");
+      return applyDomainResult(result, "Position created locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -768,7 +906,7 @@ export function SharedDataProvider({
         },
         meta,
       );
-      return applyDomainResult(result, "Position updated in draft.");
+      return applyDomainResult(result, "Position updated locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -783,7 +921,7 @@ export function SharedDataProvider({
       }
       const meta = buildEventMeta();
       const result = deletePositionDomain(editable.state, positionId, meta);
-      return applyDomainResult(result, "Position deleted in draft.");
+      return applyDomainResult(result, "Position deleted locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -818,7 +956,7 @@ export function SharedDataProvider({
         },
         meta,
       );
-      return applyDomainResult(result, "Goal created in draft.");
+      return applyDomainResult(result, "Goal created locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -853,7 +991,7 @@ export function SharedDataProvider({
         },
         meta,
       );
-      return applyDomainResult(result, "Goal updated in draft.");
+      return applyDomainResult(result, "Goal updated locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -868,7 +1006,7 @@ export function SharedDataProvider({
       }
       const meta = buildEventMeta();
       const result = deleteGoalDomain(editable.state, goalId, meta);
-      return applyDomainResult(result, "Goal deleted in draft.");
+      return applyDomainResult(result, "Goal deleted locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -896,7 +1034,7 @@ export function SharedDataProvider({
         },
         meta,
       );
-      return applyDomainResult(result, "Allocation created in draft.");
+      return applyDomainResult(result, "Allocation created locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -915,7 +1053,7 @@ export function SharedDataProvider({
         { id: allocationId, allocatedAmount },
         meta,
       );
-      return applyDomainResult(result, "Allocation updated in draft.");
+      return applyDomainResult(result, "Allocation updated locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -930,7 +1068,7 @@ export function SharedDataProvider({
       }
       const meta = buildEventMeta();
       const result = deleteAllocationDomain(editable.state, allocationId, meta);
-      return applyDomainResult(result, "Allocation deleted in draft.");
+      return applyDomainResult(result, "Allocation deleted locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -945,7 +1083,7 @@ export function SharedDataProvider({
       }
       const meta = buildEventMeta();
       const result = reduceAllocationsDomain(editable.state, { reductions }, meta);
-      return applyDomainResult(result, "Allocations reduced in draft.");
+      return applyDomainResult(result, "Allocations reduced locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -960,7 +1098,7 @@ export function SharedDataProvider({
       }
       const meta = buildEventMeta();
       const result = spendGoalDomain(editable.state, input, meta);
-      return applyDomainResult(result, "Goal marked as spent in draft.");
+      return applyDomainResult(result, "Goal marked as spent locally.");
     },
     [applyDomainResult, ensureEditableState],
   );
@@ -1002,7 +1140,7 @@ export function SharedDataProvider({
       }
       const meta = buildEventMeta();
       const result = undoSpendDomain(editable.state, { payload: latestEvent.payload }, meta);
-      return applyDomainResult(result, "Spend undone in draft.");
+      return applyDomainResult(result, "Spend undone locally.");
     },
     [applyDomainResult, ensureEditableState, latestEvent],
   );
@@ -1017,6 +1155,31 @@ export function SharedDataProvider({
     }
   }, [isOnline, isSignedIn, loadFromRemote]);
 
+  useEffect(() => {
+    upsertSyncSignal({
+      key: syncSignalKey,
+      activity,
+      retryQueueCount,
+      canWrite,
+      canWriteKnown: rootState !== null,
+      lastSyncedAt: snapshotRecord?.snapshot.updatedAt ?? null,
+    });
+  }, [
+    activity,
+    canWrite,
+    retryQueueCount,
+    rootState,
+    snapshotRecord?.snapshot.updatedAt,
+    syncSignalKey,
+  ]);
+
+  useEffect(
+    () => () => {
+      clearSyncSignal(syncSignalKey);
+    },
+    [syncSignalKey],
+  );
+
   const value = useMemo(
     () => ({
       status,
@@ -1027,6 +1190,7 @@ export function SharedDataProvider({
       isOnline,
       isSignedIn,
       isDirty: pendingEvents.length > 0,
+      retryQueueCount,
       canWrite,
       readOnlyReason,
       space,
@@ -1036,6 +1200,7 @@ export function SharedDataProvider({
       error,
       allocationNotice,
       latestEvent,
+      loadHistoryPage,
       refresh,
       createAccount,
       updateAccount,
@@ -1077,8 +1242,10 @@ export function SharedDataProvider({
       lease,
       leaseError,
       latestEvent,
+      loadHistoryPage,
       message,
       pendingEvents.length,
+      retryQueueCount,
       readOnlyReason,
       reduceAllocations,
       refresh,

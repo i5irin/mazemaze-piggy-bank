@@ -15,12 +15,25 @@ const LEASE_FILE_NAME = "lease.json";
 const EVENT_FILE_PREFIX = "event-";
 const EVENT_FILE_EXTENSION = ".jsonl";
 const SHARED_WITH_ME_PATH = "/me/drive/sharedWithMe";
-const APP_SHARED_FOLDER_SEGMENT = "/Apps/PiggyBank/shared";
+const SHARED_ROOT_FOLDER_NAME = "shared";
+const DEFAULT_APP_ROOT_FOLDER = "/Apps/MazemazePiggyBank/";
+
+const normalizeConfiguredAppRoot = (value: string): string => {
+  const trimmed = value.trim();
+  const withLeadingSlash = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  return withLeadingSlash.replace(/\/+$/, "");
+};
+
+const APP_ROOT_FOLDER = normalizeConfiguredAppRoot(
+  process.env.NEXT_PUBLIC_ONEDRIVE_APP_ROOT ?? DEFAULT_APP_ROOT_FOLDER,
+);
+const APP_SHARED_FOLDER_SEGMENT = `${APP_ROOT_FOLDER}/${SHARED_ROOT_FOLDER_NAME}`;
 
 type GraphClient = ReturnType<typeof createGraphClient>;
 
 export type LeaseRecord = {
   holderLabel: string;
+  deviceId?: string;
   leaseUntil: string;
   updatedAt: string;
 };
@@ -42,6 +55,13 @@ export type SharedRootListItem = SharedRootReference & {
   name: string;
   webUrl?: string;
   isFolder: boolean;
+};
+
+export type ShareLinkPermission = "view" | "edit";
+
+export type ShareLinkResult = {
+  permission: ShareLinkPermission;
+  webUrl: string;
 };
 
 const encodeDrivePath = (path: string) => encodeURIComponent(path).replace(/%2F/g, "/");
@@ -147,11 +167,20 @@ const parseJson = (text: string): unknown => {
 
 const isString = (value: unknown): value is string => typeof value === "string";
 
-const isLeaseRecord = (value: unknown): value is LeaseRecord =>
-  isRecord(value) &&
-  isString(value.holderLabel) &&
-  isString(value.leaseUntil) &&
-  isString(value.updatedAt);
+const isLeaseRecord = (value: unknown): value is LeaseRecord => {
+  if (
+    !isRecord(value) ||
+    !isString(value.holderLabel) ||
+    !isString(value.leaseUntil) ||
+    !isString(value.updatedAt)
+  ) {
+    return false;
+  }
+  if (value.deviceId !== undefined && !isString(value.deviceId)) {
+    return false;
+  }
+  return true;
+};
 
 const parseLeaseRecord = (text: string): LeaseRecord => {
   const data = parseJson(text);
@@ -256,6 +285,27 @@ const parseDriveItems = (data: unknown): DriveItemInfo[] => {
   return items;
 };
 
+const parseDriveItem = (data: unknown, fallbackDriveId?: string): DriveItemInfo | null => {
+  if (!isRecord(data) || !isString(data.id)) {
+    return null;
+  }
+  const parentReference = data.parentReference;
+  const driveId =
+    isRecord(parentReference) && isString(parentReference.driveId)
+      ? parentReference.driveId
+      : (fallbackDriveId ?? null);
+  if (!driveId) {
+    return null;
+  }
+  return {
+    id: data.id,
+    driveId,
+    name: isString(data.name) ? data.name : "Shared item",
+    webUrl: isString(data.webUrl) ? data.webUrl : undefined,
+    isFolder: isRecord(data.folder),
+  };
+};
+
 const hasWriteRole = (value: unknown): boolean => {
   if (!isRecord(value) || !Array.isArray(value.roles)) {
     return false;
@@ -263,11 +313,121 @@ const hasWriteRole = (value: unknown): boolean => {
   return value.roles.some((role) => role === "write" || role === "owner");
 };
 
-const hasReadOrWriteRole = (value: unknown): boolean => {
-  if (!isRecord(value) || !Array.isArray(value.roles)) {
-    return false;
+const toSharedRootListItem = (item: DriveItemInfo): SharedRootListItem => ({
+  sharedId: encodeSharedId(item.driveId, item.id),
+  driveId: item.driveId,
+  itemId: item.id,
+  name: item.name,
+  webUrl: item.webUrl,
+  isFolder: item.isFolder,
+});
+
+const parseShareLinkWebUrl = (data: unknown): string | null => {
+  if (!isRecord(data)) {
+    return null;
   }
-  return value.roles.some((role) => role === "read" || role === "write" || role === "owner");
+  const link = data.link;
+  if (isRecord(link) && isString(link.webUrl)) {
+    return link.webUrl;
+  }
+  return isString(data.webUrl) ? data.webUrl : null;
+};
+
+type EnsureSharedRootFolderOptions = {
+  repairConflict?: boolean;
+};
+
+const buildSharedConflictName = (): string =>
+  `${SHARED_ROOT_FOLDER_NAME}-legacy-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+
+const getPersonalDriveId = async (
+  client: GraphClient,
+  scopes: string[],
+): Promise<string | null> => {
+  const drive = await client.getJson("/me/drive", scopes);
+  return isRecord(drive) && isString(drive.id) ? drive.id : null;
+};
+
+const resolveSharedRootCandidate = async (
+  client: GraphClient,
+  scopes: string[],
+): Promise<DriveItemInfo | null> => {
+  try {
+    const existing = await client.getJson(
+      buildItemPathFromSegments([SHARED_ROOT_FOLDER_NAME]),
+      scopes,
+    );
+    const direct = parseDriveItem(existing);
+    if (direct) {
+      return direct;
+    }
+    const driveId = await getPersonalDriveId(client, scopes);
+    if (driveId) {
+      const withFallback = parseDriveItem(existing, driveId);
+      if (withFallback) {
+        return withFallback;
+      }
+    }
+  } catch (error) {
+    if (!isGraphError(error) || error.status !== 404) {
+      throw error;
+    }
+  }
+
+  try {
+    const children = await client.getJson(buildChildrenPathFromSegments([]), scopes);
+    const entries = parseDriveItems(children);
+    return entries.find((item) => item.name === SHARED_ROOT_FOLDER_NAME) ?? null;
+  } catch (error) {
+    if (!isGraphError(error) || error.status !== 404) {
+      throw error;
+    }
+    return null;
+  }
+};
+
+const ensureSharedRootFolder = async (
+  client: GraphClient,
+  scopes: string[],
+  options?: EnsureSharedRootFolderOptions,
+): Promise<DriveItemInfo> => {
+  const existing = await resolveSharedRootCandidate(client, scopes);
+  if (existing) {
+    if (existing.isFolder) {
+      return existing;
+    }
+    if (options?.repairConflict) {
+      await client.patchJson(
+        `/me/drive/items/${encodePathSegment(existing.id)}`,
+        { name: buildSharedConflictName() },
+        scopes,
+      );
+    } else {
+      throw new Error("Shared root is not a folder.");
+    }
+  }
+
+  try {
+    await client.postJson(
+      buildChildrenPathFromSegments([]),
+      {
+        name: SHARED_ROOT_FOLDER_NAME,
+        folder: {},
+        "@microsoft.graph.conflictBehavior": "fail",
+      },
+      scopes,
+    );
+  } catch (creationError) {
+    if (!isGraphError(creationError) || creationError.status !== 409) {
+      throw creationError;
+    }
+  }
+
+  const resolved = await resolveSharedRootCandidate(client, scopes);
+  if (!resolved || !resolved.isFolder) {
+    throw new Error("Shared root is not a folder.");
+  }
+  return resolved;
 };
 
 export const createOneDriveService = (client: GraphClient, scopes: string[]) => ({
@@ -430,6 +590,96 @@ export const createOneDriveService = (client: GraphClient, scopes: string[]) => 
       ]),
       scopes,
     ),
+  ensureSharedRootFolder: async (): Promise<SharedRootListItem> => {
+    const folder = await ensureSharedRootFolder(client, scopes);
+    return toSharedRootListItem(folder);
+  },
+  createSharedFolder: async (name: string): Promise<SharedRootListItem> => {
+    const normalized = name.trim();
+    if (!normalized) {
+      throw new Error("Folder name is required.");
+    }
+    await ensureSharedRootFolder(client, scopes, { repairConflict: true });
+    const created = await client.postJson(
+      buildChildrenPathFromSegments([SHARED_ROOT_FOLDER_NAME]),
+      {
+        name: normalized,
+        folder: {},
+        "@microsoft.graph.conflictBehavior": "fail",
+      },
+      scopes,
+    );
+    const parsed = parseDriveItem(created);
+    if (parsed && parsed.isFolder) {
+      return toSharedRootListItem(parsed);
+    }
+    const childrenData = await client.getJson(
+      buildChildrenPathFromSegments([SHARED_ROOT_FOLDER_NAME]),
+      scopes,
+    );
+    const fallback = parseDriveItems(childrenData).find(
+      (item) => item.isFolder && item.name === normalized,
+    );
+    if (fallback) {
+      return toSharedRootListItem(fallback);
+    }
+    const driveId = await getPersonalDriveId(client, scopes);
+    const fallbackParsed = driveId ? parseDriveItem(created, driveId) : null;
+    if (fallbackParsed && fallbackParsed.isFolder) {
+      return toSharedRootListItem(fallbackParsed);
+    }
+    throw new Error("Failed to create shared folder.");
+  },
+  createShareLink: async (
+    root: SharedRootReference,
+    permission: ShareLinkPermission,
+  ): Promise<ShareLinkResult> => {
+    const path = `${buildSharedRootPath(root)}/createLink`;
+    let response: unknown;
+    try {
+      response = await client.postJson(
+        path,
+        {
+          type: permission,
+          scope: "anonymous",
+        },
+        scopes,
+      );
+    } catch (error) {
+      if (!isGraphError(error) || error.status !== 400) {
+        throw error;
+      }
+      response = await client.postJson(
+        path,
+        {
+          type: permission,
+        },
+        scopes,
+      );
+    }
+    const webUrl = parseShareLinkWebUrl(response);
+    if (!webUrl) {
+      throw new Error("Share link is unavailable.");
+    }
+    return {
+      permission,
+      webUrl,
+    };
+  },
+  deleteAppCloudData: async () => {
+    try {
+      const root = await client.getJson(APP_ROOT_PATH, scopes);
+      if (!isRecord(root) || !isString(root.id)) {
+        return;
+      }
+      await client.delete(`/me/drive/items/${encodePathSegment(root.id)}`, scopes);
+    } catch (error) {
+      if (isGraphError(error) && error.status === 404) {
+        return;
+      }
+      throw error;
+    }
+  },
   listSharedRoots: async (): Promise<SharedRootListItem[]> => {
     const data = await client.getJson(SHARED_WITH_ME_PATH, scopes);
     return parseSharedListItems(data).filter((item) => item.isFolder);
@@ -440,37 +690,13 @@ export const createOneDriveService = (client: GraphClient, scopes: string[]) => 
   },
   listSharedByMeRoots: async (): Promise<SharedRootListItem[]> => {
     try {
-      const data = await client.getJson(buildChildrenPathFromSegments(["shared"]), scopes);
-      const children = parseDriveItems(data).filter((item) => item.isFolder);
-      if (children.length === 0) {
-        return [];
-      }
-      const results = await Promise.all(
-        children.map(async (item) => {
-          const detail = await client.getJson(
-            `/me/drive/items/${encodePathSegment(item.id)}?expand=permissions`,
-            scopes,
-          );
-          const permissions =
-            isRecord(detail) && Array.isArray(detail.permissions) ? detail.permissions : [];
-          const hasShare = permissions.some(hasReadOrWriteRole);
-          if (!hasShare) {
-            return null;
-          }
-          const entry: SharedRootListItem = {
-            sharedId: encodeSharedId(item.driveId, item.id),
-            driveId: item.driveId,
-            itemId: item.id,
-            name: item.name,
-            isFolder: true,
-          };
-          if (item.webUrl) {
-            entry.webUrl = item.webUrl;
-          }
-          return entry;
-        }),
+      const data = await client.getJson(
+        buildChildrenPathFromSegments([SHARED_ROOT_FOLDER_NAME]),
+        scopes,
       );
-      return results.filter((entry): entry is SharedRootListItem => Boolean(entry));
+      return parseDriveItems(data)
+        .filter((item) => item.isFolder)
+        .map((item) => toSharedRootListItem(item));
     } catch (error) {
       if (isGraphError(error) && error.status === 404) {
         return [];

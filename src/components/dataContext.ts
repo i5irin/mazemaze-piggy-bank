@@ -1,5 +1,6 @@
 import type { LeaseRecord } from "@/lib/onedrive/oneDriveService";
 import type { PendingEvent } from "@/lib/persistence/eventChunk";
+import type { HistoryFilter, HistoryPage } from "@/lib/persistence/history";
 import type { Snapshot } from "@/lib/persistence/snapshot";
 import type { Goal, NormalizedState, Position } from "@/lib/persistence/types";
 import type { AllocationNotice } from "@/lib/persistence/domain";
@@ -11,6 +12,20 @@ export type DataActivity = "idle" | "loading" | "saving";
 export type DataSource = "remote" | "cache" | "empty";
 
 export type DomainActionOutcome = { ok: true } | { ok: false; error: string };
+export type SaveChangesReason =
+  | "offline"
+  | "unauthenticated"
+  | "read_only"
+  | "invalid_space"
+  | "partial_failure"
+  | "no_snapshot"
+  | "no_changes"
+  | "missing_etag"
+  | "conflict"
+  | "error";
+export type SaveChangesOutcome =
+  | { ok: true }
+  | { ok: false; reason: SaveChangesReason; error?: string };
 
 export type SpaceInfo = {
   scope: "personal" | "shared";
@@ -30,6 +45,7 @@ export type DataContextValue = {
   isOnline: boolean;
   isSignedIn: boolean;
   isDirty: boolean;
+  retryQueueCount: number;
   canWrite: boolean;
   readOnlyReason: string | null;
   space: SpaceInfo;
@@ -37,8 +53,14 @@ export type DataContextValue = {
   leaseError: string | null;
   message: string | null;
   error: string | null;
+  isRevalidating?: boolean;
   allocationNotice: AllocationNotice | null;
   latestEvent: PendingEvent | null;
+  loadHistoryPage: (input: {
+    limit: number;
+    cursor?: string | null;
+    filter?: HistoryFilter;
+  }) => Promise<HistoryPage>;
   refresh: () => Promise<void>;
   createAccount: (name: string) => DomainActionOutcome;
   updateAccount: (accountId: string, name: string) => DomainActionOutcome;
@@ -92,6 +114,6 @@ export type DataContextValue = {
   }) => DomainActionOutcome;
   undoSpend: (goalId: string) => DomainActionOutcome;
   clearAllocationNotice: () => void;
-  saveChanges: () => Promise<void>;
+  saveChanges: () => Promise<SaveChangesOutcome>;
   discardChanges: () => void;
 };

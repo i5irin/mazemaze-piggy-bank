@@ -270,4 +270,29 @@ export const createGraphClient = ({ accessTokenProvider, onRetry }: GraphClientO
         accessTokenProvider,
       )
     ).data,
+  patchJson: async (path: string, body: unknown, scopes: string[]) =>
+    (
+      await requestGraph<unknown>(
+        path,
+        {
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(body),
+        },
+        { scopes, responseType: "json", onRetry },
+        accessTokenProvider,
+      )
+    ).data,
+  delete: async (path: string, scopes: string[]) => {
+    await requestGraph<unknown>(
+      path,
+      {
+        method: "DELETE",
+      },
+      { scopes, responseType: "json", onRetry },
+      accessTokenProvider,
+    );
+  },
 });
