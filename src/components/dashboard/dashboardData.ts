@@ -32,6 +32,7 @@ export type AssetSummaryItem = {
   label: string;
   total: number;
   ratio: number;
+  color: string;
 };
 
 export type RecentPositionItem = {
@@ -77,6 +78,9 @@ const EVENT_LABELS: Record<string, string> = {
   goal_spent: "Goal marked as spent",
   goal_spend_undone: "Goal spend undone",
 };
+
+const ASSET_COLORS = ["#F6E58D", "#d9b36f", "#b9854a", "#8a5b2d", "#6b4a2a"];
+const MAX_ASSET_SEGMENTS = 4;
 
 const sumBy = <T>(items: T[], pick: (item: T) => number): number =>
   items.reduce((total, item) => total + pick(item), 0);
@@ -204,19 +208,50 @@ export const buildAssetSummary = (positions: Position[]): AssetSummaryItem[] => 
 
   const totalValue = Object.values(totals).reduce((sum, value) => sum + value, 0);
 
-  return (Object.keys(totals) as Position["assetType"][])
-    .map((assetType) => {
-      const total = totals[assetType];
-      const ratio = totalValue > 0 ? total / totalValue : 0;
-      return {
-        assetType,
-        label: ASSET_TYPE_LABELS[assetType],
-        total,
-        ratio,
-      };
-    })
+  const entries = (Object.keys(totals) as Position["assetType"][])
+    .map((assetType) => ({
+      assetType,
+      label: ASSET_TYPE_LABELS[assetType],
+      total: totals[assetType],
+    }))
     .filter((item) => item.total > 0)
     .sort((left, right) => right.total - left.total || left.label.localeCompare(right.label));
+
+  let items = entries;
+  if (entries.length > MAX_ASSET_SEGMENTS) {
+    const keepCount = Math.max(1, MAX_ASSET_SEGMENTS - 1);
+    const top = entries.slice(0, keepCount);
+    const rest = entries.slice(keepCount);
+    const otherTotal = rest.reduce((sum, item) => sum + item.total, 0);
+    if (otherTotal > 0) {
+      const existingOther = top.find((item) => item.assetType === "other");
+      if (existingOther) {
+        existingOther.total += otherTotal;
+      } else {
+        top.push({ assetType: "other", label: "Other", total: otherTotal });
+      }
+    }
+    items = top;
+  }
+
+  const withRatios = items.map((item) => ({
+    ...item,
+    ratio: totalValue > 0 ? item.total / totalValue : 0,
+  }));
+
+  return withRatios
+    .sort((left, right) => {
+      const leftOther = left.assetType === "other";
+      const rightOther = right.assetType === "other";
+      if (leftOther !== rightOther) {
+        return leftOther ? 1 : -1;
+      }
+      return right.total - left.total || left.label.localeCompare(right.label);
+    })
+    .map((item, index) => ({
+      ...item,
+      color: ASSET_COLORS[index % ASSET_COLORS.length],
+    }));
 };
 
 export const buildRecentPositions = (positions: Position[], limit = 5): RecentPositionItem[] =>

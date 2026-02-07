@@ -819,7 +819,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
                     <div>
                       <div className="accounts-master-name">{account.name}</div>
                       <div className="app-muted">{count} positions</div>
-                      <div className="app-muted">Free {formatCurrency(free)}</div>
+                      <div className="app-muted">Unallocated {formatCurrency(free)}</div>
                     </div>
                     <div className="accounts-master-total">{formatCurrency(total)}</div>
                   </button>
@@ -854,7 +854,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
                 <div className="accounts-summary-name">{selectedAccount.name}</div>
                 <div>Total {formatCurrency(selectedAccountTotals.total)}</div>
                 <div>Allocated {formatCurrency(selectedAccountTotals.allocated)}</div>
-                <div>Free {formatCurrency(selectedAccountTotals.free)}</div>
+                <div>Unallocated {formatCurrency(selectedAccountTotals.free)}</div>
                 <Button
                   size="small"
                   onClick={() => openEditAccountDrawer(selectedAccount.id)}
@@ -892,7 +892,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
                         {formatCurrency(position.marketValue)}
                       </div>
                       <div className="app-muted">
-                        Allocated {formatCurrency(allocated)} · Free {formatCurrency(free)}
+                        Allocated {formatCurrency(allocated)} · Unallocated {formatCurrency(free)}
                       </div>
                     </button>
                   );
@@ -983,7 +983,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
                     <div>
                       <div className="accounts-master-name">{account.name}</div>
                       <div className="app-muted">{count} positions</div>
-                      <div className="app-muted">Free {formatCurrency(free)}</div>
+                      <div className="app-muted">Unallocated {formatCurrency(free)}</div>
                     </div>
                     <div className="accounts-master-total">{formatCurrency(total)}</div>
                   </div>
@@ -1012,7 +1012,7 @@ export function AccountsView({ data }: { data: DataContextValue }) {
               <div className="accounts-summary-name">{selectedAccount.name}</div>
               <div>Total {formatCurrency(selectedAccountTotals.total)}</div>
               <div>Allocated {formatCurrency(selectedAccountTotals.allocated)}</div>
-              <div>Free {formatCurrency(selectedAccountTotals.free)}</div>
+              <div>Unallocated {formatCurrency(selectedAccountTotals.free)}</div>
               <Button
                 size="small"
                 onClick={() => openEditAccountDrawer(selectedAccount.id)}
@@ -1116,7 +1116,8 @@ export function AccountsView({ data }: { data: DataContextValue }) {
                             {formatCurrency(position.marketValue)}
                           </div>
                           <div className="app-muted">
-                            Allocated {formatCurrency(allocated)} · Free {formatCurrency(free)}
+                            Allocated {formatCurrency(allocated)} · Unallocated{" "}
+                            {formatCurrency(free)}
                           </div>
                         </button>
                       )}

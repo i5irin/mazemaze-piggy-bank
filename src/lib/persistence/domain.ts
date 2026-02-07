@@ -660,6 +660,7 @@ export const deleteAccount = (
     events: [
       buildEvent(meta, "account_deleted", {
         accountId,
+        name: account.name,
         removedPositions: positionIds.size,
         removedAllocations: state.allocations.length - nextAllocations.length,
       }),
@@ -715,7 +716,9 @@ export const createPosition = (
       buildEvent(meta, "position_created", {
         positionId: position.id,
         accountId: position.accountId,
+        accountName: account.name,
         assetType: position.assetType,
+        label: position.label,
         marketValue: position.marketValue,
         allocationMode: position.allocationMode,
       }),
@@ -738,6 +741,7 @@ export const updatePosition = (
   if (!position) {
     return { error: "Position not found." };
   }
+  const accountName = findAccount(state, position.accountId)?.name ?? null;
   if (!ASSET_TYPES.includes(input.assetType)) {
     return { error: "Asset type is invalid." };
   }
@@ -902,7 +906,9 @@ export const updatePosition = (
     events: [
       buildEvent(meta, "position_updated", {
         positionId: position.id,
+        accountName,
         assetType: nextPosition.assetType,
+        label: nextPosition.label,
         marketValue: nextPosition.marketValue,
         allocationMode: nextPosition.allocationMode,
         recalculated,
@@ -920,6 +926,7 @@ export const deletePosition = (
   if (!position) {
     return { error: "Position not found." };
   }
+  const accountName = findAccount(state, position.accountId)?.name ?? null;
   const nextAllocations = state.allocations.filter(
     (allocation) => allocation.positionId !== positionId,
   );
@@ -932,6 +939,8 @@ export const deletePosition = (
     events: [
       buildEvent(meta, "position_deleted", {
         positionId,
+        accountName,
+        label: position.label,
         removedAllocations: state.allocations.length - nextAllocations.length,
       }),
     ],
@@ -1113,6 +1122,7 @@ export const deleteGoal = (
     events: [
       buildEvent(meta, "goal_deleted", {
         goalId,
+        name: goal.name,
         removedAllocations: state.allocations.length - nextAllocations.length,
       }),
     ],
@@ -1161,6 +1171,9 @@ export const createAllocation = (
           allocationId: existing.id,
           goalId: existing.goalId,
           positionId: existing.positionId,
+          goalName: goal.name,
+          positionLabel: position.label,
+          accountName: account.name,
         }),
       ],
     };
@@ -1188,6 +1201,9 @@ export const createAllocation = (
           goalId: existing.goalId,
           positionId: existing.positionId,
           amount: nextAllocation.allocatedAmount,
+          goalName: goal.name,
+          positionLabel: position.label,
+          accountName: account.name,
         }),
       ],
     };
@@ -1218,6 +1234,9 @@ export const createAllocation = (
         goalId: allocation.goalId,
         positionId: allocation.positionId,
         amount: allocation.allocatedAmount,
+        goalName: goal.name,
+        positionLabel: position.label,
+        accountName: account.name,
       }),
     ],
   };
@@ -1298,6 +1317,8 @@ export const deleteAllocation = (
   if (goal && isGoalSpent(goal)) {
     return { error: "Spent goals cannot be edited." };
   }
+  const position = findPosition(state, allocation.positionId);
+  const accountName = position ? (findAccount(state, position.accountId)?.name ?? null) : null;
   return {
     nextState: {
       ...state,
@@ -1308,6 +1329,9 @@ export const deleteAllocation = (
         allocationId,
         goalId: allocation.goalId,
         positionId: allocation.positionId,
+        goalName: goal?.name ?? null,
+        positionLabel: position?.label ?? null,
+        accountName,
       }),
     ],
   };
@@ -1579,6 +1603,7 @@ type SpendPayment = {
 
 type SpendEventPayload = {
   goalId: string;
+  goalName?: string;
   spentAt: string;
   totalAmount: number;
   payments: SpendPayment[];
@@ -1721,6 +1746,7 @@ export const spendGoal = (
 
   const payload: SpendEventPayload = {
     goalId: goal.id,
+    goalName: goal.name,
     spentAt: meta.createdAt,
     totalAmount,
     payments,
@@ -1809,6 +1835,7 @@ export const undoSpend = (
     events: [
       buildEvent(meta, "goal_spend_undone", {
         goalId: goal.id,
+        goalName: goal.name,
         spentAt: payload.spentAt,
       }),
       ...repair.events,

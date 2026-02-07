@@ -1,63 +1,78 @@
 "use client";
 
-import { Button, Spinner, Text } from "@fluentui/react-components";
 import Link from "next/link";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { DataContextValue } from "@/components/dataContext";
 import {
   buildAccountSummary,
-  buildAlertSummary,
   buildAssetSummary,
   buildDashboardTotals,
   buildGoalProgress,
-  buildRecentChange,
   buildRecentPositions,
   formatCurrency,
   formatPercent,
-  formatTimestamp,
   getProgressRatio,
 } from "@/components/dashboard/dashboardData";
+import type { HistoryItem } from "@/lib/persistence/history";
 import { getDeviceId } from "@/lib/lease/deviceId";
 import { useNow } from "@/lib/time/useNow";
 
-const getEditNotice = (data: DataContextValue): string | null => {
-  if (!data.isOnline) {
-    return "Offline mode is view-only. Connect to the internet to edit.";
+const ACTIVITY_LIMIT = 5;
+const GOAL_LIMIT = 5;
+const ACCOUNT_LIMIT = 5;
+const QUICK_UPDATE_LIMIT = 5;
+
+const formatRelativeTimestamp = (value: string, now: number): string => {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return "Unknown time";
   }
-  if (!data.isSignedIn) {
-    return "Sign in to edit. Offline mode is view-only.";
+  const diffMs = parsed.getTime() - now;
+  const diffMinutes = Math.round(diffMs / 60000);
+  const absMinutes = Math.abs(diffMinutes);
+  const formatter = new Intl.RelativeTimeFormat("en", { numeric: "auto" });
+
+  if (absMinutes < 60) {
+    return formatter.format(diffMinutes, "minute");
   }
-  if (!data.canWrite) {
-    return data.readOnlyReason;
+  const diffHours = Math.round(diffMinutes / 60);
+  if (Math.abs(diffHours) < 24) {
+    return formatter.format(diffHours, "hour");
   }
-  return null;
+  const diffDays = Math.round(diffHours / 24);
+  if (Math.abs(diffDays) < 30) {
+    return formatter.format(diffDays, "day");
+  }
+  return parsed.toLocaleDateString("en-US");
+};
+
+const toHistoryOriginLabel = (origin: HistoryItem["origin"]): string =>
+  origin === "system" ? "System" : "User";
+
+const formatDelta = (amount: number): string => {
+  if (amount === 0) {
+    return formatCurrency(amount);
+  }
+  const sign = amount > 0 ? "+" : "-";
+  return `${sign}${formatCurrency(Math.abs(amount))}`;
 };
 
 export function DashboardView({ data }: { data: DataContextValue }) {
   const {
-    status,
-    activity,
-    source,
-    snapshot,
     draftState,
     isOnline,
     isSignedIn,
-    isDirty,
-    message,
-    error,
-    refresh,
-    saveChanges,
-    discardChanges,
-    canWrite,
+    space,
     lease,
     leaseError,
-    allocationNotice,
     latestEvent,
+    loadHistoryPage,
   } = data;
 
   const totals = useMemo(() => buildDashboardTotals(draftState), [draftState]);
   const progressRatio = useMemo(() => getProgressRatio(totals), [totals]);
   const goals = useMemo(() => buildGoalProgress(draftState), [draftState]);
+  const goalCards = useMemo(() => goals.slice(0, GOAL_LIMIT), [goals]);
   const accounts = useMemo(() => draftState?.accounts ?? [], [draftState?.accounts]);
   const positions = useMemo(() => draftState?.positions ?? [], [draftState?.positions]);
   const allocations = useMemo(() => draftState?.allocations ?? [], [draftState?.allocations]);
@@ -65,10 +80,28 @@ export function DashboardView({ data }: { data: DataContextValue }) {
     () => buildAccountSummary(accounts, positions, allocations),
     [accounts, positions, allocations],
   );
+  const accountSummaryTop = useMemo(() => {
+    const sorted = [...accountSummary].sort((left, right) => {
+      if (left.total !== right.total) {
+        return right.total - left.total;
+      }
+      const nameCompare = left.name.localeCompare(right.name);
+      if (nameCompare !== 0) {
+        return nameCompare;
+      }
+      return left.id.localeCompare(right.id);
+    });
+    return sorted.slice(0, ACCOUNT_LIMIT);
+  }, [accountSummary]);
   const assetSummary = useMemo(() => buildAssetSummary(positions), [positions]);
-  const recentPositions = useMemo(() => buildRecentPositions(positions), [positions]);
-  const recentChange = useMemo(() => buildRecentChange(latestEvent), [latestEvent]);
-  const alertSummary = useMemo(() => buildAlertSummary(allocationNotice), [allocationNotice]);
+  const recentPositions = useMemo(
+    () => buildRecentPositions(positions, QUICK_UPDATE_LIMIT),
+    [positions],
+  );
+  const accountNameById = useMemo(
+    () => new Map(accounts.map((account) => [account.id, account.name])),
+    [accounts],
+  );
 
   const summaryCards = [
     { label: "Total assets", value: formatCurrency(totals.totalAssets) },
@@ -76,16 +109,15 @@ export function DashboardView({ data }: { data: DataContextValue }) {
     { label: "Unallocated", value: formatCurrency(totals.unallocated) },
   ];
 
-  const sourceLabel = source === "remote" ? "OneDrive" : source === "cache" ? "Cache" : "Empty";
-  const canEdit = isOnline && isSignedIn && canWrite;
-  const isBusy = activity !== "idle";
-  const updatedAt = snapshot?.updatedAt ?? null;
-  const editNotice = getEditNotice(data);
   const [assetTab, setAssetTab] = useState<"account" | "asset">("account");
+  const [activityItems, setActivityItems] = useState<HistoryItem[]>([]);
+  const [activityError, setActivityError] = useState<string | null>(null);
+  const [activityLoading, setActivityLoading] = useState(false);
+  const activityRequestRef = useRef(0);
+
   const deviceId = useMemo(() => getDeviceId(), []);
   const isLocalLease = Boolean(lease?.deviceId && deviceId && lease.deviceId === deviceId);
   const now = useNow(1000);
-  const [historyTab, setHistoryTab] = useState<"goals" | "positions">("goals");
   const isActiveLease = (() => {
     if (!lease?.leaseUntil) {
       return false;
@@ -97,26 +129,91 @@ export function DashboardView({ data }: { data: DataContextValue }) {
     return expiresAt > now;
   })();
   const showLeaseBanner = Boolean(lease?.holderLabel && isActiveLease && !isLocalLease);
-  const goalHistoryHref = useMemo(() => {
+
+  const accountsBasePath =
+    space.scope === "shared" && space.sharedId
+      ? `/shared/${encodeURIComponent(space.sharedId)}/accounts`
+      : "/accounts";
+  const goalsBasePath =
+    space.scope === "shared" && space.sharedId
+      ? `/shared/${encodeURIComponent(space.sharedId)}/goals`
+      : "/goals";
+
+  const buildAccountHref = (accountId: string) => {
     const params = new URLSearchParams();
-    params.set("tab", "history");
-    if (goals[0]?.id) {
-      params.set("goalId", goals[0].id);
-    }
-    return `/goals?${params.toString()}`;
-  }, [goals]);
-  const positionHistoryHref = useMemo(() => {
-    const target = recentPositions[0];
-    if (!target) {
-      return "/accounts";
-    }
+    params.set("accountId", accountId);
+    return `${accountsBasePath}?${params.toString()}`;
+  };
+
+  const buildGoalHref = (goalId: string) => {
     const params = new URLSearchParams();
-    params.set("accountId", target.accountId);
+    params.set("goalId", goalId);
+    params.set("highlightGoalId", goalId);
+    return `${goalsBasePath}?${params.toString()}`;
+  };
+
+  const buildPositionHref = (positionId: string, accountId: string) => {
+    const params = new URLSearchParams();
+    params.set("accountId", accountId);
     params.set("drawer", "position");
-    params.set("positionId", target.id);
-    params.set("positionTab", "history");
-    return `/accounts?${params.toString()}`;
-  }, [recentPositions]);
+    params.set("positionId", positionId);
+    return `${accountsBasePath}?${params.toString()}`;
+  };
+
+  const assetDonutStyle = useMemo(() => {
+    if (assetSummary.length === 0) {
+      return {};
+    }
+    let offset = 0;
+    const segments = assetSummary.map((item, index) => {
+      const isLast = index === assetSummary.length - 1;
+      const nextOffset = isLast ? 100 : offset + item.ratio * 100;
+      const segment = `${item.color} ${offset}% ${nextOffset}%`;
+      offset = nextOffset;
+      return segment;
+    });
+    return {
+      background: `conic-gradient(${segments.join(", ")})`,
+    };
+  }, [assetSummary]);
+
+  useEffect(() => {
+    if (!isOnline) {
+      setActivityItems([]);
+      setActivityError("Recent activity is unavailable offline.");
+      setActivityLoading(false);
+      return;
+    }
+    if (!isSignedIn) {
+      setActivityItems([]);
+      setActivityError("Sign in to view recent activity.");
+      setActivityLoading(false);
+      return;
+    }
+    const requestId = activityRequestRef.current + 1;
+    activityRequestRef.current = requestId;
+    setActivityLoading(true);
+    setActivityError(null);
+    void (async () => {
+      try {
+        const page = await loadHistoryPage({ limit: ACTIVITY_LIMIT });
+        if (activityRequestRef.current !== requestId) {
+          return;
+        }
+        setActivityItems(page.items);
+      } catch (err) {
+        if (activityRequestRef.current !== requestId) {
+          return;
+        }
+        setActivityItems([]);
+        setActivityError(err instanceof Error ? err.message : "Could not load activity.");
+      } finally {
+        if (activityRequestRef.current === requestId) {
+          setActivityLoading(false);
+        }
+      }
+    })();
+  }, [isOnline, isSignedIn, loadHistoryPage, space.scope, space.sharedId, latestEvent?.id]);
 
   return (
     <div className="section-stack dashboard-root">
@@ -158,9 +255,6 @@ export function DashboardView({ data }: { data: DataContextValue }) {
               <div className="dashboard-summary-value">{item.value}</div>
             </div>
           ))}
-          <div className="dashboard-free-chip">
-            Total Free: {formatCurrency(totals.unallocated)}
-          </div>
         </div>
       </section>
 
@@ -168,63 +262,93 @@ export function DashboardView({ data }: { data: DataContextValue }) {
         <div className="dashboard-main">
           <section className="app-surface dashboard-section">
             <div className="dashboard-section-header">
-              <h2>Goals</h2>
-              <Link href="/goals" className="dashboard-link">
-                Open goals
-              </Link>
+              <div className="dashboard-section-heading">
+                <h2>Goals</h2>
+                <span className="app-muted">Top {GOAL_LIMIT}</span>
+              </div>
             </div>
             {goals.length === 0 ? (
-              <div className="app-muted">No active goals yet.</div>
+              <div className="section-stack">
+                <div className="app-muted">No goals yet.</div>
+                <Link href={goalsBasePath} className="dashboard-link">
+                  Open goals
+                </Link>
+              </div>
             ) : (
-              <div className="dashboard-goal-grid">
-                {goals.map((goal) => (
-                  <div key={goal.id} className="dashboard-goal-card">
-                    <div className="dashboard-goal-header">
-                      <div className="dashboard-goal-title">{goal.name}</div>
-                      <div className="dashboard-goal-percent">
-                        {formatPercent(goal.progressRatio)}
+              <div className="section-stack">
+                <div className="dashboard-goal-grid">
+                  {goalCards.map((goal) => (
+                    <Link
+                      key={goal.id}
+                      href={buildGoalHref(goal.id)}
+                      className="dashboard-goal-card dashboard-card-link"
+                    >
+                      <div className="dashboard-goal-header">
+                        <div className="dashboard-goal-title">{goal.name}</div>
+                        <div className="dashboard-goal-percent">
+                          {formatPercent(goal.progressRatio)}
+                        </div>
                       </div>
-                    </div>
-                    <div className="dashboard-goal-values">
-                      <span>{formatCurrency(goal.allocatedAmount)}</span>
-                      <span className="app-muted">of {formatCurrency(goal.targetAmount)}</span>
-                    </div>
-                    <div className="dashboard-progress-bar" aria-hidden>
-                      <div
-                        className="dashboard-progress-fill"
-                        style={{ width: `${Math.min(100, goal.progressRatio * 100)}%` }}
-                      />
-                    </div>
-                  </div>
-                ))}
+                      <div className="dashboard-goal-values">
+                        <span>{formatCurrency(goal.allocatedAmount)}</span>
+                        <span className="app-muted">of {formatCurrency(goal.targetAmount)}</span>
+                      </div>
+                      <div className="dashboard-progress-bar" aria-hidden>
+                        <div
+                          className="dashboard-progress-fill"
+                          style={{ width: `${Math.min(100, goal.progressRatio * 100)}%` }}
+                        />
+                      </div>
+                    </Link>
+                  ))}
+                </div>
+                <Link href={goalsBasePath} className="dashboard-link">
+                  Open goals
+                </Link>
               </div>
             )}
           </section>
 
           <section className="app-surface dashboard-section">
             <div className="dashboard-section-header">
-              <h2>Frequently used positions</h2>
-              <Link href="/accounts" className="dashboard-link">
-                Open accounts
-              </Link>
+              <div className="dashboard-section-heading">
+                <h2>Quick updates</h2>
+                <span className="app-muted">Last {QUICK_UPDATE_LIMIT}</span>
+              </div>
             </div>
             {recentPositions.length === 0 ? (
-              <div className="app-muted">No positions yet.</div>
+              <div className="section-stack">
+                <div className="app-muted">No recent positions yet.</div>
+                <Link href={accountsBasePath} className="dashboard-link">
+                  Open accounts
+                </Link>
+              </div>
             ) : (
               <div className="dashboard-list">
                 {recentPositions.map((position) => (
-                  <div key={position.id} className="dashboard-list-item">
+                  <Link
+                    key={position.id}
+                    href={buildPositionHref(position.id, position.accountId)}
+                    className="dashboard-list-item dashboard-list-link"
+                  >
                     <div>
                       <div className="dashboard-list-title">{position.label}</div>
                       <div className="app-muted">
-                        Updated: {formatTimestamp(position.updatedAt)}
+                        {accountNameById.get(position.accountId) ?? "Unknown account"} · Updated{" "}
+                        {formatRelativeTimestamp(position.updatedAt, now)}
                       </div>
                     </div>
                     <div className="dashboard-list-value">
                       {formatCurrency(position.marketValue)}
                     </div>
-                  </div>
+                  </Link>
                 ))}
+                <Link
+                  href={accountsBasePath}
+                  className="dashboard-list-item dashboard-list-link dashboard-list-cta"
+                >
+                  <div className="dashboard-list-title">Open accounts</div>
+                </Link>
               </div>
             )}
           </section>
@@ -233,7 +357,12 @@ export function DashboardView({ data }: { data: DataContextValue }) {
         <div className="dashboard-side">
           <section className="app-surface dashboard-section">
             <div className="dashboard-section-header">
-              <h2>Assets overview</h2>
+              <div className="dashboard-section-heading">
+                <h2>Assets overview</h2>
+                {assetTab === "account" ? (
+                  <span className="app-muted">Top {ACCOUNT_LIMIT}</span>
+                ) : null}
+              </div>
               <div className="dashboard-tabs" role="tablist" aria-label="Assets overview">
                 <button
                   type="button"
@@ -257,14 +386,19 @@ export function DashboardView({ data }: { data: DataContextValue }) {
             </div>
 
             {assetTab === "account" ? (
-              accountSummary.length === 0 ? (
-                <div className="app-muted">No accounts yet.</div>
+              accountSummaryTop.length === 0 ? (
+                <div className="section-stack">
+                  <div className="app-muted">No accounts yet.</div>
+                  <Link href={accountsBasePath} className="dashboard-link">
+                    Open accounts
+                  </Link>
+                </div>
               ) : (
                 <div className="dashboard-list">
-                  {accountSummary.map((account) => (
+                  {accountSummaryTop.map((account) => (
                     <Link
                       key={account.id}
-                      href="/accounts"
+                      href={buildAccountHref(account.id)}
                       className="dashboard-list-item dashboard-list-link"
                     >
                       <div>
@@ -273,194 +407,120 @@ export function DashboardView({ data }: { data: DataContextValue }) {
                       </div>
                       <div className="dashboard-list-value">
                         <div>{formatCurrency(account.total)}</div>
-                        <div className="app-muted">Free {formatCurrency(account.free)}</div>
+                        <div className="app-muted">Unallocated {formatCurrency(account.free)}</div>
                       </div>
                     </Link>
                   ))}
+                  <Link
+                    href={accountsBasePath}
+                    className="dashboard-list-item dashboard-list-link dashboard-list-cta"
+                  >
+                    <div className="dashboard-list-title">Open accounts</div>
+                  </Link>
                 </div>
               )
             ) : assetSummary.length === 0 ? (
               <div className="app-muted">No assets yet.</div>
             ) : (
-              <div className="dashboard-asset-list">
-                {assetSummary.map((asset) => (
-                  <div key={asset.assetType} className="dashboard-asset-item">
-                    <div className="dashboard-asset-header">
-                      <span>{asset.label}</span>
-                      <span>{formatCurrency(asset.total)}</span>
+              <div className="dashboard-asset-layout">
+                <div
+                  className="dashboard-donut"
+                  style={assetDonutStyle}
+                  role="img"
+                  aria-label="Asset breakdown"
+                >
+                  <div className="dashboard-donut-center">
+                    <div className="dashboard-donut-label">Total</div>
+                    <div className="dashboard-donut-value">
+                      {formatCurrency(totals.totalAssets)}
                     </div>
-                    <div className="dashboard-asset-bar" aria-hidden>
-                      <div
-                        className="dashboard-asset-fill"
-                        style={{ width: `${Math.min(100, asset.ratio * 100)}%` }}
+                  </div>
+                </div>
+                <div className="dashboard-legend">
+                  {assetSummary.map((asset) => (
+                    <div key={asset.assetType} className="dashboard-legend-item">
+                      <span
+                        className="dashboard-legend-swatch"
+                        style={{ background: asset.color }}
+                        aria-hidden
                       />
+                      <div className="dashboard-legend-text">
+                        <div className="dashboard-legend-title">{asset.label}</div>
+                        <div className="dashboard-legend-sub">
+                          <span className="dashboard-legend-amount">
+                            {formatCurrency(asset.total)}
+                          </span>
+                          <span className="dashboard-legend-ratio app-muted">
+                            {formatPercent(asset.ratio)}
+                          </span>
+                        </div>
+                      </div>
                     </div>
-                    <div className="app-muted">{formatPercent(asset.ratio)} of total</div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </section>
+
+          <section className="app-surface dashboard-section">
+            <div className="dashboard-section-header">
+              <div className="dashboard-section-heading">
+                <h2>Recent activity</h2>
+                <span className="app-muted">Last {ACTIVITY_LIMIT}</span>
+              </div>
+            </div>
+            {activityLoading && activityItems.length === 0 ? (
+              <div className="app-muted">Loading recent activity...</div>
+            ) : activityError ? (
+              <div className="app-muted">{activityError}</div>
+            ) : activityItems.length === 0 ? (
+              <div className="app-muted">
+                No recent activity yet. Showing the last {ACTIVITY_LIMIT} entries when available.
+              </div>
+            ) : (
+              <div className="dashboard-activity-list">
+                {activityItems.map((item) => (
+                  <div key={item.id} className="dashboard-activity-item">
+                    <div className="dashboard-activity-main">
+                      <div className="dashboard-activity-summary">{item.summary}</div>
+                      <div className="dashboard-activity-meta">
+                        <span
+                          className={`history-origin-badge ${
+                            item.origin === "system"
+                              ? "history-origin-badge-system"
+                              : "history-origin-badge-user"
+                          }`}
+                        >
+                          {toHistoryOriginLabel(item.origin)}
+                        </span>
+                        {typeof item.amountDelta === "number" ? (
+                          <span className="dashboard-activity-delta">
+                            {formatDelta(item.amountDelta)}
+                          </span>
+                        ) : null}
+                      </div>
+                    </div>
+                    <div className="dashboard-activity-time">
+                      {formatRelativeTimestamp(item.timestamp, now)}
+                    </div>
                   </div>
                 ))}
               </div>
             )}
           </section>
 
-          <section className="app-surface dashboard-section">
-            <div className="dashboard-section-header">
-              <h2>Recent changes</h2>
-            </div>
-            {recentChange ? (
-              <div className="dashboard-list">
-                <div className="dashboard-list-item">
-                  <div>
-                    <div className="dashboard-list-title">{recentChange.title}</div>
-                    <div className="app-muted">{recentChange.detail}</div>
-                  </div>
-                  <div className="dashboard-list-value">
-                    {formatTimestamp(recentChange.timestamp)}
-                  </div>
-                </div>
-              </div>
-            ) : (
-              <div className="app-muted">No recent changes yet.</div>
-            )}
-          </section>
-
-          <section className="app-surface dashboard-section">
-            <div className="dashboard-section-header">
-              <h2>History</h2>
-            </div>
-            <div className="dashboard-tabs" role="tablist" aria-label="History shortcuts">
-              <button
-                type="button"
-                className={`dashboard-tab ${historyTab === "goals" ? "is-active" : ""}`}
-                onClick={() => setHistoryTab("goals")}
-                role="tab"
-                aria-selected={historyTab === "goals"}
-              >
-                Goals
-              </button>
-              <button
-                type="button"
-                className={`dashboard-tab ${historyTab === "positions" ? "is-active" : ""}`}
-                onClick={() => setHistoryTab("positions")}
-                role="tab"
-                aria-selected={historyTab === "positions"}
-              >
-                Positions
-              </button>
-            </div>
-            {historyTab === "goals" ? (
-              <div className="section-stack">
-                <div className="app-muted">
-                  {goals.length === 0
-                    ? "No goals available yet."
-                    : "Open the Goals history tab to review recent changes."}
-                </div>
-                <Link href={goalHistoryHref} className="dashboard-link">
-                  Open goal history
-                </Link>
-              </div>
-            ) : (
-              <div className="section-stack">
-                <div className="app-muted">
-                  {recentPositions.length === 0
-                    ? "No positions available yet."
-                    : "Open position history from the selected position drawer."}
-                </div>
-                <Link href={positionHistoryHref} className="dashboard-link">
-                  Open position history
-                </Link>
-              </div>
-            )}
-          </section>
-
-          <section className="app-surface dashboard-section">
-            <div className="dashboard-section-header">
-              <h2>Alerts</h2>
-              <Link href="/goals" className="dashboard-link">
-                Review allocations
-              </Link>
-            </div>
-            {alertSummary ? (
-              <div className="app-alert" role="status">
-                <Text>{alertSummary}</Text>
-                {allocationNotice?.requiresDirectEdit ? (
-                  <div className="app-muted" style={{ marginTop: 8 }}>
-                    Direct review is recommended.
-                  </div>
-                ) : null}
-              </div>
-            ) : (
-              <div className="app-muted">No alerts right now.</div>
-            )}
-          </section>
-
-          <section className="app-surface dashboard-section">
-            <div className="dashboard-section-header">
-              <h2>Sync status</h2>
-              <Link href="/settings#connection-health" className="dashboard-link">
-                Open settings
-              </Link>
-            </div>
-            <div className="dashboard-status-grid">
-              <div className="app-muted">Status</div>
-              <div>{status === "loading" ? "Loading" : status}</div>
-              <div className="app-muted">Source</div>
-              <div>{sourceLabel}</div>
-              <div className="app-muted">Version</div>
-              <div>{snapshot?.version ?? "—"}</div>
-              <div className="app-muted">Updated</div>
-              <div>{formatTimestamp(updatedAt)}</div>
-              <div className="app-muted">Online</div>
-              <div>{isOnline ? "Yes" : "No"}</div>
-              <div className="app-muted">Signed in</div>
-              <div>{isSignedIn ? "Yes" : "No"}</div>
-              <div className="app-muted">Pending changes</div>
-              <div>{isDirty ? "Yes" : "No"}</div>
-            </div>
-            <div className="app-actions" style={{ marginTop: 12 }}>
-              <Button onClick={refresh} disabled={isBusy}>
-                {isOnline && isSignedIn ? "Refresh from OneDrive" : "Load cached data"}
-              </Button>
-              <Button
-                appearance="primary"
-                onClick={saveChanges}
-                disabled={!canEdit || !isDirty || isBusy}
-              >
-                Save changes
-              </Button>
-              <Button onClick={discardChanges} disabled={!isDirty || isBusy}>
-                Discard changes
-              </Button>
-              {isBusy ? <Spinner size="tiny" /> : null}
-            </div>
-            {editNotice ? (
-              <div className="app-alert" role="status">
-                <Text>{editNotice}</Text>
-              </div>
-            ) : null}
-            {message ? (
-              <div className="app-alert" role="status">
-                <Text>{message}</Text>
-              </div>
-            ) : null}
-            {error ? (
-              <div className="app-alert app-alert-error" role="alert">
-                <Text>{error}</Text>
-              </div>
-            ) : null}
-          </section>
-
           {leaseError ? (
             <section className="app-surface dashboard-section">
               <h2>Lease status</h2>
               <div className="app-alert" role="status">
-                <Text>{leaseError}</Text>
+                <div>{leaseError}</div>
               </div>
             </section>
           ) : null}
         </div>
       </div>
 
-      <Link href="/accounts" className="dashboard-fab" aria-label="Add account or position">
+      <Link href={accountsBasePath} className="dashboard-fab" aria-label="Add account or position">
         +
       </Link>
     </div>

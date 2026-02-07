@@ -796,6 +796,11 @@ a {
   gap: var(--space-3);
 }
 
+.dashboard-section-heading {
+  display: grid;
+  gap: 4px;
+}
+
 .dashboard-goal-grid {
   display: grid;
   gap: var(--space-3);
@@ -814,6 +819,27 @@ a {
   display: grid;
   gap: 8px;
   scroll-snap-align: start;
+}
+
+.dashboard-card-link {
+  text-decoration: none;
+  color: inherit;
+  cursor: pointer;
+  transition:
+    transform 120ms ease,
+    border-color 120ms ease,
+    background 120ms ease;
+}
+
+.dashboard-card-link:hover {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--app-accent) 35%, var(--app-border));
+  background: color-mix(in srgb, var(--app-accent) 8%, var(--app-surface));
+}
+
+.dashboard-card-link:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--app-accent) 55%, transparent);
+  outline-offset: 2px;
 }
 
 .dashboard-goal-header {
@@ -882,6 +908,29 @@ a {
 
 .dashboard-list-link {
   text-decoration: none;
+  color: inherit;
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease,
+    transform 120ms ease;
+}
+
+.dashboard-list-link:hover {
+  background: color-mix(in srgb, var(--app-accent) 10%, var(--app-surface));
+  border-color: color-mix(in srgb, var(--app-accent) 35%, var(--app-border));
+  transform: translateY(-1px);
+}
+
+.dashboard-list-link:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--app-accent) 55%, transparent);
+  outline-offset: 2px;
+}
+
+.dashboard-list-cta {
+  justify-content: flex-start;
+  font-weight: 600;
+  color: var(--app-accent);
 }
 
 .dashboard-list-title {
@@ -896,6 +945,85 @@ a {
 .dashboard-asset-list {
   display: grid;
   gap: var(--space-3);
+}
+
+.dashboard-asset-layout {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.dashboard-donut {
+  width: 140px;
+  height: 140px;
+  border-radius: 50%;
+  border: 1px solid var(--app-border);
+  background: color-mix(in srgb, var(--app-border) 55%, transparent);
+  display: grid;
+  place-items: center;
+}
+
+.dashboard-donut-center {
+  width: 88px;
+  height: 88px;
+  border-radius: 50%;
+  background: var(--app-surface);
+  display: grid;
+  place-items: center;
+  gap: 4px;
+  text-align: center;
+  box-shadow: var(--app-shadow);
+}
+
+.dashboard-donut-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--app-subtle);
+}
+
+.dashboard-donut-value {
+  font-weight: 700;
+  font-size: 14px;
+}
+
+.dashboard-legend {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.dashboard-legend-item {
+  display: grid;
+  grid-template-columns: 14px 1fr;
+  gap: 10px;
+  align-items: start;
+}
+
+.dashboard-legend-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 4px;
+  border: 1px solid var(--app-border);
+  margin-top: 4px;
+}
+
+.dashboard-legend-text {
+  display: grid;
+  gap: 4px;
+}
+
+.dashboard-legend-title {
+  font-weight: 600;
+}
+
+.dashboard-legend-sub {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 12px;
+}
+
+.dashboard-legend-amount {
+  font-weight: 600;
 }
 
 .dashboard-asset-item {
@@ -920,6 +1048,52 @@ a {
 .dashboard-asset-fill {
   height: 100%;
   background: var(--app-accent);
+}
+
+.dashboard-activity-list {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.dashboard-activity-item {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: 10px 12px;
+  border-radius: var(--radius-2);
+  border: 1px solid var(--app-border);
+  background: color-mix(in srgb, var(--app-surface) 92%, transparent);
+}
+
+.dashboard-activity-main {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.dashboard-activity-summary {
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.dashboard-activity-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.dashboard-activity-delta {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.dashboard-activity-time {
+  font-size: 12px;
+  color: var(--app-subtle);
+  white-space: nowrap;
+  align-self: flex-start;
+  text-align: right;
 }
 
 .dashboard-status-grid {
@@ -1071,6 +1245,11 @@ a {
     grid-auto-columns: auto;
     overflow: visible;
     scroll-snap-type: none;
+  }
+
+  .dashboard-asset-layout {
+    grid-template-columns: 160px 1fr;
+    align-items: center;
   }
 
   .dashboard-fab {
@@ -1494,6 +1673,11 @@ a {
 .goals-master-item-selected {
   border-left-color: var(--app-accent);
   background: color-mix(in srgb, var(--app-accent) 18%, var(--app-surface));
+}
+
+.goals-master-item-highlight {
+  border-color: color-mix(in srgb, var(--app-accent) 55%, var(--app-border));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--app-accent) 25%, transparent);
 }
 
 .goals-master-item-header {

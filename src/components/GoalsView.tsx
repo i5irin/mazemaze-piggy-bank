@@ -269,6 +269,7 @@ export function GoalsView({ data }: { data: DataContextValue }) {
   }, []);
 
   const queryGoalId = searchParams.get("goalId");
+  const highlightGoalId = searchParams.get("highlightGoalId");
   const selectedGoal = goals.find((goal) => goal.id === queryGoalId) ?? null;
   const selectedGoalHistoryId = selectedGoal?.id ?? null;
   const selectedGoalTab = normalizeTabForGoal(searchParams.get("tab"), selectedGoal);
@@ -348,9 +349,24 @@ export function GoalsView({ data }: { data: DataContextValue }) {
   );
 
   const [recentlyAddedPositionId, setRecentlyAddedPositionId] = useState<string | null>(null);
+  const [highlightedGoalId, setHighlightedGoalId] = useState<string | null>(null);
+  const highlightConsumedRef = useRef<Set<string>>(new Set());
   const [highlightedAllocationPositionId, setHighlightedAllocationPositionId] = useState<
     string | null
   >(null);
+
+  useEffect(() => {
+    if (!highlightGoalId) {
+      return;
+    }
+    if (highlightConsumedRef.current.has(highlightGoalId)) {
+      return;
+    }
+    highlightConsumedRef.current.add(highlightGoalId);
+    setHighlightedGoalId(highlightGoalId);
+    const timerId = window.setTimeout(() => setHighlightedGoalId(null), 1800);
+    return () => window.clearTimeout(timerId);
+  }, [highlightGoalId]);
 
   useEffect(() => {
     if (!highlightedAllocationPositionId) {
@@ -1246,13 +1262,14 @@ export function GoalsView({ data }: { data: DataContextValue }) {
                     goal.targetAmount > 0 ? Math.min(1, allocated / goal.targetAmount) : 1;
                   const achieved = allocated >= goal.targetAmount;
                   const selected = selectedGoal?.id === goal.id;
+                  const highlighted = highlightedGoalId === goal.id;
                   const spent = Boolean(goal.spentAt);
 
                   return (
                     <button
                       key={goal.id}
                       type="button"
-                      className={`goals-master-item ${selected ? "goals-master-item-selected" : ""}`}
+                      className={`goals-master-item ${selected ? "goals-master-item-selected" : ""} ${highlighted ? "goals-master-item-highlight" : ""}`}
                       onClick={() => {
                         setIsFabMenuOpen(false);
                         updateGoalsQuery((params) => {
@@ -1606,7 +1623,7 @@ export function GoalsView({ data }: { data: DataContextValue }) {
                           const maxAllowed = Math.min(available, maxByGoal);
                           const draftRaw = allocationDrafts[position.id] ?? "0";
                           const draftAmount = parseIntegerInput(draftRaw) ?? 0;
-                          const nextFree = Math.max(
+                          const nextUnallocated = Math.max(
                             0,
                             position.marketValue - (totalForPosition - currentAmount + draftAmount),
                           );
@@ -1678,7 +1695,7 @@ export function GoalsView({ data }: { data: DataContextValue }) {
                               <div className="goals-allocation-meta">
                                 {showAfterChangeHint ? (
                                   <span className="app-muted">
-                                    After change: Free {formatCurrency(nextFree)}
+                                    After change: Unallocated {formatCurrency(nextUnallocated)}
                                   </span>
                                 ) : null}
                                 <Button
