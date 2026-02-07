@@ -1,7 +1,7 @@
 "use client";
 
 import { Button, Radio, RadioGroup, Spinner, Text } from "@fluentui/react-components";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAuth } from "@/components/AuthProvider";
 import { type ThemePreference, useTheme } from "@/components/AppProviders";
 import { usePersonalData } from "@/components/PersonalDataProvider";
@@ -13,6 +13,7 @@ import { isGraphError } from "@/lib/graph/graphErrors";
 import {
   DEFAULT_TEST_FILE_NAME,
   createOneDriveService,
+  type ShareLinkPermission,
   type SharedRootListItem,
   type SharedRootReference,
 } from "@/lib/onedrive/oneDriveService";
@@ -30,6 +31,14 @@ type SharedRootsState = {
   status: "idle" | "loading" | "ready" | "error";
   message: string | null;
 };
+
+type SettingsSectionId =
+  | "provider-sign-in"
+  | "connection-health"
+  | "shared"
+  | "appearance"
+  | "advanced-diagnostics"
+  | "danger-zone";
 
 const sensitiveKeys = [
   "authorization",
@@ -158,6 +167,45 @@ const getSaveErrorMessage = (reason: string, fallback?: string): string => {
 
 const buildExportTimestamp = (): string => new Date().toISOString().replace(/[:.]/g, "-");
 
+const SETTINGS_SECTION_IDS: SettingsSectionId[] = [
+  "provider-sign-in",
+  "connection-health",
+  "shared",
+  "appearance",
+  "advanced-diagnostics",
+  "danger-zone",
+];
+
+const SETTINGS_SECTION_TITLES: Record<SettingsSectionId, string> = {
+  "provider-sign-in": "Provider & sign-in",
+  "connection-health": "Connection health",
+  shared: "Shared",
+  appearance: "Appearance",
+  "advanced-diagnostics": "Advanced / Diagnostics",
+  "danger-zone": "Danger zone",
+};
+
+const isSettingsSectionId = (value: string): value is SettingsSectionId =>
+  SETTINGS_SECTION_IDS.includes(value as SettingsSectionId);
+
+const resolveHashSection = (hash: string): SettingsSectionId | null => {
+  const raw = hash.startsWith("#") ? hash.slice(1) : hash;
+  if (!raw) {
+    return null;
+  }
+  return isSettingsSectionId(raw) ? raw : null;
+};
+
+const formatThemePreference = (preference: ThemePreference): string => {
+  if (preference === "light") {
+    return "Light";
+  }
+  if (preference === "dark") {
+    return "Dark";
+  }
+  return "System";
+};
+
 const downloadBlob = (blob: Blob, filename: string) => {
   const url = window.URL.createObjectURL(blob);
   const link = document.createElement("a");
@@ -231,6 +279,10 @@ export function SettingsClient() {
   const now = useNow(60_000);
   const [isMounted] = useState(() => typeof window !== "undefined");
   const [isSelectionHydrated, setIsSelectionHydrated] = useState(false);
+  const [isMobileViewport, setIsMobileViewport] = useState(false);
+  const [activeSectionId, setActiveSectionId] = useState<SettingsSectionId | null>(null);
+  const [overlayOrigin, setOverlayOrigin] = useState<"list" | "hash" | null>(null);
+  const suppressNextHashOrigin = useRef(false);
 
   const [driveState, setDriveState] = useState<OperationState>({
     status: "idle",
@@ -253,6 +305,7 @@ export function SettingsClient() {
     message: null,
   });
   const [shareLinkUrl, setShareLinkUrl] = useState("");
+  const [shareLinkPermission, setShareLinkPermission] = useState<ShareLinkPermission>("view");
   const [dangerState, setDangerState] = useState<OperationState>({
     status: "idle",
     message: null,
@@ -272,6 +325,7 @@ export function SettingsClient() {
 
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [createFolderName, setCreateFolderName] = useState("");
+  const [copyPathMessage, setCopyPathMessage] = useState<string | null>(null);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [deleteStep, setDeleteStep] = useState<1 | 2>(1);
   const [deleteAcknowledge, setDeleteAcknowledge] = useState(false);
@@ -351,6 +405,9 @@ export function SettingsClient() {
     ? formatAbsoluteTimestamp(data.snapshot.updatedAt)
     : null;
 
+  const accountLabel = account?.name ?? account?.username ?? "Unknown";
+  const providerSummary = isSignedIn ? `Signed in as ${accountLabel}` : "Not signed in";
+
   const selectedSharedId = effectiveSelection?.sharedId ?? "";
   const selectedSharedRoot = sharedRoots.find((root) => root.sharedId === selectedSharedId) ?? null;
   const selectedSharedWebUrl = effectiveSelection?.webUrl ?? selectedSharedRoot?.webUrl ?? null;
@@ -393,6 +450,100 @@ export function SettingsClient() {
     return null;
   }, [data.isOnline, isShareLinkWorking, isSharedWorking, isSignedIn, sharedRoot]);
   const isShareLinkDisabled = Boolean(shareLinkDisabledReason);
+
+  const connectionSummary = useMemo(() => {
+    if (currentSyncState === "retry_needed") {
+      return `Retry needed - ${data.retryQueueCount} queued`;
+    }
+    if (currentSyncState === "offline") {
+      return "Offline";
+    }
+    if (currentSyncState === "view_only") {
+      return "View-only";
+    }
+    if (currentSyncState === "saving") {
+      return "Saving...";
+    }
+    return `Online - Last sync ${lastSyncRelative}`;
+  }, [currentSyncState, data.retryQueueCount, lastSyncRelative]);
+
+  const sharedAccessLabel = useMemo(() => {
+    if (!effectiveSelection) {
+      return "Not selected";
+    }
+    if (sharedAccess.status === "loading") {
+      return "Checking...";
+    }
+    if (sharedAccess.status === "error") {
+      return "Access check failed";
+    }
+    return sharedAccess.message ?? "Unknown";
+  }, [effectiveSelection, sharedAccess.message, sharedAccess.status]);
+
+  const sharedSummary = useMemo(() => {
+    if (!isSignedIn) {
+      return "Not signed in";
+    }
+    if (!effectiveSelection) {
+      return "Not selected";
+    }
+    const base = `Selected: ${effectiveSelection.name}`;
+    if (sharedAccess.status === "loading") {
+      return `${base} - Checking access...`;
+    }
+    if (sharedAccess.status === "error") {
+      return `${base} - Access unavailable`;
+    }
+    return `${base} - ${sharedAccess.message ?? "Access unknown"}`;
+  }, [effectiveSelection, isSignedIn, sharedAccess.message, sharedAccess.status]);
+
+  const appearanceSummary = formatThemePreference(preference);
+  const advancedSummary = "Diagnostics & tools";
+  const dangerSummary = "Delete cloud data";
+
+  const settingsListItems = useMemo(
+    () => [
+      {
+        id: "provider-sign-in" as const,
+        title: SETTINGS_SECTION_TITLES["provider-sign-in"],
+        summary: providerSummary,
+      },
+      {
+        id: "connection-health" as const,
+        title: SETTINGS_SECTION_TITLES["connection-health"],
+        summary: connectionSummary,
+      },
+      {
+        id: "shared" as const,
+        title: SETTINGS_SECTION_TITLES.shared,
+        summary: sharedSummary,
+      },
+      {
+        id: "appearance" as const,
+        title: SETTINGS_SECTION_TITLES.appearance,
+        summary: appearanceSummary,
+      },
+      {
+        id: "advanced-diagnostics" as const,
+        title: SETTINGS_SECTION_TITLES["advanced-diagnostics"],
+        summary: advancedSummary,
+      },
+      {
+        id: "danger-zone" as const,
+        title: SETTINGS_SECTION_TITLES["danger-zone"],
+        summary: dangerSummary,
+        tone: "danger" as const,
+      },
+    ],
+    [
+      appearanceSummary,
+      connectionSummary,
+      dangerSummary,
+      providerSummary,
+      sharedSummary,
+      advancedSummary,
+    ],
+  );
 
   const loadSharedRoots = useCallback(async () => {
     if (!isSignedIn || !data.isOnline) {
@@ -660,39 +811,38 @@ export function SettingsClient() {
     }
   }, [createFolderName, data.isOnline, isSignedIn, oneDrive]);
 
-  const handleCreateShareLink = useCallback(
-    async (permission: "view" | "edit") => {
-      if (!isSignedIn) {
-        setShareLinkState({ status: "error", message: "Sign in to create share links." });
-        return;
-      }
-      if (!data.isOnline) {
-        setShareLinkState({ status: "error", message: "Reconnect to create share links." });
-        return;
-      }
-      if (!sharedRoot) {
-        setShareLinkState({ status: "error", message: "Select a shared folder first." });
-        return;
-      }
-      setShareLinkState({ status: "working", message: "Creating share link..." });
-      try {
-        const result = await oneDrive.createShareLink(sharedRoot, permission);
-        setShareLinkUrl(result.webUrl);
-        const copied = await copyToClipboard(result.webUrl);
-        setShareLinkState({
-          status: "success",
-          message: copied ? "Share link copied." : "Share link created.",
-        });
-      } catch (err) {
-        const message = getUserMessage(err);
-        setShareLinkState({
-          status: "error",
-          message: `Could not create share link. ${message}`,
-        });
-      }
-    },
-    [data.isOnline, isSignedIn, oneDrive, sharedRoot],
-  );
+  const handleCreateShareLink = useCallback(async () => {
+    if (!isSignedIn) {
+      setShareLinkState({ status: "error", message: "Sign in to create share links." });
+      return;
+    }
+    if (!data.isOnline) {
+      setShareLinkState({ status: "error", message: "Reconnect to create share links." });
+      return;
+    }
+    if (!sharedRoot) {
+      setShareLinkState({ status: "error", message: "Select a shared folder first." });
+      return;
+    }
+    setShareLinkState({ status: "working", message: "Creating share link..." });
+    try {
+      const result = await oneDrive.createShareLink(sharedRoot, shareLinkPermission);
+      setShareLinkUrl(result.webUrl);
+      const copied = await copyToClipboard(result.webUrl);
+      setShareLinkState({
+        status: "success",
+        message: copied ? "Share link copied." : "Share link created.",
+        payload: null,
+      });
+    } catch (err) {
+      const detail = getUserMessage(err);
+      setShareLinkState({
+        status: "error",
+        message: "Could not create a share link.",
+        payload: detail,
+      });
+    }
+  }, [data.isOnline, isSignedIn, oneDrive, shareLinkPermission, sharedRoot]);
 
   const handleCopyShareLink = useCallback(async () => {
     if (!shareLinkUrl) {
@@ -701,11 +851,20 @@ export function SettingsClient() {
     }
     const copied = await copyToClipboard(shareLinkUrl);
     if (copied) {
-      setShareLinkState({ status: "success", message: "Copied." });
+      setShareLinkState({ status: "success", message: "Copied.", payload: null });
       return;
     }
-    setShareLinkState({ status: "error", message: "Copy failed. Copy the link manually." });
+    setShareLinkState({
+      status: "error",
+      message: "Copy failed. Copy the link manually.",
+      payload: null,
+    });
   }, [shareLinkUrl]);
+
+  const handleCopySharedPath = useCallback(async () => {
+    const copied = await copyToClipboard(appRootLabel);
+    setCopyPathMessage(copied ? "Path copied." : "Copy failed. Copy the path manually.");
+  }, [appRootLabel]);
 
   const handleOpenInOneDrive = useCallback(async () => {
     if (selectedSharedWebUrl) {
@@ -764,8 +923,63 @@ export function SettingsClient() {
     }
   }, [clearSelection, isSignedIn, oneDrive]);
 
+  const openSection = useCallback((sectionId: SettingsSectionId) => {
+    setActiveSectionId(sectionId);
+    setOverlayOrigin("list");
+    if (typeof window === "undefined") {
+      return;
+    }
+    const nextHash = `#${sectionId}`;
+    if (window.location.hash !== nextHash) {
+      suppressNextHashOrigin.current = true;
+      window.location.hash = sectionId;
+    }
+  }, []);
+
+  const closeSection = useCallback(() => {
+    if (typeof window === "undefined") {
+      setActiveSectionId(null);
+      setOverlayOrigin(null);
+      return;
+    }
+    if (overlayOrigin === "list") {
+      window.history.back();
+      return;
+    }
+    const nextUrl = `${window.location.pathname}${window.location.search}`;
+    window.history.replaceState(null, "", nextUrl);
+    setActiveSectionId(null);
+    setOverlayOrigin(null);
+  }, [overlayOrigin]);
+
+  const syncOverlayWithHash = useCallback(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    if (!isMobileViewport) {
+      setActiveSectionId(null);
+      setOverlayOrigin(null);
+      return;
+    }
+    const sectionId = resolveHashSection(window.location.hash);
+    if (!sectionId) {
+      setActiveSectionId(null);
+      setOverlayOrigin(null);
+      return;
+    }
+    setActiveSectionId(sectionId);
+    if (suppressNextHashOrigin.current) {
+      suppressNextHashOrigin.current = false;
+      return;
+    }
+    setOverlayOrigin("hash");
+  }, [isMobileViewport]);
+
   const scrollToHashTarget = useCallback(() => {
     if (typeof window === "undefined") {
+      return;
+    }
+    if (isMobileViewport) {
       return;
     }
     const rawHash = window.location.hash.replace("#", "");
@@ -779,7 +993,7 @@ export function SettingsClient() {
     requestAnimationFrame(() => {
       target.scrollIntoView({ behavior: "smooth", block: "start" });
     });
-  }, []);
+  }, [isMobileViewport]);
 
   useEffect(() => {
     const timerId = window.setTimeout(() => {
@@ -791,10 +1005,46 @@ export function SettingsClient() {
   }, []);
 
   useEffect(() => {
-    scrollToHashTarget();
-    window.addEventListener("hashchange", scrollToHashTarget);
-    return () => window.removeEventListener("hashchange", scrollToHashTarget);
-  }, [scrollToHashTarget]);
+    if (typeof window === "undefined") {
+      return;
+    }
+    const media = window.matchMedia("(max-width: 719px)");
+    const apply = () => setIsMobileViewport(media.matches);
+    apply();
+    media.addEventListener("change", apply);
+    return () => media.removeEventListener("change", apply);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const handleHashChange = () => {
+      scrollToHashTarget();
+      syncOverlayWithHash();
+    };
+    handleHashChange();
+    window.addEventListener("hashchange", handleHashChange);
+    return () => window.removeEventListener("hashchange", handleHashChange);
+  }, [scrollToHashTarget, syncOverlayWithHash]);
+
+  useEffect(() => {
+    const timerId = window.setTimeout(() => {
+      scrollToHashTarget();
+      syncOverlayWithHash();
+    }, 0);
+    return () => window.clearTimeout(timerId);
+  }, [isMobileViewport, scrollToHashTarget, syncOverlayWithHash]);
+
+  useEffect(() => {
+    if (!copyPathMessage) {
+      return;
+    }
+    const timerId = window.setTimeout(() => {
+      setCopyPathMessage(null);
+    }, 4000);
+    return () => window.clearTimeout(timerId);
+  }, [copyPathMessage]);
 
   useEffect(() => {
     const timerId = window.setTimeout(() => {
@@ -837,59 +1087,77 @@ export function SettingsClient() {
     };
   }, [isSignedIn, oneDrive, sharedRoot]);
 
-  return (
-    <div className="section-stack">
-      <h1 className="settings-page-title">Settings</h1>
+  const shareLinkDetail =
+    typeof shareLinkState.payload === "string" ? shareLinkState.payload : null;
 
-      <section className="app-surface settings-anchor" id="provider-sign-in">
-        <h2>Provider &amp; sign-in</h2>
-        <div className="settings-row-grid" role="list">
-          <div className="settings-row" role="listitem">
-            <span className="app-muted">Provider</span>
-            <strong>OneDrive</strong>
-          </div>
-          <div className="settings-row" role="listitem">
-            <span className="app-muted">Signed in as</span>
-            <strong>
-              {isSignedIn ? (account?.name ?? account?.username ?? "Unknown") : "Not signed in"}
-            </strong>
-          </div>
+  const renderProviderBody = () => (
+    <>
+      <div className="settings-row-grid" role="list">
+        <div className="settings-row" role="listitem">
+          <span className="app-muted">Provider</span>
+          <strong>OneDrive</strong>
         </div>
-        <p className="app-muted" style={{ marginTop: 8 }}>
-          {signInStatus}
-        </p>
-        <div className="app-actions" style={{ marginTop: 12 }}>
-          {status === "signed_in" ? (
-            <Button onClick={signOut} disabled={isAuthLoading}>
-              Sign out
-            </Button>
-          ) : (
-            <Button appearance="primary" onClick={signIn} disabled={isAuthLoading || isAuthBlocked}>
-              Sign in
-            </Button>
-          )}
-          {isAuthLoading ? <Spinner size="tiny" /> : null}
+        <div className="settings-row" role="listitem">
+          <span className="app-muted">Signed in as</span>
+          <strong>{isSignedIn ? accountLabel : "Not signed in"}</strong>
         </div>
-        {error ? (
-          <div className="app-alert app-alert-error" role="alert">
-            <Text>{error}</Text>
-          </div>
-        ) : null}
-      </section>
+      </div>
+      <p className="app-muted" style={{ marginTop: 8 }}>
+        {signInStatus}
+      </p>
+      <div className="app-actions" style={{ marginTop: 12 }}>
+        {status === "signed_in" ? (
+          <Button onClick={signOut} disabled={isAuthLoading}>
+            Sign out
+          </Button>
+        ) : (
+          <Button appearance="primary" onClick={signIn} disabled={isAuthLoading || isAuthBlocked}>
+            Sign in
+          </Button>
+        )}
+        {isAuthLoading ? <Spinner size="tiny" /> : null}
+      </div>
+      {error ? (
+        <div className="app-alert app-alert-error" role="alert">
+          <Text>{error}</Text>
+        </div>
+      ) : null}
+    </>
+  );
 
-      <section className="app-surface settings-anchor" id="connection-health">
-        <h2>Connection health</h2>
-        <p className="app-muted">Status details and recovery actions are grouped here.</p>
-        <div className="settings-status-line" role="status" aria-live="polite">
-          <span className={`status-dot status-dot-${currentSyncMeta.tone}`} aria-hidden />
-          <span>
-            Status: <strong>{currentSyncMeta.label}</strong>
-          </span>
-        </div>
-        <p className="app-muted" title={lastSyncAbsolute ?? undefined}>
-          Last sync: {lastSyncRelative}
-        </p>
-        <div className="settings-row-grid" role="list">
+  const renderConnectionHealthBody = () => (
+    <>
+      <p className="app-muted">Status details and recovery actions are grouped here.</p>
+      <div className="settings-status-line" role="status" aria-live="polite">
+        <span className={`status-dot status-dot-${currentSyncMeta.tone}`} aria-hidden />
+        <span>
+          Status: <strong>{currentSyncMeta.label}</strong>
+        </span>
+      </div>
+      <p className="app-muted" title={lastSyncAbsolute ?? undefined}>
+        Last sync: {lastSyncRelative}
+      </p>
+      <div className="app-actions" style={{ marginTop: 12 }}>
+        <Button onClick={() => void handleRetryNow()} disabled={retryNowDisabled}>
+          Retry now
+        </Button>
+        <Button onClick={() => void handleClearCacheAndReload()} disabled={isSyncWorking}>
+          Clear cache &amp; reload
+        </Button>
+        <Button
+          onClick={() => void handleReloadFromCloud()}
+          disabled={!isSignedIn || !data.isOnline || isSyncWorking || data.activity !== "idle"}
+        >
+          Reload from cloud
+        </Button>
+        {isSyncWorking ? <Spinner size="tiny" /> : null}
+      </div>
+      {retryNowDisabled && retryNowDisabledReason ? (
+        <p className="app-muted settings-help-text">{retryNowDisabledReason}</p>
+      ) : null}
+      <details className="settings-details" style={{ marginTop: 12 }}>
+        <summary>Show details</summary>
+        <div className="settings-row-grid" role="list" style={{ marginTop: 12 }}>
           <div className="settings-row" role="listitem">
             <span className="app-muted">Retry queue</span>
             <strong>{data.retryQueueCount}</strong>
@@ -899,61 +1167,34 @@ export function SettingsClient() {
             <strong>{data.snapshot?.version ?? "—"}</strong>
           </div>
         </div>
-        <div className="app-actions" style={{ marginTop: 12 }}>
-          {retryNowDisabled && retryNowDisabledReason ? (
-            <span
-              className="settings-tooltip-target"
-              tabIndex={0}
-              role="note"
-              aria-label={retryNowDisabledReason}
-              title={retryNowDisabledReason}
-            >
-              <Button onClick={() => void handleRetryNow()} disabled>
-                Retry now
-              </Button>
-            </span>
-          ) : (
-            <Button onClick={() => void handleRetryNow()} disabled={retryNowDisabled}>
-              Retry now
-            </Button>
-          )}
-          <Button onClick={() => void handleClearCacheAndReload()} disabled={isSyncWorking}>
-            Clear cache &amp; reload
-          </Button>
-          <Button
-            onClick={() => void handleReloadFromCloud()}
-            disabled={!isSignedIn || !data.isOnline || isSyncWorking || data.activity !== "idle"}
-          >
-            Reload from cloud
-          </Button>
-          {isSyncWorking ? <Spinner size="tiny" /> : null}
+      </details>
+      {syncState.message ? (
+        <div
+          className={`app-alert ${syncState.status === "error" ? "app-alert-error" : ""}`}
+          role="status"
+        >
+          <Text>{syncState.message}</Text>
         </div>
-        {retryNowDisabled && retryNowDisabledReason ? (
-          <p className="app-muted settings-help-text">{retryNowDisabledReason}</p>
-        ) : null}
-        {syncState.message ? (
-          <div
-            className={`app-alert ${syncState.status === "error" ? "app-alert-error" : ""}`}
-            role="status"
-          >
-            <Text>{syncState.message}</Text>
-          </div>
-        ) : null}
-        {data.message ? (
-          <div className="app-alert" role="status">
-            <Text>{data.message}</Text>
-          </div>
-        ) : null}
-        {data.error ? (
-          <div className="app-alert app-alert-error" role="alert">
-            <Text>{data.error}</Text>
-          </div>
-        ) : null}
-      </section>
+      ) : null}
+      {data.message ? (
+        <div className="app-alert" role="status">
+          <Text>{data.message}</Text>
+        </div>
+      ) : null}
+      {data.error ? (
+        <div className="app-alert app-alert-error" role="alert">
+          <Text>{data.error}</Text>
+        </div>
+      ) : null}
+    </>
+  );
 
-      <section className="app-surface settings-anchor" id="shared">
-        <h2>Shared</h2>
-        <p className="app-muted">Manage shared folder selection in one place.</p>
+  const renderSharedBody = () => (
+    <>
+      <p className="app-muted">Manage shared folder selection in one place.</p>
+      <div className="settings-subsection">
+        <h3>Shared folder</h3>
+        <p className="app-muted">Select or create the shared folder used by this app.</p>
         <div className="settings-row-grid" role="list">
           <div className="settings-row" role="listitem">
             <span className="app-muted">Selected folder</span>
@@ -962,23 +1203,29 @@ export function SettingsClient() {
             </strong>
           </div>
           <div className="settings-row" role="listitem">
-            <span className="app-muted">Location</span>
-            <strong>{appRootLabel}</strong>
-          </div>
-          <div className="settings-row" role="listitem">
             <span className="app-muted">Access</span>
-            <strong>
-              {!effectiveSelection
-                ? "Not selected"
-                : sharedAccess.status === "loading"
-                  ? "Checking..."
-                  : (sharedAccess.message ?? "Unknown")}
-            </strong>
+            {sharedAccess.status === "ready" ? (
+              <span className="settings-chip">{sharedAccess.message ?? "Unknown"}</span>
+            ) : (
+              <strong>{sharedAccessLabel}</strong>
+            )}
           </div>
           <div className="settings-row" role="listitem">
             <span className="app-muted">Available folders</span>
             <strong>{sharedRoots.length}</strong>
           </div>
+        </div>
+        <div className="settings-location">
+          <span className="app-muted">Location</span>
+          <div className="settings-location-row">
+            <span className="settings-truncate" title={appRootLabel}>
+              {appRootLabel}
+            </span>
+            <Button onClick={() => void handleCopySharedPath()}>Copy path</Button>
+          </div>
+          {copyPathMessage ? (
+            <p className="app-muted settings-help-text">{copyPathMessage}</p>
+          ) : null}
         </div>
         <div style={{ marginTop: 12 }}>
           <label className="app-muted" htmlFor="settings-shared-folder">
@@ -1000,9 +1247,6 @@ export function SettingsClient() {
             ))}
           </select>
         </div>
-        <p className="app-muted" style={{ marginTop: 10 }}>
-          Creating a folder doesn&apos;t share it automatically.
-        </p>
         <div className="app-actions" style={{ marginTop: 12 }}>
           <Button
             onClick={() => {
@@ -1023,44 +1267,9 @@ export function SettingsClient() {
             <Spinner size="tiny" />
           ) : null}
         </div>
-        <div className="settings-share-link-panel">
-          <p className="app-muted">Create and copy a share link for the selected folder.</p>
-          <div className="app-actions" style={{ marginTop: 12 }}>
-            <Button
-              onClick={() => void handleCreateShareLink("view")}
-              disabled={isShareLinkDisabled}
-            >
-              Create share link (View)
-            </Button>
-            <Button
-              onClick={() => void handleCreateShareLink("edit")}
-              disabled={isShareLinkDisabled}
-            >
-              Create share link (Edit)
-            </Button>
-            {isShareLinkWorking ? <Spinner size="tiny" /> : null}
-          </div>
-          {shareLinkDisabledReason ? (
-            <p className="app-muted settings-help-text">{shareLinkDisabledReason}</p>
-          ) : null}
-          {shareLinkUrl ? (
-            <div className="settings-share-link-row">
-              <input
-                className="settings-text-input settings-share-link-input"
-                value={shareLinkUrl}
-                readOnly
-                aria-label="Share link"
-              />
-              <Button onClick={() => void handleCopyShareLink()} disabled={isShareLinkWorking}>
-                Copy
-              </Button>
-            </div>
-          ) : null}
-          <p className="app-muted" style={{ marginTop: 10 }}>
-            Creating a link doesn&apos;t share it automatically - only people you send the link to
-            can access it.
-          </p>
-        </div>
+        <p className="app-muted" style={{ marginTop: 10 }}>
+          Creating a folder doesn&apos;t share it automatically.
+        </p>
         {sharedRootsState.message ? (
           <div
             className={`app-alert ${sharedRootsState.status === "error" ? "app-alert-error" : ""}`}
@@ -1073,12 +1282,69 @@ export function SettingsClient() {
             <Text>{sharedState.message}</Text>
           </div>
         ) : null}
+        {sharedAccess.status === "error" && sharedAccess.message ? (
+          <div className="app-alert app-alert-error" role="alert">
+            <Text>{sharedAccess.message}</Text>
+          </div>
+        ) : null}
+      </div>
+      <div className="settings-subsection">
+        <h3>Share link</h3>
+        <p className="app-muted">Create a share link for the selected folder.</p>
+        <div className="settings-field">
+          <span className="app-muted">Access type</span>
+          <RadioGroup
+            value={shareLinkPermission}
+            onChange={(_, radioData) =>
+              setShareLinkPermission(radioData.value as ShareLinkPermission)
+            }
+            aria-label="Share link access type"
+            className="settings-access-type"
+          >
+            <Radio value="view" label="View" />
+            <Radio value="edit" label="Edit" />
+          </RadioGroup>
+        </div>
+        <div className="app-actions" style={{ marginTop: 12 }}>
+          <Button onClick={() => void handleCreateShareLink()} disabled={isShareLinkDisabled}>
+            Create link
+          </Button>
+          {isShareLinkWorking ? <Spinner size="tiny" /> : null}
+        </div>
+        {shareLinkDisabledReason ? (
+          <p className="app-muted settings-help-text">{shareLinkDisabledReason}</p>
+        ) : null}
+        {shareLinkUrl ? (
+          <div className="settings-share-link-row">
+            <input
+              className="settings-text-input settings-share-link-input"
+              value={shareLinkUrl}
+              readOnly
+              aria-label="Share link"
+            />
+            <Button onClick={() => void handleCopyShareLink()} disabled={isShareLinkWorking}>
+              Copy
+            </Button>
+          </div>
+        ) : null}
+        <p className="app-muted" style={{ marginTop: 10 }}>
+          Creating a link doesn&apos;t share it automatically - only people you send the link to can
+          access it.
+        </p>
         {shareLinkState.message ? (
           <div
             className={`app-alert ${shareLinkState.status === "error" ? "app-alert-error" : ""}`}
             role="status"
           >
             <Text>{shareLinkState.message}</Text>
+            {shareLinkDetail ? (
+              <details className="settings-details" style={{ marginTop: 10 }}>
+                <summary>Show details</summary>
+                <p className="app-muted" style={{ marginTop: 8 }}>
+                  {shareLinkDetail}
+                </p>
+              </details>
+            ) : null}
             {shareLinkState.status === "error" && sharedRoot ? (
               <div className="app-actions" style={{ marginTop: 8 }}>
                 <Button onClick={() => void handleOpenInOneDrive()} disabled={isShareLinkWorking}>
@@ -1088,132 +1354,211 @@ export function SettingsClient() {
             ) : null}
           </div>
         ) : null}
-      </section>
+      </div>
+    </>
+  );
 
-      <section className="app-surface settings-anchor" id="appearance">
-        <h2>Appearance</h2>
-        <p className="app-muted">Use system setting or choose a theme manually.</p>
-        <RadioGroup
-          value={preference}
-          onChange={(_, radioData) => setPreference(radioData.value as ThemePreference)}
-          aria-label="Theme selection"
-        >
-          <Radio value="system" label="System" />
-          <Radio value="light" label="Light" />
-          <Radio value="dark" label="Dark" />
-        </RadioGroup>
-        <p className="app-muted">
-          Current mode:{" "}
-          <span suppressHydrationWarning>
-            {isMounted ? (mode === "dark" ? "Dark" : "Light") : "Light"}
-          </span>
-        </p>
-      </section>
+  const renderAppearanceBody = () => (
+    <>
+      <p className="app-muted">Use system setting or choose a theme manually.</p>
+      <RadioGroup
+        value={preference}
+        onChange={(_, radioData) => setPreference(radioData.value as ThemePreference)}
+        aria-label="Theme selection"
+      >
+        <Radio value="system" label="System" />
+        <Radio value="light" label="Light" />
+        <Radio value="dark" label="Dark" />
+      </RadioGroup>
+      <p className="app-muted">
+        Current mode:{" "}
+        <span suppressHydrationWarning>
+          {isMounted ? (mode === "dark" ? "Dark" : "Light") : "Light"}
+        </span>
+      </p>
+    </>
+  );
 
-      <section className="app-surface settings-anchor" id="advanced-diagnostics">
-        <h2>Advanced / Diagnostics</h2>
-        <details className="settings-details">
-          <summary>Show diagnostics</summary>
-          <div className="section-stack" style={{ marginTop: 12 }}>
-            <div className="app-surface">
-              <h3>OneDrive checks</h3>
-              <p className="app-muted">Run low-level checks against the app folder.</p>
-              <div className="app-actions">
-                <Button onClick={handleEnsureRoot} disabled={!isSignedIn || isDriveWorking}>
-                  Check app folder
-                </Button>
-                <Button onClick={handleWriteTestFile} disabled={!isSignedIn || isDriveWorking}>
-                  Write test file
-                </Button>
-                <Button onClick={handleReadTestFile} disabled={!isSignedIn || isDriveWorking}>
-                  Read test file
-                </Button>
-                {isDriveWorking ? <Spinner size="tiny" /> : null}
-              </div>
-              <p className="app-muted">Test file: {DEFAULT_TEST_FILE_NAME}</p>
-              {driveState.message ? (
-                <div
-                  className={`app-alert ${driveState.status === "error" ? "app-alert-error" : ""}`}
-                  role="status"
-                >
-                  <Text>{driveState.message}</Text>
-                </div>
-              ) : null}
-              {driveState.payload ? (
-                <pre className="app-code">{formatPayload(driveState.payload)}</pre>
-              ) : null}
-            </div>
-
-            <div className="app-surface">
-              <h3>Export</h3>
-              <p className="app-muted">
-                Download snapshots and event logs for personal data or the selected shared folder.
-              </p>
-              <div className="app-actions">
-                <Button
-                  onClick={() => void handleExportSnapshot("personal")}
-                  disabled={!isSignedIn || isExportWorking}
-                >
-                  Download personal snapshot
-                </Button>
-                <Button
-                  onClick={() => void handleExportEvents("personal")}
-                  disabled={!isSignedIn || isExportWorking}
-                >
-                  Download personal events
-                </Button>
-                <Button
-                  onClick={() => void handleExportSnapshot("shared")}
-                  disabled={!isSignedIn || isExportWorking || !sharedRoot}
-                >
-                  Download shared snapshot
-                </Button>
-                <Button
-                  onClick={() => void handleExportEvents("shared")}
-                  disabled={!isSignedIn || isExportWorking || !sharedRoot}
-                >
-                  Download shared events
-                </Button>
-                {isExportWorking ? <Spinner size="tiny" /> : null}
-              </div>
-              {exportState.message ? (
-                <div
-                  className={`app-alert ${exportState.status === "error" ? "app-alert-error" : ""}`}
-                  role="status"
-                >
-                  <Text>{exportState.message}</Text>
-                </div>
-              ) : null}
-            </div>
+  const renderAdvancedBody = () => (
+    <details className="settings-details">
+      <summary>Show diagnostics</summary>
+      <div className="section-stack" style={{ marginTop: 12 }}>
+        <div className="app-surface">
+          <h3>OneDrive checks</h3>
+          <p className="app-muted">Run low-level checks against the app folder.</p>
+          <div className="app-actions">
+            <Button onClick={handleEnsureRoot} disabled={!isSignedIn || isDriveWorking}>
+              Check app folder
+            </Button>
+            <Button onClick={handleWriteTestFile} disabled={!isSignedIn || isDriveWorking}>
+              Write test file
+            </Button>
+            <Button onClick={handleReadTestFile} disabled={!isSignedIn || isDriveWorking}>
+              Read test file
+            </Button>
+            {isDriveWorking ? <Spinner size="tiny" /> : null}
           </div>
-        </details>
-      </section>
-
-      <section className="app-surface settings-anchor danger-zone" id="danger-zone">
-        <h2>Danger zone</h2>
-        <p className="app-muted">
-          Delete cloud data removes the app folder content under your configured app root in
-          OneDrive.
-        </p>
-        <div className="app-actions" style={{ marginTop: 12 }}>
-          <Button
-            appearance="secondary"
-            onClick={openDeleteDialog}
-            disabled={!isSignedIn || isDangerWorking}
-          >
-            Delete cloud data
-          </Button>
-          {isDangerWorking ? <Spinner size="tiny" /> : null}
+          <p className="app-muted">Test file: {DEFAULT_TEST_FILE_NAME}</p>
+          {driveState.message ? (
+            <div
+              className={`app-alert ${driveState.status === "error" ? "app-alert-error" : ""}`}
+              role="status"
+            >
+              <Text>{driveState.message}</Text>
+            </div>
+          ) : null}
+          {driveState.payload ? (
+            <pre className="app-code">{formatPayload(driveState.payload)}</pre>
+          ) : null}
         </div>
-        {dangerState.message ? (
-          <div
-            className={`app-alert ${dangerState.status === "error" ? "app-alert-error" : ""}`}
-            role="status"
-          >
-            <Text>{dangerState.message}</Text>
+
+        <div className="app-surface">
+          <h3>Export</h3>
+          <p className="app-muted">
+            Download snapshots and event logs for personal data or the selected shared folder.
+          </p>
+          <div className="app-actions">
+            <Button
+              onClick={() => void handleExportSnapshot("personal")}
+              disabled={!isSignedIn || isExportWorking}
+            >
+              Download personal snapshot
+            </Button>
+            <Button
+              onClick={() => void handleExportEvents("personal")}
+              disabled={!isSignedIn || isExportWorking}
+            >
+              Download personal events
+            </Button>
+            <Button
+              onClick={() => void handleExportSnapshot("shared")}
+              disabled={!isSignedIn || isExportWorking || !sharedRoot}
+            >
+              Download shared snapshot
+            </Button>
+            <Button
+              onClick={() => void handleExportEvents("shared")}
+              disabled={!isSignedIn || isExportWorking || !sharedRoot}
+            >
+              Download shared events
+            </Button>
+            {isExportWorking ? <Spinner size="tiny" /> : null}
           </div>
-        ) : null}
-      </section>
+          {exportState.message ? (
+            <div
+              className={`app-alert ${exportState.status === "error" ? "app-alert-error" : ""}`}
+              role="status"
+            >
+              <Text>{exportState.message}</Text>
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </details>
+  );
+
+  const renderDangerBody = () => (
+    <>
+      <p className="app-muted">
+        Delete cloud data removes the app folder content under your configured app root in OneDrive.
+      </p>
+      <div className="app-actions" style={{ marginTop: 12 }}>
+        <Button
+          appearance="secondary"
+          onClick={openDeleteDialog}
+          disabled={!isSignedIn || isDangerWorking}
+        >
+          Delete cloud data
+        </Button>
+        {isDangerWorking ? <Spinner size="tiny" /> : null}
+      </div>
+      {dangerState.message ? (
+        <div
+          className={`app-alert ${dangerState.status === "error" ? "app-alert-error" : ""}`}
+          role="status"
+        >
+          <Text>{dangerState.message}</Text>
+        </div>
+      ) : null}
+    </>
+  );
+
+  const renderSectionBody = (sectionId: SettingsSectionId) => {
+    switch (sectionId) {
+      case "provider-sign-in":
+        return renderProviderBody();
+      case "connection-health":
+        return renderConnectionHealthBody();
+      case "shared":
+        return renderSharedBody();
+      case "appearance":
+        return renderAppearanceBody();
+      case "advanced-diagnostics":
+        return renderAdvancedBody();
+      case "danger-zone":
+        return renderDangerBody();
+      default:
+        return null;
+    }
+  };
+
+  return (
+    <div className="section-stack">
+      <h1 className="settings-page-title">Settings</h1>
+      <div className="settings-mobile-only">
+        <div className="settings-mobile-list" role="list">
+          {settingsListItems.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              className={`settings-mobile-item ${
+                item.tone === "danger" ? "settings-mobile-item-danger" : ""
+              }`}
+              onClick={() => openSection(item.id)}
+              role="listitem"
+              aria-label={`${item.title}. ${item.summary}`}
+            >
+              <span className="settings-mobile-item-title">{item.title}</span>
+              <span className="settings-mobile-item-summary">{item.summary}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="settings-desktop-only section-stack">
+        {SETTINGS_SECTION_IDS.map((sectionId) => (
+          <section
+            key={sectionId}
+            className={`app-surface settings-anchor ${
+              sectionId === "danger-zone" ? "danger-zone" : ""
+            }`}
+            id={sectionId}
+          >
+            <h2>{SETTINGS_SECTION_TITLES[sectionId]}</h2>
+            {renderSectionBody(sectionId)}
+          </section>
+        ))}
+      </div>
+
+      {isMobileViewport && activeSectionId ? (
+        <div className="settings-overlay" onClick={closeSection}>
+          <section
+            className="settings-drawer"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby={`settings-overlay-title-${activeSectionId}`}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="settings-drawer-header">
+              <strong id={`settings-overlay-title-${activeSectionId}`}>
+                {SETTINGS_SECTION_TITLES[activeSectionId]}
+              </strong>
+              <Button onClick={closeSection}>Close</Button>
+            </header>
+            <div className="section-stack">{renderSectionBody(activeSectionId)}</div>
+          </section>
+        </div>
+      ) : null}
 
       {createDialogOpen ? (
         <div className="settings-modal-overlay" onClick={() => setCreateDialogOpen(false)}>
