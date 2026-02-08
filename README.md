@@ -80,7 +80,6 @@ This app supports **Personal Microsoft accounts only**.
 3. Configure delegated Microsoft Graph permissions:
    - `User.Read`
    - `Files.ReadWrite`
-
 4. Update `.env.local` with your values:
    - `NEXT_PUBLIC_MSAL_CLIENT_ID`
    - `NEXT_PUBLIC_MSAL_REDIRECT_URI`
@@ -115,13 +114,16 @@ npm test
 npm run check
 ```
 
-## 🚀 Deployment (dev)
+## 🚀 Deployment
 
-Dev deployments are performed via **GitHub Actions** using the Vercel CLI.
+Deployments are performed via **GitHub Actions** using the Vercel CLI.
+To avoid double-deploys, Vercel's Git integration deployment should be disabled by `vercel.json`.
+
+### Dev environment
 
 The dev environment is intended to be **non-public**. Do not share the dev URL outside collaborators.
 
-### Vercel Project (dev)
+#### Vercel Project (dev)
 
 1. Create a dedicated Vercel project for dev.
 2. Configure Environment Variables on the Vercel project (dev):
@@ -132,11 +134,9 @@ The dev environment is intended to be **non-public**. Do not share the dev URL o
 
 > Note: `NEXT_PUBLIC_MSAL_REDIRECT_URI` must be registered on the Microsoft Entra app as a Redirect URI.
 
-### GitHub Actions (dev)
+#### GitHub Actions (dev)
 
-To avoid double-deploys, Vercel's Git integration deployment should be disabled by `vercel.json`.
-
-#### Required GitHub Secrets
+##### Required GitHub Secrets
 
 Set these secrets in the GitHub repository settings:
 
@@ -144,10 +144,50 @@ Set these secrets in the GitHub repository settings:
 - `VERCEL_ORG_ID_DEV`
 - `VERCEL_PROJECT_ID_DEV`
 
-#### Workflows
+##### Workflows
 
 - **Auto deploy on main**: A push to `main` deploys to the dev Vercel project.
 - **Manual deploy**: You can deploy any `ref` (branch/tag/SHA) to dev via `workflow_dispatch`.
+
+### Production environment
+
+Production is deployed to a separate Vercel project and is intended to be publicly accessible.
+
+#### Vercel Project (prod)
+
+1. Create a dedicated Vercel project for production.
+2. (Optional) Configure a custom domain for production.
+3. Configure Environment Variables on the Vercel project (prod):
+   - `NEXT_PUBLIC_MSAL_CLIENT_ID`
+   - `NEXT_PUBLIC_MSAL_REDIRECT_URI` (set to the production base URL used by the project)
+   - `NEXT_PUBLIC_MSAL_AUTHORITY` (recommended: `https://login.microsoftonline.com/consumers`)
+   - `NEXT_PUBLIC_ONEDRIVE_APP_ROOT` (recommended: `/Apps/MazemazePiggyBank/`)
+
+> Note: You can use the same Entra app registration for dev and prod, but separate registrations are recommended for isolation.
+> If you use a single registration, keep Redirect URIs minimal and do not register preview URLs.
+
+#### GitHub Actions (prod)
+
+##### Required GitHub Secrets
+
+Add these additional secrets for production:
+
+- `VERCEL_TOKEN`
+- `VERCEL_ORG_ID_PROD`
+- `VERCEL_PROJECT_ID_PROD`
+
+`VERCEL_TOKEN` is required for production deployments. Treat it as highly sensitive.
+
+##### Workflows
+
+- **Tag deploy**: Push a version tag (e.g. `v1.2.3`) to deploy to production.
+
+Example:
+
+```bash
+git tag v1.0.0
+git push --tags
+```
 
 ## 📌 Project Constraints
 
