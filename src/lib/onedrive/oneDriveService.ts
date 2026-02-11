@@ -1,11 +1,13 @@
 "use client";
 
 import { createGraphClient } from "@/lib/graph/graphClient";
-import { GraphError, isGraphError } from "@/lib/graph/graphErrors";
+import { isGraphError } from "@/lib/graph/graphErrors";
 import { parseSnapshot, type Snapshot } from "@/lib/persistence/snapshot";
+import type { LeaseRecord } from "@/lib/storage/lease";
 
 export const DEFAULT_TEST_FILE_NAME = "pb-test.json";
-const ROOT_PROBE_FILE_NAME = ".pb-root.json";
+const ROOT_PROBE_FILE_NAME = ".mpb-root.json";
+const POINTER_FILE_NAME = ".mpb-pointer.json";
 const APP_ROOT_PATH = "/me/drive/special/approot";
 const SNAPSHOT_PERSONAL_FILE_NAME = "snapshot-personal.json";
 const SNAPSHOT_SHARED_FILE_NAME = "snapshot-shared.json";
@@ -16,27 +18,10 @@ const EVENT_FILE_PREFIX = "event-";
 const EVENT_FILE_EXTENSION = ".jsonl";
 const SHARED_WITH_ME_PATH = "/me/drive/sharedWithMe";
 const SHARED_ROOT_FOLDER_NAME = "shared";
-const DEFAULT_APP_ROOT_FOLDER = "/Apps/MazemazePiggyBank/";
-
-const normalizeConfiguredAppRoot = (value: string): string => {
-  const trimmed = value.trim();
-  const withLeadingSlash = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
-  return withLeadingSlash.replace(/\/+$/, "");
-};
-
-const APP_ROOT_FOLDER = normalizeConfiguredAppRoot(
-  process.env.NEXT_PUBLIC_ONEDRIVE_APP_ROOT ?? DEFAULT_APP_ROOT_FOLDER,
-);
-const APP_SHARED_FOLDER_SEGMENT = `${APP_ROOT_FOLDER}/${SHARED_ROOT_FOLDER_NAME}`;
+const PERSONAL_ROOT_FOLDER_NAME = "personal";
+const POINTER_SCHEMA_VERSION = 1;
 
 type GraphClient = ReturnType<typeof createGraphClient>;
-
-export type LeaseRecord = {
-  holderLabel: string;
-  deviceId?: string;
-  leaseUntil: string;
-  updatedAt: string;
-};
 
 export type SharedRootReference = {
   sharedId: string;
@@ -55,6 +40,14 @@ export type SharedRootListItem = SharedRootReference & {
   name: string;
   webUrl?: string;
   isFolder: boolean;
+};
+
+type PointerRecord = {
+  schemaVersion: number;
+  updatedAt: string;
+  appRootFolderId?: string;
+  personalRootFolderId?: string;
+  sharedRootFolderId?: string;
 };
 
 export type ShareLinkPermission = "view" | "edit";
@@ -94,8 +87,6 @@ const buildChildrenPathFromSegments = (segments: string[]) =>
   segments.length === 0
     ? `${APP_ROOT_PATH}/children`
     : `${APP_ROOT_PATH}:/${buildPathFromSegments(segments)}:/children`;
-
-const buildContentPath = (fileName: string) => buildContentPathFromSegments([fileName]);
 
 const buildSharedRootPath = (root: { driveId: string; itemId: string }) =>
   `/drives/${encodePathSegment(root.driveId)}/items/${encodePathSegment(root.itemId)}`;
@@ -167,6 +158,33 @@ const parseJson = (text: string): unknown => {
 
 const isString = (value: unknown): value is string => typeof value === "string";
 
+const isPointerRecord = (value: unknown): value is PointerRecord => {
+  if (!isRecord(value)) {
+    return false;
+  }
+  if (!isString(value.updatedAt) || value.schemaVersion !== POINTER_SCHEMA_VERSION) {
+    return false;
+  }
+  if (value.appRootFolderId !== undefined && !isString(value.appRootFolderId)) {
+    return false;
+  }
+  if (value.personalRootFolderId !== undefined && !isString(value.personalRootFolderId)) {
+    return false;
+  }
+  if (value.sharedRootFolderId !== undefined && !isString(value.sharedRootFolderId)) {
+    return false;
+  }
+  return true;
+};
+
+const parsePointerRecord = (text: string): PointerRecord => {
+  const data = parseJson(text);
+  if (!isPointerRecord(data)) {
+    throw new Error("Pointer file has an invalid shape.");
+  }
+  return data;
+};
+
 const isLeaseRecord = (value: unknown): value is LeaseRecord => {
   if (
     !isRecord(value) ||
@@ -190,16 +208,6 @@ const parseLeaseRecord = (text: string): LeaseRecord => {
   return data;
 };
 
-const normalizeDrivePath = (value: string): string => value.replace(/\\/g, "/");
-
-const isUnderSharedRootPath = (value: string | null): boolean => {
-  if (!value) {
-    return false;
-  }
-  const normalized = normalizeDrivePath(value);
-  return normalized.includes(APP_SHARED_FOLDER_SEGMENT);
-};
-
 const parseSharedListItems = (data: unknown): SharedRootListItem[] => {
   if (!isRecord(data) || !Array.isArray(data.value)) {
     return [];
@@ -215,10 +223,6 @@ const parseSharedListItems = (data: unknown): SharedRootListItem[] => {
     }
     const parentReference = remoteItem.parentReference;
     if (!isRecord(parentReference)) {
-      continue;
-    }
-    const parentPath = isString(parentReference.path) ? parentReference.path : null;
-    if (!isUnderSharedRootPath(parentPath)) {
       continue;
     }
     if (!isString(remoteItem.id) || !isString(parentReference.driveId)) {
@@ -306,6 +310,49 @@ const parseDriveItem = (data: unknown, fallbackDriveId?: string): DriveItemInfo 
   };
 };
 
+const tryReadFolderById = async (
+  client: GraphClient,
+  scopes: string[],
+  itemId: string,
+): Promise<DriveItemInfo | null> => {
+  try {
+    const data = await client.getJson(`/me/drive/items/${encodePathSegment(itemId)}`, scopes);
+    const parsed = parseDriveItem(data);
+    return parsed && parsed.isFolder ? parsed : null;
+  } catch (error) {
+    if (isGraphError(error) && error.status === 404) {
+      return null;
+    }
+    throw error;
+  }
+};
+
+const readPointerRecord = async (
+  client: GraphClient,
+  scopes: string[],
+): Promise<PointerRecord | null> => {
+  try {
+    const response = await client.getText(
+      buildContentPathFromSegments([POINTER_FILE_NAME]),
+      scopes,
+    );
+    return parsePointerRecord(response);
+  } catch (error) {
+    if (isGraphError(error) && error.status === 404) {
+      return null;
+    }
+    throw error;
+  }
+};
+
+const writePointerRecord = async (
+  client: GraphClient,
+  scopes: string[],
+  record: PointerRecord,
+): Promise<void> => {
+  await client.putJson(buildContentPathFromSegments([POINTER_FILE_NAME]), record, scopes);
+};
+
 const hasWriteRole = (value: unknown): boolean => {
   if (!isRecord(value) || !Array.isArray(value.roles)) {
     return false;
@@ -348,6 +395,136 @@ const getPersonalDriveId = async (
   return isRecord(drive) && isString(drive.id) ? drive.id : null;
 };
 
+const listAppRootChildren = async (
+  client: GraphClient,
+  scopes: string[],
+): Promise<DriveItemInfo[]> => {
+  const data = await client.getJson(buildChildrenPathFromSegments([]), scopes);
+  return parseDriveItems(data);
+};
+
+const listChildFolders = async (
+  client: GraphClient,
+  scopes: string[],
+  root: { driveId: string; itemId: string },
+  name?: string,
+): Promise<DriveItemInfo[]> => {
+  const data = await client.getJson(buildSharedChildrenPathFromSegments(root, []), scopes);
+  const folders = parseDriveItems(data).filter((item) => item.isFolder);
+  if (!name) {
+    return folders;
+  }
+  return folders.filter((item) => item.name === name);
+};
+
+const hasFileByPath = async (
+  client: GraphClient,
+  scopes: string[],
+  path: string,
+): Promise<boolean> => {
+  try {
+    await client.getJson(path, scopes);
+    return true;
+  } catch (error) {
+    if (isGraphError(error) && error.status === 404) {
+      return false;
+    }
+    throw error;
+  }
+};
+
+const hasPersonalSnapshot = async (
+  client: GraphClient,
+  scopes: string[],
+  root: { driveId: string; itemId: string },
+): Promise<boolean> => {
+  try {
+    await client.getText(
+      buildSharedContentPathFromSegments(root, [SNAPSHOT_PERSONAL_FILE_NAME]),
+      scopes,
+    );
+    return true;
+  } catch (error) {
+    if (isGraphError(error) && error.status === 404) {
+      return false;
+    }
+    throw error;
+  }
+};
+
+const hasSharedSnapshot = async (
+  client: GraphClient,
+  scopes: string[],
+  root: { driveId: string; itemId: string },
+): Promise<boolean> => {
+  try {
+    await client.getText(
+      buildSharedContentPathFromSegments(root, [SNAPSHOT_SHARED_FILE_NAME]),
+      scopes,
+    );
+    return true;
+  } catch (error) {
+    if (isGraphError(error) && error.status === 404) {
+      return false;
+    }
+    throw error;
+  }
+};
+
+const selectBestCandidate = async (
+  candidates: DriveItemInfo[],
+  scorer: (candidate: DriveItemInfo) => Promise<number>,
+): Promise<DriveItemInfo> => {
+  if (candidates.length === 1) {
+    return candidates[0];
+  }
+  let best = candidates[0];
+  let bestScore = -1;
+  const sorted = [...candidates].sort((left, right) => left.id.localeCompare(right.id));
+  for (const candidate of sorted) {
+    const score = await scorer(candidate);
+    if (score > bestScore) {
+      bestScore = score;
+      best = candidate;
+    }
+  }
+  return best;
+};
+
+const scorePersonalRootCandidate = async (
+  client: GraphClient,
+  scopes: string[],
+  candidate: DriveItemInfo,
+): Promise<number> => {
+  let score = 0;
+  if (
+    await hasPersonalSnapshot(client, scopes, { driveId: candidate.driveId, itemId: candidate.id })
+  ) {
+    score += 2;
+  }
+  return score;
+};
+
+const scoreSharedRootCandidate = async (
+  client: GraphClient,
+  scopes: string[],
+  candidate: DriveItemInfo,
+): Promise<number> => {
+  const children = await listChildFolders(client, scopes, {
+    driveId: candidate.driveId,
+    itemId: candidate.id,
+  });
+  if (children.length === 0) {
+    return 0;
+  }
+  for (const child of children.slice(0, 5)) {
+    if (await hasSharedSnapshot(client, scopes, { driveId: child.driveId, itemId: child.id })) {
+      return 2;
+    }
+  }
+  return 1;
+};
+
 const resolveSharedRootCandidate = async (
   client: GraphClient,
   scopes: string[],
@@ -375,9 +552,17 @@ const resolveSharedRootCandidate = async (
   }
 
   try {
-    const children = await client.getJson(buildChildrenPathFromSegments([]), scopes);
-    const entries = parseDriveItems(children);
-    return entries.find((item) => item.name === SHARED_ROOT_FOLDER_NAME) ?? null;
+    const entries = await listAppRootChildren(client, scopes);
+    const candidates = entries.filter((item) => item.name === SHARED_ROOT_FOLDER_NAME);
+    if (candidates.length === 0) {
+      return null;
+    }
+    if (candidates.length === 1) {
+      return candidates[0];
+    }
+    return await selectBestCandidate(candidates, (candidate) =>
+      scoreSharedRootCandidate(client, scopes, candidate),
+    );
   } catch (error) {
     if (!isGraphError(error) || error.status !== 404) {
       throw error;
@@ -430,436 +615,803 @@ const ensureSharedRootFolder = async (
   return resolved;
 };
 
-export const createOneDriveService = (client: GraphClient, scopes: string[]) => ({
-  ensureAppRoot: async () => {
-    try {
-      return await client.getJson(APP_ROOT_PATH, scopes);
-    } catch (error) {
-      if (error instanceof GraphError && error.status === 404) {
-        const payload = {
-          message: "App root initialization file.",
-          createdAt: new Date().toISOString(),
-        };
-        await client.putJson(buildContentPath(ROOT_PROBE_FILE_NAME), payload, scopes);
-        return await client.getJson(APP_ROOT_PATH, scopes);
-      }
-      throw error;
+export const createOneDriveService = (client: GraphClient, scopes: string[]) => {
+  let pointerPromise: Promise<PointerRecord | null> | null = null;
+  let appRootPromise: Promise<DriveItemInfo> | null = null;
+  let personalRootPromise: Promise<DriveItemInfo> | null = null;
+  let sharedRootPromise: Promise<DriveItemInfo | null> | null = null;
+  let rootProbePromise: Promise<void> | null = null;
+  let rootProbeRootKey: string | null = null;
+
+  const resetRootCaches = () => {
+    pointerPromise = null;
+    appRootPromise = null;
+    personalRootPromise = null;
+    sharedRootPromise = null;
+    rootProbePromise = null;
+    rootProbeRootKey = null;
+  };
+
+  const getPointerRecord = async (): Promise<PointerRecord | null> => {
+    if (!pointerPromise) {
+      pointerPromise = (async () => {
+        try {
+          return await readPointerRecord(client, scopes);
+        } catch {
+          return null;
+        }
+      })();
     }
-  },
-  writeJsonFile: async (fileName: string, data: unknown) =>
-    client.putJson(buildContentPath(fileName), data, scopes),
-  readJsonFile: async (fileName: string) => {
-    const response = await client.getText(buildContentPath(fileName), scopes);
-    return parseJson(response);
-  },
-  readPersonalSnapshot: async (): Promise<{
-    snapshot: Snapshot;
-    etag: string | null;
-    lastModified: string | null;
-  }> => {
-    const response = await client.getTextWithHeaders(
-      buildContentPathFromSegments([SNAPSHOT_PERSONAL_FILE_NAME]),
-      scopes,
-    );
-    const snapshot = parseSnapshot(response.data);
-    return {
-      snapshot,
-      etag: getHeaderValue(response.headers, "ETag"),
-      lastModified: getHeaderValue(response.headers, "Last-Modified"),
+    return pointerPromise;
+  };
+
+  const updatePointerRecord = async (partial: Partial<PointerRecord>): Promise<PointerRecord> => {
+    const base = (await getPointerRecord()) ?? {
+      schemaVersion: POINTER_SCHEMA_VERSION,
+      updatedAt: new Date().toISOString(),
     };
-  },
-  writePersonalSnapshot: async (
-    snapshot: Snapshot,
-    options?: { ifMatch?: string },
-  ): Promise<{ etag: string | null }> => {
-    const response = await client.putJsonWithHeaders(
-      buildContentPathFromSegments([SNAPSHOT_PERSONAL_FILE_NAME]),
-      snapshot,
-      scopes,
-      options,
-    );
-    return {
-      etag: getHeaderValue(response.headers, "ETag") ?? extractETag(response.data),
+    const next: PointerRecord = {
+      ...base,
+      ...partial,
+      schemaVersion: POINTER_SCHEMA_VERSION,
+      updatedAt: new Date().toISOString(),
     };
-  },
-  readPersonalLease: async (): Promise<LeaseRecord | null> => {
-    try {
-      const response = await client.getText(
-        buildContentPathFromSegments([LEASES_FOLDER_NAME, LEASE_FILE_NAME]),
-        scopes,
-      );
-      return parseLeaseRecord(response);
-    } catch (error) {
-      if (isGraphError(error) && error.status === 404) {
+    await writePointerRecord(client, scopes, next);
+    pointerPromise = Promise.resolve(next);
+    return next;
+  };
+
+  const getAppRootFolder = async (): Promise<DriveItemInfo> => {
+    if (!appRootPromise) {
+      appRootPromise = (async () => {
+        const pointer = await getPointerRecord();
+        if (pointer?.appRootFolderId) {
+          const resolved = await tryReadFolderById(client, scopes, pointer.appRootFolderId);
+          if (resolved) {
+            return resolved;
+          }
+          await updatePointerRecord({ appRootFolderId: undefined });
+        }
+        const rootData = await client.getJson(APP_ROOT_PATH, scopes);
+        const driveId = await getPersonalDriveId(client, scopes);
+        const parsed = parseDriveItem(rootData, driveId ?? undefined);
+        if (!parsed || !parsed.isFolder) {
+          throw new Error("App root is unavailable.");
+        }
+        await updatePointerRecord({ appRootFolderId: parsed.id });
+        return parsed;
+      })();
+    }
+    return appRootPromise;
+  };
+
+  const getPersonalRootFolder = async (): Promise<DriveItemInfo> => {
+    if (!personalRootPromise) {
+      personalRootPromise = (async () => {
+        const pointer = await getPointerRecord();
+        if (pointer?.personalRootFolderId) {
+          const resolved = await tryReadFolderById(client, scopes, pointer.personalRootFolderId);
+          if (resolved) {
+            return resolved;
+          }
+          await updatePointerRecord({ personalRootFolderId: undefined });
+        }
+        const appRoot = await getAppRootFolder();
+        const appRootRef = { driveId: appRoot.driveId, itemId: appRoot.id };
+        const candidates = await listChildFolders(
+          client,
+          scopes,
+          appRootRef,
+          PERSONAL_ROOT_FOLDER_NAME,
+        );
+        let resolved: DriveItemInfo;
+        if (candidates.length === 0) {
+          const created = await client.postJson(
+            buildSharedChildrenPathFromSegments(appRootRef, []),
+            {
+              name: PERSONAL_ROOT_FOLDER_NAME,
+              folder: {},
+              "@microsoft.graph.conflictBehavior": "fail",
+            },
+            scopes,
+          );
+          const parsed = parseDriveItem(created, appRoot.driveId);
+          if (!parsed || !parsed.isFolder) {
+            throw new Error("Failed to create personal folder.");
+          }
+          resolved = parsed;
+        } else if (candidates.length === 1) {
+          resolved = candidates[0];
+        } else {
+          resolved = await selectBestCandidate(candidates, (candidate) =>
+            scorePersonalRootCandidate(client, scopes, candidate),
+          );
+        }
+        await updatePointerRecord({
+          appRootFolderId: appRoot.id,
+          personalRootFolderId: resolved.id,
+        });
+        return resolved;
+      })();
+    }
+    return personalRootPromise;
+  };
+
+  const getSharedRootFolder = async (options?: {
+    createIfMissing?: boolean;
+  }): Promise<DriveItemInfo | null> => {
+    if (!sharedRootPromise) {
+      sharedRootPromise = (async () => {
+        const pointer = await getPointerRecord();
+        if (pointer?.sharedRootFolderId) {
+          const resolved = await tryReadFolderById(client, scopes, pointer.sharedRootFolderId);
+          if (resolved) {
+            return resolved;
+          }
+          await updatePointerRecord({ sharedRootFolderId: undefined });
+        }
+        const candidate = await resolveSharedRootCandidate(client, scopes);
+        if (candidate && candidate.isFolder) {
+          await updatePointerRecord({
+            sharedRootFolderId: candidate.id,
+            appRootFolderId: (await getAppRootFolder()).id,
+          });
+          return candidate;
+        }
+        if (!options?.createIfMissing) {
+          return null;
+        }
+        const created = await ensureSharedRootFolder(client, scopes, { repairConflict: true });
+        if (created.isFolder) {
+          await updatePointerRecord({
+            sharedRootFolderId: created.id,
+            appRootFolderId: (await getAppRootFolder()).id,
+          });
+          return created;
+        }
         return null;
-      }
-      throw error;
+      })();
     }
-  },
-  writePersonalLease: async (lease: LeaseRecord) => {
-    await client.putJson(
-      buildContentPathFromSegments([LEASES_FOLDER_NAME, LEASE_FILE_NAME]),
-      lease,
-      scopes,
-    );
-  },
-  ensureEventsFolder: async () => {
-    try {
-      await client.getJson(buildItemPathFromSegments([EVENTS_FOLDER_NAME]), scopes);
-    } catch (error) {
-      if (isGraphError(error) && error.status === 404) {
-        try {
-          await client.postJson(
-            buildChildrenPathFromSegments([]),
-            {
-              name: EVENTS_FOLDER_NAME,
-              folder: {},
-              "@microsoft.graph.conflictBehavior": "fail",
-            },
-            scopes,
-          );
-        } catch (creationError) {
-          if (isGraphError(creationError) && creationError.status === 409) {
-            return;
-          }
-          throw creationError;
-        }
+    return sharedRootPromise;
+  };
+
+  const getPersonalRootReference = async (): Promise<{ driveId: string; itemId: string }> => {
+    const root = await getPersonalRootFolder();
+    return { driveId: root.driveId, itemId: root.id };
+  };
+
+  const ensureRootProbe = async (root: { driveId: string; itemId: string }) => {
+    const rootKey = `${root.driveId}:${root.itemId}`;
+    if (rootProbePromise && rootProbeRootKey === rootKey) {
+      return rootProbePromise;
+    }
+    rootProbeRootKey = rootKey;
+    rootProbePromise = (async () => {
+      const probePath = buildSharedItemPathFromSegments(root, [ROOT_PROBE_FILE_NAME]);
+      if (await hasFileByPath(client, scopes, probePath)) {
         return;
       }
+      const payload = {
+        message: "App root initialization file.",
+        createdAt: new Date().toISOString(),
+      };
+      await client.putJson(
+        buildSharedContentPathFromSegments(root, [ROOT_PROBE_FILE_NAME]),
+        payload,
+        scopes,
+      );
+    })().catch((error) => {
+      if (rootProbeRootKey === rootKey) {
+        rootProbePromise = null;
+        rootProbeRootKey = null;
+      }
       throw error;
-    }
-  },
-  ensureLeasesFolder: async () => {
-    try {
-      await client.getJson(buildItemPathFromSegments([LEASES_FOLDER_NAME]), scopes);
-    } catch (error) {
-      if (isGraphError(error) && error.status === 404) {
-        try {
-          await client.postJson(
-            buildChildrenPathFromSegments([]),
-            {
-              name: LEASES_FOLDER_NAME,
-              folder: {},
-              "@microsoft.graph.conflictBehavior": "fail",
-            },
-            scopes,
-          );
-        } catch (creationError) {
-          if (isGraphError(creationError) && creationError.status === 409) {
-            return;
-          }
-          throw creationError;
+    });
+    return rootProbePromise;
+  };
+
+  return {
+    ensureAppRoot: async () => {
+      const root = await getAppRootFolder();
+      await ensureRootProbe({ driveId: root.driveId, itemId: root.id });
+      await getPersonalRootFolder();
+      return root;
+    },
+    writeJsonFile: async (fileName: string, data: unknown) => {
+      const personal = await getPersonalRootReference();
+      await client.putJson(buildSharedContentPathFromSegments(personal, [fileName]), data, scopes);
+    },
+    readJsonFile: async (fileName: string) => {
+      const personal = await getPersonalRootReference();
+      const response = await client.getText(
+        buildSharedContentPathFromSegments(personal, [fileName]),
+        scopes,
+      );
+      return parseJson(response);
+    },
+    readPersonalSnapshot: async (): Promise<{
+      snapshot: Snapshot;
+      etag: string | null;
+      lastModified: string | null;
+    }> => {
+      const personal = await getPersonalRootReference();
+      const response = await client.getTextWithHeaders(
+        buildSharedContentPathFromSegments(personal, [SNAPSHOT_PERSONAL_FILE_NAME]),
+        scopes,
+      );
+      const snapshot = parseSnapshot(response.data);
+      return {
+        snapshot,
+        etag: getHeaderValue(response.headers, "ETag"),
+        lastModified: getHeaderValue(response.headers, "Last-Modified"),
+      };
+    },
+    writePersonalSnapshot: async (
+      snapshot: Snapshot,
+      options?: { ifMatch?: string },
+    ): Promise<{ etag: string | null }> => {
+      const personal = await getPersonalRootReference();
+      const response = await client.putJsonWithHeaders(
+        buildSharedContentPathFromSegments(personal, [SNAPSHOT_PERSONAL_FILE_NAME]),
+        snapshot,
+        scopes,
+        options,
+      );
+      return {
+        etag: getHeaderValue(response.headers, "ETag") ?? extractETag(response.data),
+      };
+    },
+    readPersonalLease: async (): Promise<LeaseRecord | null> => {
+      const personal = await getPersonalRootReference();
+      try {
+        const response = await client.getText(
+          buildSharedContentPathFromSegments(personal, [LEASES_FOLDER_NAME, LEASE_FILE_NAME]),
+          scopes,
+        );
+        return parseLeaseRecord(response);
+      } catch (error) {
+        if (isGraphError(error) && error.status === 404) {
+          return null;
         }
-        return;
-      }
-      throw error;
-    }
-  },
-  listEventChunkIds: async (): Promise<number[]> => {
-    try {
-      const data = await client.getJson(
-        buildChildrenPathFromSegments([EVENTS_FOLDER_NAME]),
-        scopes,
-      );
-      const names = parseChildNames(data);
-      return names
-        .map(parseEventChunkId)
-        .filter((value): value is number => typeof value === "number");
-    } catch (error) {
-      if (isGraphError(error) && error.status === 404) {
-        return [];
-      }
-      throw error;
-    }
-  },
-  writeEventChunk: async (chunkId: number, content: string) => {
-    await client.putText(
-      buildContentPathFromSegments([
-        EVENTS_FOLDER_NAME,
-        `${EVENT_FILE_PREFIX}${chunkId}${EVENT_FILE_EXTENSION}`,
-      ]),
-      content,
-      scopes,
-    );
-  },
-  readEventChunk: async (chunkId: number): Promise<string> =>
-    client.getText(
-      buildContentPathFromSegments([
-        EVENTS_FOLDER_NAME,
-        `${EVENT_FILE_PREFIX}${chunkId}${EVENT_FILE_EXTENSION}`,
-      ]),
-      scopes,
-    ),
-  ensureSharedRootFolder: async (): Promise<SharedRootListItem> => {
-    const folder = await ensureSharedRootFolder(client, scopes);
-    return toSharedRootListItem(folder);
-  },
-  createSharedFolder: async (name: string): Promise<SharedRootListItem> => {
-    const normalized = name.trim();
-    if (!normalized) {
-      throw new Error("Folder name is required.");
-    }
-    await ensureSharedRootFolder(client, scopes, { repairConflict: true });
-    const created = await client.postJson(
-      buildChildrenPathFromSegments([SHARED_ROOT_FOLDER_NAME]),
-      {
-        name: normalized,
-        folder: {},
-        "@microsoft.graph.conflictBehavior": "fail",
-      },
-      scopes,
-    );
-    const parsed = parseDriveItem(created);
-    if (parsed && parsed.isFolder) {
-      return toSharedRootListItem(parsed);
-    }
-    const childrenData = await client.getJson(
-      buildChildrenPathFromSegments([SHARED_ROOT_FOLDER_NAME]),
-      scopes,
-    );
-    const fallback = parseDriveItems(childrenData).find(
-      (item) => item.isFolder && item.name === normalized,
-    );
-    if (fallback) {
-      return toSharedRootListItem(fallback);
-    }
-    const driveId = await getPersonalDriveId(client, scopes);
-    const fallbackParsed = driveId ? parseDriveItem(created, driveId) : null;
-    if (fallbackParsed && fallbackParsed.isFolder) {
-      return toSharedRootListItem(fallbackParsed);
-    }
-    throw new Error("Failed to create shared folder.");
-  },
-  createShareLink: async (
-    root: SharedRootReference,
-    permission: ShareLinkPermission,
-  ): Promise<ShareLinkResult> => {
-    const path = `${buildSharedRootPath(root)}/createLink`;
-    let response: unknown;
-    try {
-      response = await client.postJson(
-        path,
-        {
-          type: permission,
-          scope: "anonymous",
-        },
-        scopes,
-      );
-    } catch (error) {
-      if (!isGraphError(error) || error.status !== 400) {
         throw error;
       }
-      response = await client.postJson(
-        path,
-        {
-          type: permission,
-        },
+    },
+    writePersonalLease: async (lease: LeaseRecord) => {
+      const personal = await getPersonalRootReference();
+      await client.putJson(
+        buildSharedContentPathFromSegments(personal, [LEASES_FOLDER_NAME, LEASE_FILE_NAME]),
+        lease,
         scopes,
       );
-    }
-    const webUrl = parseShareLinkWebUrl(response);
-    if (!webUrl) {
-      throw new Error("Share link is unavailable.");
-    }
-    return {
-      permission,
-      webUrl,
-    };
-  },
-  deleteAppCloudData: async () => {
-    try {
-      const root = await client.getJson(APP_ROOT_PATH, scopes);
-      if (!isRecord(root) || !isString(root.id)) {
-        return;
+    },
+    ensureEventsFolder: async () => {
+      const personal = await getPersonalRootReference();
+      try {
+        await client.getJson(
+          buildSharedItemPathFromSegments(personal, [EVENTS_FOLDER_NAME]),
+          scopes,
+        );
+      } catch (error) {
+        if (isGraphError(error) && error.status === 404) {
+          try {
+            await client.postJson(
+              buildSharedChildrenPathFromSegments(personal, []),
+              {
+                name: EVENTS_FOLDER_NAME,
+                folder: {},
+                "@microsoft.graph.conflictBehavior": "fail",
+              },
+              scopes,
+            );
+          } catch (creationError) {
+            if (isGraphError(creationError) && creationError.status === 409) {
+              return;
+            }
+            throw creationError;
+          }
+          return;
+        }
+        throw error;
       }
-      await client.delete(`/me/drive/items/${encodePathSegment(root.id)}`, scopes);
-    } catch (error) {
-      if (isGraphError(error) && error.status === 404) {
-        return;
+    },
+    ensureLeasesFolder: async () => {
+      const personal = await getPersonalRootReference();
+      try {
+        await client.getJson(
+          buildSharedItemPathFromSegments(personal, [LEASES_FOLDER_NAME]),
+          scopes,
+        );
+      } catch (error) {
+        if (isGraphError(error) && error.status === 404) {
+          try {
+            await client.postJson(
+              buildSharedChildrenPathFromSegments(personal, []),
+              {
+                name: LEASES_FOLDER_NAME,
+                folder: {},
+                "@microsoft.graph.conflictBehavior": "fail",
+              },
+              scopes,
+            );
+          } catch (creationError) {
+            if (isGraphError(creationError) && creationError.status === 409) {
+              return;
+            }
+            throw creationError;
+          }
+          return;
+        }
+        throw error;
       }
-      throw error;
-    }
-  },
-  listSharedRoots: async (): Promise<SharedRootListItem[]> => {
-    const data = await client.getJson(SHARED_WITH_ME_PATH, scopes);
-    return parseSharedListItems(data).filter((item) => item.isFolder);
-  },
-  listSharedWithMeRoots: async (): Promise<SharedRootListItem[]> => {
-    const data = await client.getJson(SHARED_WITH_ME_PATH, scopes);
-    return parseSharedListItems(data).filter((item) => item.isFolder);
-  },
-  listSharedByMeRoots: async (): Promise<SharedRootListItem[]> => {
-    try {
+    },
+    listEventChunkIds: async (): Promise<number[]> => {
+      const personal = await getPersonalRootReference();
+      try {
+        const data = await client.getJson(
+          buildSharedChildrenPathFromSegments(personal, [EVENTS_FOLDER_NAME]),
+          scopes,
+        );
+        const names = parseChildNames(data);
+        return names
+          .map(parseEventChunkId)
+          .filter((value): value is number => typeof value === "number");
+      } catch (error) {
+        if (isGraphError(error) && error.status === 404) {
+          return [];
+        }
+        throw error;
+      }
+    },
+    writeEventChunk: async (
+      chunkId: number,
+      content: string,
+      _options?: { assumeMissing?: boolean },
+    ) => {
+      void _options;
+      const personal = await getPersonalRootReference();
+      await client.putText(
+        buildSharedContentPathFromSegments(personal, [
+          EVENTS_FOLDER_NAME,
+          `${EVENT_FILE_PREFIX}${chunkId}${EVENT_FILE_EXTENSION}`,
+        ]),
+        content,
+        scopes,
+      );
+    },
+    readEventChunk: async (chunkId: number): Promise<string> => {
+      const personal = await getPersonalRootReference();
+      return client.getText(
+        buildSharedContentPathFromSegments(personal, [
+          EVENTS_FOLDER_NAME,
+          `${EVENT_FILE_PREFIX}${chunkId}${EVENT_FILE_EXTENSION}`,
+        ]),
+        scopes,
+      );
+    },
+    deleteEventChunk: async (chunkId: number) => {
+      const personal = await getPersonalRootReference();
+      try {
+        await client.delete(
+          buildSharedItemPathFromSegments(personal, [
+            EVENTS_FOLDER_NAME,
+            `${EVENT_FILE_PREFIX}${chunkId}${EVENT_FILE_EXTENSION}`,
+          ]),
+          scopes,
+        );
+      } catch (error) {
+        if (isGraphError(error) && error.status === 404) {
+          return;
+        }
+        throw error;
+      }
+    },
+    deleteAllEventChunks: async () => {
+      const personal = await getPersonalRootReference();
+      try {
+        const data = await client.getJson(
+          buildSharedChildrenPathFromSegments(personal, [EVENTS_FOLDER_NAME]),
+          scopes,
+        );
+        const names = parseChildNames(data);
+        const chunkIds = names
+          .map(parseEventChunkId)
+          .filter((value): value is number => typeof value === "number");
+        await Promise.all(
+          chunkIds.map((chunkId) =>
+            client
+              .delete(
+                buildSharedItemPathFromSegments(personal, [
+                  EVENTS_FOLDER_NAME,
+                  `${EVENT_FILE_PREFIX}${chunkId}${EVENT_FILE_EXTENSION}`,
+                ]),
+                scopes,
+              )
+              .catch((error) => {
+                if (isGraphError(error) && error.status === 404) {
+                  return;
+                }
+                throw error;
+              }),
+          ),
+        );
+      } catch (error) {
+        if (isGraphError(error) && error.status === 404) {
+          return;
+        }
+        throw error;
+      }
+    },
+    ensureSharedRootFolder: async (): Promise<SharedRootListItem> => {
+      const folder = await getSharedRootFolder({ createIfMissing: true });
+      if (!folder || !folder.isFolder) {
+        throw new Error("Shared root is unavailable.");
+      }
+      return toSharedRootListItem(folder);
+    },
+    createSharedFolder: async (name: string): Promise<SharedRootListItem> => {
+      const normalized = name.trim();
+      if (!normalized) {
+        throw new Error("Folder name is required.");
+      }
+      const sharedRoot = await getSharedRootFolder({ createIfMissing: true });
+      if (!sharedRoot || !sharedRoot.isFolder) {
+        throw new Error("Shared root is unavailable.");
+      }
+      const sharedRootRef = { driveId: sharedRoot.driveId, itemId: sharedRoot.id };
+      try {
+        const created = await client.postJson(
+          buildSharedChildrenPathFromSegments(sharedRootRef, []),
+          {
+            name: normalized,
+            folder: {},
+            "@microsoft.graph.conflictBehavior": "fail",
+          },
+          scopes,
+        );
+        const parsed = parseDriveItem(created, sharedRoot.driveId);
+        if (parsed && parsed.isFolder) {
+          return toSharedRootListItem(parsed);
+        }
+      } catch (creationError) {
+        if (!isGraphError(creationError) || creationError.status !== 409) {
+          throw creationError;
+        }
+      }
+      const fallback = await listChildFolders(client, scopes, sharedRootRef, normalized);
+      if (fallback.length > 0) {
+        return toSharedRootListItem(fallback[0]);
+      }
+      throw new Error("Failed to create shared workspace.");
+    },
+    createShareLink: async (
+      root: SharedRootReference,
+      permission: ShareLinkPermission,
+    ): Promise<ShareLinkResult> => {
+      const path = `${buildSharedRootPath(root)}/createLink`;
+      let response: unknown;
+      try {
+        response = await client.postJson(
+          path,
+          {
+            type: permission,
+            scope: "anonymous",
+          },
+          scopes,
+        );
+      } catch (error) {
+        if (!isGraphError(error) || error.status !== 400) {
+          throw error;
+        }
+        response = await client.postJson(
+          path,
+          {
+            type: permission,
+          },
+          scopes,
+        );
+      }
+      const webUrl = parseShareLinkWebUrl(response);
+      if (!webUrl) {
+        throw new Error("Share link is unavailable.");
+      }
+      return {
+        permission,
+        webUrl,
+      };
+    },
+    deleteAppCloudData: async () => {
+      try {
+        const root = await client.getJson(APP_ROOT_PATH, scopes);
+        if (!isRecord(root) || !isString(root.id)) {
+          return;
+        }
+        await client.delete(`/me/drive/items/${encodePathSegment(root.id)}`, scopes);
+        resetRootCaches();
+      } catch (error) {
+        if (isGraphError(error) && error.status === 404) {
+          resetRootCaches();
+          return;
+        }
+        throw error;
+      }
+    },
+    listSharedWithMeRoots: async (): Promise<SharedRootListItem[]> => {
+      const data = await client.getJson(SHARED_WITH_ME_PATH, scopes);
+      const candidates = parseSharedListItems(data).filter((item) => item.isFolder);
+      const filtered: SharedRootListItem[] = [];
+      for (const candidate of candidates) {
+        if (
+          await hasSharedSnapshot(client, scopes, {
+            driveId: candidate.driveId,
+            itemId: candidate.itemId,
+          })
+        ) {
+          filtered.push(candidate);
+        }
+      }
+      return filtered;
+    },
+    listSharedByMeRoots: async (): Promise<SharedRootListItem[]> => {
+      const sharedRoot = await getSharedRootFolder({ createIfMissing: false });
+      if (!sharedRoot || !sharedRoot.isFolder) {
+        return [];
+      }
       const data = await client.getJson(
-        buildChildrenPathFromSegments([SHARED_ROOT_FOLDER_NAME]),
+        buildSharedChildrenPathFromSegments(
+          { driveId: sharedRoot.driveId, itemId: sharedRoot.id },
+          [],
+        ),
         scopes,
       );
       return parseDriveItems(data)
         .filter((item) => item.isFolder)
         .map((item) => toSharedRootListItem(item));
-    } catch (error) {
-      if (isGraphError(error) && error.status === 404) {
-        return [];
-      }
-      throw error;
-    }
-  },
-  getSharedRootInfo: async (root: SharedRootReference): Promise<SharedRootInfo> => {
-    const data = await client.getJson(`${buildSharedRootPath(root)}?expand=permissions`, scopes);
-    const name = isRecord(data) && isString(data.name) ? data.name : "Shared item";
-    const webUrl = isRecord(data) && isString(data.webUrl) ? data.webUrl : undefined;
-    const isFolder = isRecord(data) && isRecord(data.folder);
-    const permissions = isRecord(data) && Array.isArray(data.permissions) ? data.permissions : [];
-    const canWrite = permissions.some(hasWriteRole);
-    return {
-      sharedId: root.sharedId,
-      driveId: root.driveId,
-      itemId: root.itemId,
-      name,
-      webUrl,
-      isFolder,
-      canWrite,
-    };
-  },
-  readSharedSnapshot: async (
-    root: SharedRootReference,
-  ): Promise<{
-    snapshot: Snapshot;
-    etag: string | null;
-    lastModified: string | null;
-  }> => {
-    const response = await client.getTextWithHeaders(
-      buildSharedContentPathFromSegments(root, [SNAPSHOT_SHARED_FILE_NAME]),
-      scopes,
-    );
-    const snapshot = parseSnapshot(response.data);
-    return {
-      snapshot,
-      etag: getHeaderValue(response.headers, "ETag"),
-      lastModified: getHeaderValue(response.headers, "Last-Modified"),
-    };
-  },
-  writeSharedSnapshot: async (
-    root: SharedRootReference,
-    snapshot: Snapshot,
-    options?: { ifMatch?: string },
-  ): Promise<{ etag: string | null }> => {
-    const response = await client.putJsonWithHeaders(
-      buildSharedContentPathFromSegments(root, [SNAPSHOT_SHARED_FILE_NAME]),
-      snapshot,
-      scopes,
-      options,
-    );
-    return {
-      etag: getHeaderValue(response.headers, "ETag") ?? extractETag(response.data),
-    };
-  },
-  ensureSharedEventsFolder: async (root: SharedRootReference) => {
-    try {
-      await client.getJson(buildSharedItemPathFromSegments(root, [EVENTS_FOLDER_NAME]), scopes);
-    } catch (error) {
-      if (isGraphError(error) && error.status === 404) {
-        try {
-          await client.postJson(
-            buildSharedChildrenPathFromSegments(root, []),
-            {
-              name: EVENTS_FOLDER_NAME,
-              folder: {},
-              "@microsoft.graph.conflictBehavior": "fail",
-            },
-            scopes,
-          );
-        } catch (creationError) {
-          if (isGraphError(creationError) && creationError.status === 409) {
-            return;
-          }
-          throw creationError;
-        }
-        return;
-      }
-      throw error;
-    }
-  },
-  ensureSharedLeasesFolder: async (root: SharedRootReference) => {
-    try {
-      await client.getJson(buildSharedItemPathFromSegments(root, [LEASES_FOLDER_NAME]), scopes);
-    } catch (error) {
-      if (isGraphError(error) && error.status === 404) {
-        try {
-          await client.postJson(
-            buildSharedChildrenPathFromSegments(root, []),
-            {
-              name: LEASES_FOLDER_NAME,
-              folder: {},
-              "@microsoft.graph.conflictBehavior": "fail",
-            },
-            scopes,
-          );
-        } catch (creationError) {
-          if (isGraphError(creationError) && creationError.status === 409) {
-            return;
-          }
-          throw creationError;
-        }
-        return;
-      }
-      throw error;
-    }
-  },
-  listSharedEventChunkIds: async (root: SharedRootReference): Promise<number[]> => {
-    try {
-      const data = await client.getJson(
-        buildSharedChildrenPathFromSegments(root, [EVENTS_FOLDER_NAME]),
+    },
+    getSharedRootInfo: async (root: SharedRootReference): Promise<SharedRootInfo> => {
+      const data = await client.getJson(`${buildSharedRootPath(root)}?expand=permissions`, scopes);
+      const name = isRecord(data) && isString(data.name) ? data.name : "Shared item";
+      const webUrl = isRecord(data) && isString(data.webUrl) ? data.webUrl : undefined;
+      const isFolder = isRecord(data) && isRecord(data.folder);
+      const permissions = isRecord(data) && Array.isArray(data.permissions) ? data.permissions : [];
+      const canWrite = permissions.some(hasWriteRole);
+      return {
+        sharedId: root.sharedId,
+        driveId: root.driveId,
+        itemId: root.itemId,
+        name,
+        webUrl,
+        isFolder,
+        canWrite,
+      };
+    },
+    readSharedSnapshot: async (
+      root: SharedRootReference,
+    ): Promise<{
+      snapshot: Snapshot;
+      etag: string | null;
+      lastModified: string | null;
+    }> => {
+      const response = await client.getTextWithHeaders(
+        buildSharedContentPathFromSegments(root, [SNAPSHOT_SHARED_FILE_NAME]),
         scopes,
       );
-      const names = parseChildNames(data);
-      return names
-        .map(parseEventChunkId)
-        .filter((value): value is number => typeof value === "number");
-    } catch (error) {
-      if (isGraphError(error) && error.status === 404) {
-        return [];
+      const snapshot = parseSnapshot(response.data);
+      return {
+        snapshot,
+        etag: getHeaderValue(response.headers, "ETag"),
+        lastModified: getHeaderValue(response.headers, "Last-Modified"),
+      };
+    },
+    writeSharedSnapshot: async (
+      root: SharedRootReference,
+      snapshot: Snapshot,
+      options?: { ifMatch?: string },
+    ): Promise<{ etag: string | null }> => {
+      const response = await client.putJsonWithHeaders(
+        buildSharedContentPathFromSegments(root, [SNAPSHOT_SHARED_FILE_NAME]),
+        snapshot,
+        scopes,
+        options,
+      );
+      return {
+        etag: getHeaderValue(response.headers, "ETag") ?? extractETag(response.data),
+      };
+    },
+    ensureSharedEventsFolder: async (root: SharedRootReference) => {
+      try {
+        await client.getJson(buildSharedItemPathFromSegments(root, [EVENTS_FOLDER_NAME]), scopes);
+      } catch (error) {
+        if (isGraphError(error) && error.status === 404) {
+          try {
+            await client.postJson(
+              buildSharedChildrenPathFromSegments(root, []),
+              {
+                name: EVENTS_FOLDER_NAME,
+                folder: {},
+                "@microsoft.graph.conflictBehavior": "fail",
+              },
+              scopes,
+            );
+          } catch (creationError) {
+            if (isGraphError(creationError) && creationError.status === 409) {
+              return;
+            }
+            throw creationError;
+          }
+          return;
+        }
+        throw error;
       }
-      throw error;
-    }
-  },
-  writeSharedEventChunk: async (root: SharedRootReference, chunkId: number, content: string) => {
-    await client.putText(
-      buildSharedContentPathFromSegments(root, [
-        EVENTS_FOLDER_NAME,
-        `${EVENT_FILE_PREFIX}${chunkId}${EVENT_FILE_EXTENSION}`,
-      ]),
-      content,
-      scopes,
-    );
-  },
-  readSharedEventChunk: async (root: SharedRootReference, chunkId: number): Promise<string> =>
-    client.getText(
-      buildSharedContentPathFromSegments(root, [
-        EVENTS_FOLDER_NAME,
-        `${EVENT_FILE_PREFIX}${chunkId}${EVENT_FILE_EXTENSION}`,
-      ]),
-      scopes,
-    ),
-  readSharedLease: async (root: SharedRootReference): Promise<LeaseRecord | null> => {
-    try {
-      const response = await client.getText(
+    },
+    ensureSharedLeasesFolder: async (root: SharedRootReference) => {
+      try {
+        await client.getJson(buildSharedItemPathFromSegments(root, [LEASES_FOLDER_NAME]), scopes);
+      } catch (error) {
+        if (isGraphError(error) && error.status === 404) {
+          try {
+            await client.postJson(
+              buildSharedChildrenPathFromSegments(root, []),
+              {
+                name: LEASES_FOLDER_NAME,
+                folder: {},
+                "@microsoft.graph.conflictBehavior": "fail",
+              },
+              scopes,
+            );
+          } catch (creationError) {
+            if (isGraphError(creationError) && creationError.status === 409) {
+              return;
+            }
+            throw creationError;
+          }
+          return;
+        }
+        throw error;
+      }
+    },
+    listSharedEventChunkIds: async (root: SharedRootReference): Promise<number[]> => {
+      try {
+        const data = await client.getJson(
+          buildSharedChildrenPathFromSegments(root, [EVENTS_FOLDER_NAME]),
+          scopes,
+        );
+        const names = parseChildNames(data);
+        return names
+          .map(parseEventChunkId)
+          .filter((value): value is number => typeof value === "number");
+      } catch (error) {
+        if (isGraphError(error) && error.status === 404) {
+          return [];
+        }
+        throw error;
+      }
+    },
+    writeSharedEventChunk: async (
+      root: SharedRootReference,
+      chunkId: number,
+      content: string,
+      _options?: { assumeMissing?: boolean },
+    ) => {
+      void _options;
+      await client.putText(
+        buildSharedContentPathFromSegments(root, [
+          EVENTS_FOLDER_NAME,
+          `${EVENT_FILE_PREFIX}${chunkId}${EVENT_FILE_EXTENSION}`,
+        ]),
+        content,
+        scopes,
+      );
+    },
+    readSharedEventChunk: async (root: SharedRootReference, chunkId: number): Promise<string> =>
+      client.getText(
+        buildSharedContentPathFromSegments(root, [
+          EVENTS_FOLDER_NAME,
+          `${EVENT_FILE_PREFIX}${chunkId}${EVENT_FILE_EXTENSION}`,
+        ]),
+        scopes,
+      ),
+    deleteSharedEventChunk: async (root: SharedRootReference, chunkId: number) => {
+      try {
+        await client.delete(
+          buildSharedItemPathFromSegments(root, [
+            EVENTS_FOLDER_NAME,
+            `${EVENT_FILE_PREFIX}${chunkId}${EVENT_FILE_EXTENSION}`,
+          ]),
+          scopes,
+        );
+      } catch (error) {
+        if (isGraphError(error) && error.status === 404) {
+          return;
+        }
+        throw error;
+      }
+    },
+    deleteAllSharedEventChunks: async (root: SharedRootReference) => {
+      try {
+        const data = await client.getJson(
+          buildSharedChildrenPathFromSegments(root, [EVENTS_FOLDER_NAME]),
+          scopes,
+        );
+        const names = parseChildNames(data);
+        const chunkIds = names
+          .map(parseEventChunkId)
+          .filter((value): value is number => typeof value === "number");
+        await Promise.all(
+          chunkIds.map((chunkId) =>
+            client
+              .delete(
+                buildSharedItemPathFromSegments(root, [
+                  EVENTS_FOLDER_NAME,
+                  `${EVENT_FILE_PREFIX}${chunkId}${EVENT_FILE_EXTENSION}`,
+                ]),
+                scopes,
+              )
+              .catch((error) => {
+                if (isGraphError(error) && error.status === 404) {
+                  return;
+                }
+                throw error;
+              }),
+          ),
+        );
+      } catch (error) {
+        if (isGraphError(error) && error.status === 404) {
+          return;
+        }
+        throw error;
+      }
+    },
+    readSharedLease: async (root: SharedRootReference): Promise<LeaseRecord | null> => {
+      try {
+        const response = await client.getText(
+          buildSharedContentPathFromSegments(root, [LEASES_FOLDER_NAME, LEASE_FILE_NAME]),
+          scopes,
+        );
+        return parseLeaseRecord(response);
+      } catch (error) {
+        if (isGraphError(error) && error.status === 404) {
+          return null;
+        }
+        throw error;
+      }
+    },
+    writeSharedLease: async (root: SharedRootReference, lease: LeaseRecord) => {
+      await client.putJson(
         buildSharedContentPathFromSegments(root, [LEASES_FOLDER_NAME, LEASE_FILE_NAME]),
+        lease,
         scopes,
       );
-      return parseLeaseRecord(response);
-    } catch (error) {
-      if (isGraphError(error) && error.status === 404) {
-        return null;
+    },
+    getRootFolderInfo: async (): Promise<{
+      appRoot?: { id: string; name: string };
+      personalRoot?: { id: string; name: string };
+      sharedRoot?: { id: string; name: string };
+    }> => {
+      const pointer = await getPointerRecord();
+      const result: {
+        appRoot?: { id: string; name: string };
+        personalRoot?: { id: string; name: string };
+        sharedRoot?: { id: string; name: string };
+      } = {};
+      if (pointer?.appRootFolderId) {
+        const info = await tryReadFolderById(client, scopes, pointer.appRootFolderId);
+        if (info) {
+          result.appRoot = { id: info.id, name: info.name };
+        }
       }
-      throw error;
-    }
-  },
-  writeSharedLease: async (root: SharedRootReference, lease: LeaseRecord) => {
-    await client.putJson(
-      buildSharedContentPathFromSegments(root, [LEASES_FOLDER_NAME, LEASE_FILE_NAME]),
-      lease,
-      scopes,
-    );
-  },
-});
+      if (pointer?.personalRootFolderId) {
+        const info = await tryReadFolderById(client, scopes, pointer.personalRootFolderId);
+        if (info) {
+          result.personalRoot = { id: info.id, name: info.name };
+        }
+      }
+      if (pointer?.sharedRootFolderId) {
+        const info = await tryReadFolderById(client, scopes, pointer.sharedRootFolderId);
+        if (info) {
+          result.sharedRoot = { id: info.id, name: info.name };
+        }
+      }
+      return result;
+    },
+  };
+};

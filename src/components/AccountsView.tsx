@@ -1446,14 +1446,14 @@ export function AccountsView({ data }: { data: DataContextValue }) {
 
                 {positionTab === "history" ? (
                   <div className="section-stack">
-                    <div className="app-muted">Source: OneDrive event log.</div>
+                    <div className="app-muted">Source: cloud event log.</div>
 
                     {historyError ? (
                       <div className="app-alert app-alert-error">{historyError}</div>
                     ) : null}
 
                     {historyLoading && historyItems.length === 0 ? (
-                      <div className="app-muted">Loading history from OneDrive...</div>
+                      <div className="app-muted">Loading history from cloud...</div>
                     ) : null}
 
                     {historyItems.length === 0 && !historyLoading ? (

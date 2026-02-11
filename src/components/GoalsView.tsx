@@ -13,6 +13,7 @@ import {
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DataContextValue, DomainActionOutcome } from "@/components/dataContext";
+import { useStorageProviderContext } from "@/components/StorageProviderContext";
 import {
   formatCurrency,
   formatIntegerInput,
@@ -21,6 +22,7 @@ import {
 } from "@/lib/numberFormat";
 import type { HistoryItem } from "@/lib/persistence/history";
 import type { Allocation, Goal } from "@/lib/persistence/types";
+import { buildSharedRouteKey } from "@/lib/storage/sharedRoute";
 
 type GoalFilter = "active" | "closed" | "spent";
 type GoalTab = "details" | "allocations" | "history" | "receipt";
@@ -128,6 +130,7 @@ const isSpendPayload = (value: unknown): value is SpendEventPayload => {
 };
 
 export function GoalsView({ data }: { data: DataContextValue }) {
+  const { activeProviderId } = useStorageProviderContext();
   const {
     draftState,
     isOnline,
@@ -486,7 +489,7 @@ export function GoalsView({ data }: { data: DataContextValue }) {
     const persisted = await persistOperation(false);
     if (persisted) {
       setRetryPending(false);
-      setInfoMessage("Saved to OneDrive.");
+      setInfoMessage("Saved to cloud.");
     }
   };
 
@@ -825,7 +828,9 @@ export function GoalsView({ data }: { data: DataContextValue }) {
       query.set("returnTab", "allocations");
     }
     if (space.scope === "shared" && space.sharedId) {
-      return `/shared/${encodeURIComponent(space.sharedId)}/accounts?${query.toString()}`;
+      return `/shared/${encodeURIComponent(
+        buildSharedRouteKey(activeProviderId, space.sharedId),
+      )}/accounts?${query.toString()}`;
     }
     return `/accounts?${query.toString()}`;
   };
@@ -1720,14 +1725,14 @@ export function GoalsView({ data }: { data: DataContextValue }) {
 
                   {selectedGoalTab === "history" ? (
                     <div className="section-stack">
-                      <div className="app-muted">Source: OneDrive event log.</div>
+                      <div className="app-muted">Source: cloud event log.</div>
 
                       {historyError ? (
                         <div className="app-alert app-alert-error">{historyError}</div>
                       ) : null}
 
                       {historyLoading && historyItems.length === 0 ? (
-                        <div className="app-muted">Loading history from OneDrive...</div>
+                        <div className="app-muted">Loading history from cloud...</div>
                       ) : null}
 
                       {historyItems.length === 0 && !historyLoading ? (

@@ -12,13 +12,11 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { useAuth } from "@/components/AuthProvider";
+import { useStorageProviderContext } from "@/components/StorageProviderContext";
 import { useSharedSelection } from "@/components/SharedSelectionProvider";
 import { StatusIndicator } from "@/components/StatusIndicator";
-import { getGraphScopes } from "@/lib/auth/msalConfig";
-import { createGraphClient } from "@/lib/graph/graphClient";
-import { createOneDriveService, type SharedRootListItem } from "@/lib/onedrive/oneDriveService";
 import {
-  PERSONAL_SYNC_SIGNAL_KEY,
+  buildPersonalSyncSignalKey,
   buildSharedSyncSignalKey,
   getSyncSignalsSnapshot,
   subscribeSyncSignals,
@@ -26,6 +24,9 @@ import {
 } from "@/lib/persistence/syncSignalStore";
 import { resolveSyncIndicatorState } from "@/lib/persistence/syncStatus";
 import { useOnlineStatus } from "@/lib/persistence/useOnlineStatus";
+import { buildSharedRouteKey, parseSharedRouteKey } from "@/lib/storage/sharedRoute";
+import { createStorageService } from "@/lib/storage/storageService";
+import type { SharedRootListItem } from "@/lib/storage/types";
 
 type AppShellProps = {
   children: ReactNode;
@@ -35,8 +36,8 @@ type AppSection = "dashboard" | "accounts" | "goals" | "settings";
 
 type SharedOption = {
   sharedId: string;
-  driveId: string;
-  itemId: string;
+  driveId?: string;
+  itemId?: string;
   name: string;
   webUrl?: string;
 };
@@ -92,12 +93,14 @@ const mergeSharedOptions = (
 export function AppShell({ children }: AppShellProps) {
   const pathname = usePathname();
   const router = useRouter();
-  const { status: authStatus, getAccessToken } = useAuth();
+  const { providers, getAccessToken } = useAuth();
+  const { activeProviderId, setActiveProviderId } = useStorageProviderContext();
   const { selection, setSelection } = useSharedSelection();
   const [isHydrated, setIsHydrated] = useState(false);
   const effectiveSelection = isHydrated ? selection : null;
   const isOnline = useOnlineStatus();
-  const isSignedIn = authStatus === "signed_in";
+  const activeProvider = providers[activeProviderId];
+  const isSignedIn = activeProvider.status === "signed_in";
   const [sharedRoots, setSharedRoots] = useState<SharedRootListItem[]>([]);
   const [sharedRootsStatus, setSharedRootsStatus] = useState<
     "idle" | "loading" | "ready" | "error"
@@ -105,23 +108,21 @@ export function AppShell({ children }: AppShellProps) {
   const [syncSignals, setSyncSignals] = useState<Record<string, SyncSignalEntry>>(() =>
     getSyncSignalsSnapshot(),
   );
-  const graphScopes = useMemo(() => getGraphScopes(), []);
-  const tokenProvider = useCallback((scopes: string[]) => getAccessToken(scopes), [getAccessToken]);
-  const graphClient = useMemo(
-    () =>
-      createGraphClient({
-        accessTokenProvider: tokenProvider,
-      }),
-    [tokenProvider],
+  const tokenProvider = useCallback(
+    (scopes: string[]) => getAccessToken(activeProviderId, scopes),
+    [activeProviderId, getAccessToken],
   );
-  const oneDrive = useMemo(
-    () => createOneDriveService(graphClient, graphScopes),
-    [graphClient, graphScopes],
+  const storage = useMemo(
+    () => createStorageService(activeProviderId, tokenProvider),
+    [activeProviderId, tokenProvider],
   );
 
   const pathSegments = useMemo(() => pathname.split("/").filter(Boolean), [pathname]);
   const isSharedRoute = pathSegments[0] === "shared" && pathSegments.length >= 2;
-  const routeSharedId = isSharedRoute ? decodeURIComponent(pathSegments[1]) : null;
+  const routeKey = isSharedRoute ? decodeURIComponent(pathSegments[1]) : null;
+  const routeInfo = useMemo(() => (routeKey ? parseSharedRouteKey(routeKey) : null), [routeKey]);
+  const routeProviderId = routeInfo?.providerId ?? activeProviderId;
+  const routeSharedId = routeInfo?.sharedId ?? null;
   const sectionCandidate = isSharedRoute
     ? (pathSegments[2] ?? "dashboard")
     : (pathSegments[0] ?? "dashboard");
@@ -140,6 +141,12 @@ export function AppShell({ children }: AppShellProps) {
   const activeSharedId =
     routeSharedId ?? (activeScope === "shared" ? (effectiveSelection?.sharedId ?? null) : null);
 
+  useEffect(() => {
+    if (isSharedRoute && routeProviderId !== activeProviderId) {
+      setActiveProviderId(routeProviderId);
+    }
+  }, [activeProviderId, isSharedRoute, routeProviderId, setActiveProviderId]);
+
   const sharedOptions = useMemo(() => {
     const selectedOption = effectiveSelection
       ? {
@@ -155,21 +162,22 @@ export function AppShell({ children }: AppShellProps) {
   const selectedSharedId = activeSharedId ?? effectiveSelection?.sharedId ?? "";
   const activeSyncSignal = useMemo(() => {
     if (activeScope === "shared" && activeSharedId) {
-      return syncSignals[buildSharedSyncSignalKey(activeSharedId)] ?? null;
+      return syncSignals[buildSharedSyncSignalKey(routeProviderId, activeSharedId)] ?? null;
     }
-    return syncSignals[PERSONAL_SYNC_SIGNAL_KEY] ?? null;
-  }, [activeScope, activeSharedId, syncSignals]);
+    return syncSignals[buildPersonalSyncSignalKey(activeProviderId)] ?? null;
+  }, [activeProviderId, activeScope, activeSharedId, routeProviderId, syncSignals]);
   const syncIndicatorState = useMemo(
     () =>
       resolveSyncIndicatorState({
         isOnline,
+        isSignedIn,
         isSaving: activeSyncSignal?.activity === "saving",
         retryQueueCount: activeSyncSignal?.retryQueueCount ?? 0,
         isViewOnly:
           activeScope === "shared" &&
           Boolean(activeSyncSignal?.canWriteKnown && !activeSyncSignal.canWrite),
       }),
-    [activeScope, activeSyncSignal, isOnline],
+    [activeScope, activeSyncSignal, isOnline, isSignedIn],
   );
 
   const toScopedPath = useCallback(
@@ -182,14 +190,14 @@ export function AppShell({ children }: AppShellProps) {
       if (!sharedId) {
         return "/dashboard";
       }
-      return `/shared/${encodeURIComponent(sharedId)}/${targetSection}`;
+      return `/shared/${encodeURIComponent(buildSharedRouteKey(activeProviderId, sharedId))}/${targetSection}`;
     },
-    [currentSection],
+    [activeProviderId, currentSection],
   );
 
   const dashboardHref =
     activeScope === "shared" && selectedSharedId
-      ? `/shared/${encodeURIComponent(selectedSharedId)}/dashboard`
+      ? `/shared/${encodeURIComponent(buildSharedRouteKey(activeProviderId, selectedSharedId))}/dashboard`
       : "/dashboard";
 
   const loadSharedRoots = useCallback(async (): Promise<SharedRootListItem[]> => {
@@ -200,9 +208,14 @@ export function AppShell({ children }: AppShellProps) {
     }
     setSharedRootsStatus("loading");
     try {
+      if (!storage.capabilities.supportsShared) {
+        setSharedRoots([]);
+        setSharedRootsStatus("ready");
+        return [];
+      }
       const [withMe, byMe] = await Promise.all([
-        oneDrive.listSharedWithMeRoots(),
-        oneDrive.listSharedByMeRoots(),
+        storage.listSharedWithMeRoots(),
+        storage.listSharedByMeRoots(),
       ]);
       const byId = new Map<string, SharedRootListItem>();
       for (const root of [...withMe, ...byMe]) {
@@ -216,7 +229,7 @@ export function AppShell({ children }: AppShellProps) {
       setSharedRootsStatus("error");
       return [];
     }
-  }, [isOnline, isSignedIn, oneDrive]);
+  }, [isOnline, isSignedIn, storage]);
 
   useEffect(() => {
     const timerId = window.setTimeout(() => {
@@ -270,8 +283,8 @@ export function AppShell({ children }: AppShellProps) {
       }
       return {
         sharedId: first.sharedId,
-        driveId: first.driveId,
-        itemId: first.itemId,
+        driveId: first.driveId ?? "",
+        itemId: first.itemId ?? "",
         name: first.name,
         webUrl: first.webUrl,
       };
@@ -288,20 +301,29 @@ export function AppShell({ children }: AppShellProps) {
       void (async () => {
         const target = await resolveSharedTarget(activeSharedId ?? selection?.sharedId);
         if (!target) {
-          router.push("/settings#shared");
+          router.push("/settings#workspace");
           return;
         }
         setSelection({
+          providerId: activeProviderId,
           sharedId: target.sharedId,
-          driveId: target.driveId,
-          itemId: target.itemId,
+          driveId: target.driveId ?? "",
+          itemId: target.itemId ?? "",
           name: target.name,
           webUrl: target.webUrl,
         });
         router.push(toScopedPath("shared", target.sharedId));
       })();
     },
-    [activeSharedId, resolveSharedTarget, router, selection?.sharedId, setSelection, toScopedPath],
+    [
+      activeProviderId,
+      activeSharedId,
+      resolveSharedTarget,
+      router,
+      selection?.sharedId,
+      setSelection,
+      toScopedPath,
+    ],
   );
 
   const handleSharedSelect = useCallback(
@@ -311,15 +333,16 @@ export function AppShell({ children }: AppShellProps) {
         return;
       }
       setSelection({
+        providerId: activeProviderId,
         sharedId: target.sharedId,
-        driveId: target.driveId,
-        itemId: target.itemId,
+        driveId: target.driveId ?? "",
+        itemId: target.itemId ?? "",
         name: target.name,
         webUrl: target.webUrl,
       });
       router.push(toScopedPath("shared", target.sharedId));
     },
-    [router, setSelection, sharedOptions, toScopedPath],
+    [activeProviderId, router, setSelection, sharedOptions, toScopedPath],
   );
 
   const renderScopeSwitcher = (className?: string) =>
@@ -340,12 +363,12 @@ export function AppShell({ children }: AppShellProps) {
         !isOnline ||
         (sharedOptions.length === 0 && sharedRootsStatus !== "loading");
       const sharedPlaceholder = !isSharedScope
-        ? "Switch to Shared to choose a folder"
+        ? "Switch to Shared to choose a workspace"
         : sharedRootsStatus === "loading"
-          ? "Loading shared folders..."
+          ? "Loading shared workspaces..."
           : sharedOptions.length === 0
-            ? "No shared folders"
-            : "Select shared folder";
+            ? "No shared workspaces"
+            : "Select shared workspace";
 
       return (
         <div className={`scope-switcher ${className ?? ""}`.trim()}>
@@ -449,7 +472,9 @@ export function AppShell({ children }: AppShellProps) {
               item.section === "settings"
                 ? "/settings"
                 : activeScope === "shared" && selectedSharedId
-                  ? `/shared/${encodeURIComponent(selectedSharedId)}/${item.section}`
+                  ? `/shared/${encodeURIComponent(
+                      buildSharedRouteKey(activeProviderId, selectedSharedId),
+                    )}/${item.section}`
                   : item.section === "dashboard"
                     ? "/dashboard"
                     : `/${item.section}`;

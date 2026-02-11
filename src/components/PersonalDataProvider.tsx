@@ -11,10 +11,14 @@ import {
 } from "react";
 import { usePathname } from "next/navigation";
 import { useAuth } from "@/components/AuthProvider";
-import { getGraphScopes } from "@/lib/auth/msalConfig";
-import { createGraphClient } from "@/lib/graph/graphClient";
-import { isGraphError, isPreconditionFailed } from "@/lib/graph/graphErrors";
-import { createOneDriveService, type LeaseRecord } from "@/lib/onedrive/oneDriveService";
+import { useStorageProviderContext } from "@/components/StorageProviderContext";
+import {
+  formatStorageError,
+  isStorageNetworkError,
+  isStorageNotFound,
+  isStoragePermissionScopeError,
+  isStoragePreconditionFailed,
+} from "@/lib/storage/storageErrors";
 import {
   assignEventVersions,
   buildEventChunks,
@@ -46,10 +50,12 @@ import {
 import { createId } from "@/lib/persistence/id";
 import { createEmptySnapshot, type Snapshot } from "@/lib/persistence/snapshot";
 import { readSnapshotCache, writeSnapshotCache } from "@/lib/persistence/snapshotCache";
-import { PERSONAL_SYNC_SIGNAL_KEY, upsertSyncSignal } from "@/lib/persistence/syncSignalStore";
+import { buildPersonalSyncSignalKey, upsertSyncSignal } from "@/lib/persistence/syncSignalStore";
 import { useOnlineStatus } from "@/lib/persistence/useOnlineStatus";
 import type { Goal, NormalizedState, Position } from "@/lib/persistence/types";
 import { getDeviceId } from "@/lib/lease/deviceId";
+import type { LeaseRecord } from "@/lib/storage/lease";
+import { createStorageService } from "@/lib/storage/storageService";
 import type {
   DataActivity,
   DataContextValue,
@@ -59,6 +65,7 @@ import type {
   SaveChangesOutcome,
   SpaceInfo,
 } from "@/components/dataContext";
+import { canPromptGoogleConsent, markGoogleConsentPrompted } from "@/lib/auth/googleConsent";
 
 const MAX_EVENTS_PER_CHUNK = 500;
 const LEASE_DURATION_MS = 90_000;
@@ -77,33 +84,7 @@ type QueuedChunkWrite = {
 
 const PersonalDataContext = createContext<DataContextValue | null>(null);
 
-const formatGraphError = (error: unknown): string => {
-  if (isGraphError(error)) {
-    if (error.code === "unauthorized") {
-      return "Authentication failed. Please sign in again.";
-    }
-    if (error.code === "forbidden") {
-      return "Permission denied. Please consent to the required Graph scopes.";
-    }
-    if (error.code === "not_found") {
-      return "The requested file was not found.";
-    }
-    if (error.code === "rate_limited") {
-      return "Too many requests. Please wait and try again.";
-    }
-    if (error.code === "network_error") {
-      return "Network error. Please check your connection.";
-    }
-    if (error.code === "precondition_failed") {
-      return "The data changed on OneDrive. Please reload and try again.";
-    }
-    return "Microsoft Graph request failed. Please try again.";
-  }
-  if (error instanceof Error) {
-    return error.message;
-  }
-  return "Something went wrong. Please try again.";
-};
+const formatGraphError = (error: unknown): string => formatStorageError(error);
 
 const buildEventMeta = () => ({
   eventId: createId(),
@@ -137,9 +118,12 @@ const withTimeout = async <T,>(task: Promise<T>, timeoutMs: number): Promise<T> 
 };
 
 export function PersonalDataProvider({ children }: { children: React.ReactNode }) {
-  const { status: authStatus, account, getAccessToken } = useAuth();
+  const { providers, getAccessToken } = useAuth();
+  const { activeProviderId } = useStorageProviderContext();
+  const activeProvider = providers[activeProviderId];
   const isOnline = useOnlineStatus();
-  const isSignedIn = authStatus === "signed_in";
+  const isSignedIn = activeProvider.status === "signed_in";
+  const account = activeProvider.account;
   const canWrite = true;
   const readOnlyReason = null;
 
@@ -177,28 +161,21 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
   const pathname = usePathname();
   const prevPathnameRef = useRef(pathname);
 
-  const graphScopes = useMemo(() => getGraphScopes(), []);
-  const tokenProvider = useCallback((scopes: string[]) => getAccessToken(scopes), [getAccessToken]);
-
-  const graphClient = useMemo(
-    () =>
-      createGraphClient({
-        accessTokenProvider: tokenProvider,
-      }),
-    [tokenProvider],
+  const tokenProvider = useCallback(
+    (scopes: string[]) => getAccessToken(activeProviderId, scopes),
+    [activeProviderId, getAccessToken],
   );
-
-  const oneDrive = useMemo(
-    () => createOneDriveService(graphClient, graphScopes),
-    [graphClient, graphScopes],
+  const storage = useMemo(
+    () => createStorageService(activeProviderId, tokenProvider),
+    [activeProviderId, tokenProvider],
   );
   const historyLoader = useMemo(
     () =>
       createHistoryLoader({
-        listChunkIds: () => oneDrive.listEventChunkIds(),
-        readChunk: (chunkId) => oneDrive.readEventChunk(chunkId),
+        listChunkIds: () => storage.listEventChunkIds(),
+        readChunk: (chunkId) => storage.readEventChunk(chunkId),
       }),
-    [oneDrive],
+    [storage],
   );
 
   const applySnapshot = useCallback(
@@ -230,22 +207,22 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
 
   const loadLeaseFromRemote = useCallback(async () => {
     try {
-      const result = await oneDrive.readPersonalLease();
+      const result = await storage.readPersonalLease();
       setLease(result);
       setLeaseError(null);
     } catch (err) {
       setLeaseError(formatGraphError(err));
     }
-  }, [oneDrive]);
+  }, [storage]);
 
   const loadLatestEventFromRemote = useCallback(async (): Promise<PendingEvent | null> => {
     try {
-      const chunkIds = await oneDrive.listEventChunkIds();
+      const chunkIds = await storage.listEventChunkIds();
       if (chunkIds.length === 0) {
         return null;
       }
       const latestChunkId = Math.max(...chunkIds);
-      const content = await oneDrive.readEventChunk(latestChunkId);
+      const content = await storage.readEventChunk(latestChunkId);
       const parsed = parseEventChunk(content);
       const latest = parsed.events[parsed.events.length - 1];
       if (!latest) {
@@ -260,13 +237,16 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     } catch {
       return null;
     }
-  }, [oneDrive]);
+  }, [storage]);
 
   const loadFromCache = useCallback(async () => {
     setStatus("loading");
     setActivity("loading");
     try {
-      const cached = await readSnapshotCache("personal");
+      const cacheKey = `personal:${activeProviderId}`;
+      const cached =
+        (await readSnapshotCache(cacheKey)) ??
+        (activeProviderId === "onedrive" ? await readSnapshotCache("personal") : null);
       if (cached) {
         applySnapshot(
           cached.snapshot,
@@ -276,10 +256,17 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
           savedLatestEvent,
         );
       } else {
-        setStatus("error");
+        if (!isOnline) {
+          setStatus("error");
+          setSource("empty");
+          setMessage(null);
+          setError("No cached data is available.");
+          return;
+        }
+        setStatus("loading");
         setSource("empty");
         setMessage(null);
-        setError("No cached data is available.");
+        setError(null);
       }
     } catch (err) {
       setStatus("error");
@@ -289,7 +276,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     } finally {
       setActivity("idle");
     }
-  }, [applySnapshot, savedLatestEvent]);
+  }, [activeProviderId, applySnapshot, isOnline, savedLatestEvent]);
 
   const loadFromRemote = useCallback(
     async (options?: { background?: boolean }) => {
@@ -306,28 +293,43 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
         setActivity("loading");
       }
       try {
-        await oneDrive.ensureAppRoot();
-        const result = await oneDrive.readPersonalSnapshot();
+        await storage.ensureAppRoot();
+        const result = await storage.readPersonalSnapshot();
         const latest = await loadLatestEventFromRemote();
         if (pendingEventsRef.current.length > 0) {
           setStatus("ready");
           setMessage("Pending local changes are still processing. Try again shortly.");
           return;
         }
-        applySnapshot(result.snapshot, result.etag, "remote", "Synced from OneDrive.", latest);
+        const cacheKey = `personal:${activeProviderId}`;
+        applySnapshot(result.snapshot, result.etag, "remote", "Synced from cloud.", latest);
         void loadLeaseFromRemote();
         await writeSnapshotCache({
-          key: "personal",
+          key: cacheKey,
           snapshot: result.snapshot,
           etag: result.etag,
           cachedAt: new Date().toISOString(),
         });
       } catch (err) {
-        if (isGraphError(err) && err.status === 404) {
+        if (
+          activeProviderId === "gdrive" &&
+          isStoragePermissionScopeError(err) &&
+          canPromptGoogleConsent()
+        ) {
+          markGoogleConsentPrompted();
+          try {
+            await activeProvider.signIn({ prompt: "consent" });
+            await loadFromRemote(options);
+            return;
+          } catch {
+            // Fall through to default error handling.
+          }
+        }
+        if (isStorageNotFound(err)) {
           try {
             const now = new Date().toISOString();
             const emptySnapshot = createEmptySnapshot(now);
-            const result = await oneDrive.writePersonalSnapshot(emptySnapshot);
+            const result = await storage.writePersonalSnapshot(emptySnapshot);
             applySnapshot(
               emptySnapshot,
               result.etag,
@@ -336,7 +338,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
               null,
             );
             await writeSnapshotCache({
-              key: "personal",
+              key: `personal:${activeProviderId}`,
               snapshot: emptySnapshot,
               etag: result.etag,
               cachedAt: now,
@@ -351,7 +353,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
             return;
           }
         }
-        if (isGraphError(err) && err.code === "network_error") {
+        if (isStorageNetworkError(err)) {
           if (shouldRunInBackground) {
             setMessage("Offline mode. Showing cached data.");
             return;
@@ -374,7 +376,15 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
         }
       }
     },
-    [applySnapshot, loadFromCache, loadLatestEventFromRemote, loadLeaseFromRemote, oneDrive],
+    [
+      activeProviderId,
+      activeProvider,
+      applySnapshot,
+      loadFromCache,
+      loadLatestEventFromRemote,
+      loadLeaseFromRemote,
+      storage,
+    ],
   );
   useEffect(() => {
     pendingEventsRef.current = pendingEvents;
@@ -438,7 +448,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       for (let index = 0; index < queue.length; index += 1) {
         const chunk = queue[index];
         try {
-          await oneDrive.writeEventChunk(chunk.chunkId, chunk.content);
+          await storage.writeEventChunk(chunk.chunkId, chunk.content);
         } catch (err) {
           return {
             ok: false,
@@ -449,7 +459,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       }
       return { ok: true };
     },
-    [oneDrive],
+    [storage],
   );
 
   const handleConflict = useCallback(async () => {
@@ -485,8 +495,8 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     setActivity("saving");
 
     try {
-      await oneDrive.ensureAppRoot();
-      await oneDrive.ensureEventsFolder();
+      await storage.ensureAppRoot();
+      await storage.ensureEventsFolder();
 
       if (hasPendingHistoryChunks) {
         const retryResult = await flushPendingHistoryChunks(pendingHistoryChunksRef.current);
@@ -540,11 +550,11 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
         return { ok: false, reason: "missing_etag" };
       }
 
-      const chunkIds = await oneDrive.listEventChunkIds();
+      const chunkIds = await storage.listEventChunkIds();
       const nextChunkId = chunkIds.length === 0 ? 1 : Math.max(...chunkIds) + 1;
       const chunks = buildEventChunks(versionedEvents, nextChunkId, MAX_EVENTS_PER_CHUNK, now);
 
-      const writeResult = await oneDrive.writePersonalSnapshot(nextSnapshot, {
+      const writeResult = await storage.writePersonalSnapshot(nextSnapshot, {
         ifMatch: currentEtag,
       });
 
@@ -566,12 +576,12 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       setSource("remote");
       setStatus("ready");
       setMessage(
-        repairWarningMessage ? `${repairWarningMessage} Saved to OneDrive.` : "Saved to OneDrive.",
+        repairWarningMessage ? `${repairWarningMessage} Saved to cloud.` : "Saved to cloud.",
       );
       setError(null);
 
       await writeSnapshotCache({
-        key: "personal",
+        key: `personal:${activeProviderId}`,
         snapshot: nextSnapshot,
         etag: nextEtag,
         cachedAt: now,
@@ -601,7 +611,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       setRetryQueueCount(0);
       return { ok: true };
     } catch (err) {
-      if (isPreconditionFailed(err)) {
+      if (isStoragePreconditionFailed(err)) {
         await handleConflict();
         return { ok: false, reason: "conflict" };
       }
@@ -612,12 +622,13 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       setActivity("idle");
     }
   }, [
+    activeProviderId,
     draftState,
     flushPendingHistoryChunks,
     handleConflict,
     isOnline,
     isSignedIn,
-    oneDrive,
+    storage,
     pendingEvents,
     savedLatestEvent,
     snapshotRecord,
@@ -625,7 +636,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
 
   const buildLeasePayload = useCallback((): LeaseRecord => {
     const now = new Date();
-    const holderLabel = account?.name ?? account?.username ?? "Anonymous";
+    const holderLabel = account?.name ?? account?.email ?? "Anonymous";
     const deviceId = getDeviceId() ?? undefined;
     return {
       holderLabel,
@@ -646,10 +657,10 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     let isActive = true;
     const updateLease = async () => {
       try {
-        await oneDrive.ensureAppRoot();
-        await oneDrive.ensureLeasesFolder();
+        await storage.ensureAppRoot();
+        await storage.ensureLeasesFolder();
         const payload = buildLeasePayload();
-        await oneDrive.writePersonalLease(payload);
+        await storage.writePersonalLease(payload);
         if (isActive) {
           setLease(payload);
           setLeaseError(null);
@@ -668,7 +679,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       isActive = false;
       window.clearInterval(intervalId);
     };
-  }, [buildLeasePayload, canWrite, isOnline, isSignedIn, oneDrive, pendingEvents]);
+  }, [buildLeasePayload, canWrite, isOnline, isSignedIn, pendingEvents, storage]);
 
   const ensureEditableState = useCallback((): { state: NormalizedState } | { error: string } => {
     if (!isOnline) {
@@ -1085,14 +1096,14 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
 
   useEffect(() => {
     upsertSyncSignal({
-      key: PERSONAL_SYNC_SIGNAL_KEY,
+      key: buildPersonalSyncSignalKey(activeProviderId),
       activity,
       retryQueueCount,
       canWrite,
       canWriteKnown: true,
       lastSyncedAt: snapshotRecord?.snapshot.updatedAt ?? null,
     });
-  }, [activity, canWrite, retryQueueCount, snapshotRecord?.snapshot.updatedAt]);
+  }, [activity, activeProviderId, canWrite, retryQueueCount, snapshotRecord?.snapshot.updatedAt]);
 
   const value = useMemo(
     () => ({

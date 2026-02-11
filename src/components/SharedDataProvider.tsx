@@ -11,6 +11,7 @@ import {
 } from "react";
 import { useAuth } from "@/components/AuthProvider";
 import { useSharedSelection } from "@/components/SharedSelectionProvider";
+import { useStorageProviderContext } from "@/components/StorageProviderContext";
 import type {
   DataActivity,
   DataContextValue,
@@ -20,17 +21,7 @@ import type {
   SaveChangesOutcome,
   SpaceInfo,
 } from "@/components/dataContext";
-import { getGraphScopes } from "@/lib/auth/msalConfig";
-import { createGraphClient } from "@/lib/graph/graphClient";
-import { isGraphError, isPreconditionFailed } from "@/lib/graph/graphErrors";
-import {
-  createOneDriveService,
-  decodeSharedId,
-  encodeSharedId,
-  type LeaseRecord,
-  type SharedRootInfo,
-  type SharedRootReference,
-} from "@/lib/onedrive/oneDriveService";
+import { decodeSharedId, encodeSharedId } from "@/lib/onedrive/oneDriveService";
 import {
   assignEventVersions,
   buildEventChunks,
@@ -70,6 +61,18 @@ import {
 import { useOnlineStatus } from "@/lib/persistence/useOnlineStatus";
 import type { Goal, NormalizedState, Position } from "@/lib/persistence/types";
 import { getDeviceId } from "@/lib/lease/deviceId";
+import type { LeaseRecord } from "@/lib/storage/lease";
+import { parseSharedRouteKey } from "@/lib/storage/sharedRoute";
+import { createStorageService } from "@/lib/storage/storageService";
+import {
+  formatStorageError,
+  isStorageNetworkError,
+  isStorageNotFound,
+  isStoragePermissionScopeError,
+  isStoragePreconditionFailed,
+} from "@/lib/storage/storageErrors";
+import type { CloudProviderId, SharedRootInfo, SharedRootReference } from "@/lib/storage/types";
+import { canPromptGoogleConsent, markGoogleConsentPrompted } from "@/lib/auth/googleConsent";
 
 const MAX_EVENTS_PER_CHUNK = 500;
 const LEASE_DURATION_MS = 90_000;
@@ -93,33 +96,7 @@ type SharedRootState = {
 
 const SharedDataContext = createContext<DataContextValue | null>(null);
 
-const formatGraphError = (error: unknown): string => {
-  if (isGraphError(error)) {
-    if (error.code === "unauthorized") {
-      return "Authentication failed. Please sign in again.";
-    }
-    if (error.code === "forbidden") {
-      return "Permission denied. Please consent to the required Graph scopes.";
-    }
-    if (error.code === "not_found") {
-      return "The requested file was not found.";
-    }
-    if (error.code === "rate_limited") {
-      return "Too many requests. Please wait and try again.";
-    }
-    if (error.code === "network_error") {
-      return "Network error. Please check your connection.";
-    }
-    if (error.code === "precondition_failed") {
-      return "The data changed on OneDrive. Please reload and try again.";
-    }
-    return "Microsoft Graph request failed. Please try again.";
-  }
-  if (error instanceof Error) {
-    return error.message;
-  }
-  return "Something went wrong. Please try again.";
-};
+const formatGraphError = (error: unknown): string => formatStorageError(error);
 
 const buildEventMeta = () => ({
   eventId: createId(),
@@ -152,12 +129,24 @@ const withTimeout = async <T,>(task: Promise<T>, timeoutMs: number): Promise<T> 
   }
 };
 
-const resolveSharedReference = (sharedId: string): SharedRootReference | null => {
+const resolveSharedReference = (
+  providerId: CloudProviderId,
+  sharedId: string,
+): SharedRootReference | null => {
+  if (providerId === "gdrive") {
+    return {
+      providerId,
+      sharedId,
+      driveId: "",
+      itemId: sharedId,
+    };
+  }
   const decoded = decodeSharedId(sharedId);
   if (!decoded) {
     return null;
   }
   return {
+    providerId,
     sharedId: encodeSharedId(decoded.driveId, decoded.itemId),
     driveId: decoded.driveId,
     itemId: decoded.itemId,
@@ -171,10 +160,16 @@ export function SharedDataProvider({
   sharedId: string;
   children: React.ReactNode;
 }) {
-  const { status: authStatus, account, getAccessToken } = useAuth();
+  const { providers, getAccessToken } = useAuth();
+  const { activeProviderId, setActiveProviderId } = useStorageProviderContext();
   const { selection, setSelection } = useSharedSelection();
+  const routeInfo = useMemo(() => parseSharedRouteKey(sharedId), [sharedId]);
+  const routeProviderId = routeInfo.providerId;
+  const routeSharedId = routeInfo.sharedId;
+  const providerSession = providers[routeProviderId];
+  const account = providerSession.account;
   const isOnline = useOnlineStatus();
-  const isSignedIn = authStatus === "signed_in";
+  const isSignedIn = providerSession.status === "signed_in";
 
   const [status, setStatus] = useState<DataStatus>("idle");
   const [activity, setActivity] = useState<DataActivity>("idle");
@@ -194,24 +189,29 @@ export function SharedDataProvider({
   const pendingHistoryChunksRef = useRef<QueuedChunkWrite[]>([]);
   const [rootState, setRootState] = useState<SharedRootState | null>(null);
 
-  const graphScopes = useMemo(() => getGraphScopes(), []);
-  const tokenProvider = useCallback((scopes: string[]) => getAccessToken(scopes), [getAccessToken]);
-
-  const graphClient = useMemo(
-    () =>
-      createGraphClient({
-        accessTokenProvider: tokenProvider,
-      }),
-    [tokenProvider],
+  const tokenProvider = useCallback(
+    (scopes: string[]) => getAccessToken(routeProviderId, scopes),
+    [getAccessToken, routeProviderId],
+  );
+  const storage = useMemo(
+    () => createStorageService(routeProviderId, tokenProvider),
+    [routeProviderId, tokenProvider],
   );
 
-  const oneDrive = useMemo(
-    () => createOneDriveService(graphClient, graphScopes),
-    [graphClient, graphScopes],
+  const sharedReference = useMemo(
+    () => resolveSharedReference(routeProviderId, routeSharedId),
+    [routeProviderId, routeSharedId],
+  );
+  const syncSignalKey = useMemo(
+    () => buildSharedSyncSignalKey(routeProviderId, routeSharedId),
+    [routeProviderId, routeSharedId],
   );
 
-  const sharedReference = useMemo(() => resolveSharedReference(sharedId), [sharedId]);
-  const syncSignalKey = useMemo(() => buildSharedSyncSignalKey(sharedId), [sharedId]);
+  useEffect(() => {
+    if (activeProviderId !== routeProviderId) {
+      setActiveProviderId(routeProviderId);
+    }
+  }, [activeProviderId, routeProviderId, setActiveProviderId]);
 
   const canWrite = rootState?.info.canWrite ?? false;
   const readOnlyReason =
@@ -219,7 +219,7 @@ export function SharedDataProvider({
 
   const space = useMemo<SpaceInfo>(() => {
     if (!rootState) {
-      if (selection && selection.sharedId === sharedId) {
+      if (selection && selection.sharedId === routeSharedId) {
         return {
           scope: "shared",
           label: selection.name,
@@ -232,7 +232,7 @@ export function SharedDataProvider({
       return {
         scope: "shared",
         label: "Shared",
-        sharedId,
+        sharedId: routeSharedId,
       };
     }
     return {
@@ -243,11 +243,11 @@ export function SharedDataProvider({
       itemId: rootState.reference.itemId,
       webUrl: rootState.info.webUrl,
     };
-  }, [rootState, selection, sharedId]);
+  }, [rootState, routeSharedId, selection]);
 
   const buildLeasePayload = useCallback((): LeaseRecord => {
     const now = new Date();
-    const holderLabel = account?.name ?? account?.username ?? "Anonymous";
+    const holderLabel = account?.name ?? account?.email ?? "Anonymous";
     const deviceId = getDeviceId() ?? undefined;
     return {
       holderLabel,
@@ -287,12 +287,12 @@ export function SharedDataProvider({
   const loadLatestEventFromRemote = useCallback(
     async (root: SharedRootReference): Promise<PendingEvent | null> => {
       try {
-        const chunkIds = await oneDrive.listSharedEventChunkIds(root);
+        const chunkIds = await storage.listSharedEventChunkIds(root);
         if (chunkIds.length === 0) {
           return null;
         }
         const latestChunkId = Math.max(...chunkIds);
-        const content = await oneDrive.readSharedEventChunk(root, latestChunkId);
+        const content = await storage.readSharedEventChunk(root, latestChunkId);
         const parsed = parseEventChunk(content);
         const latest = parsed.events[parsed.events.length - 1];
         if (!latest) {
@@ -308,7 +308,7 @@ export function SharedDataProvider({
         return null;
       }
     },
-    [oneDrive],
+    [storage],
   );
 
   const ensureRootInfo = useCallback(async (): Promise<SharedRootState> => {
@@ -318,33 +318,34 @@ export function SharedDataProvider({
     if (!sharedReference) {
       throw new Error("Invalid shared space id.");
     }
-    const info = await oneDrive.getSharedRootInfo(sharedReference);
+    const info = await storage.getSharedRootInfo(sharedReference);
     if (!info.isFolder) {
-      throw new Error("The shared item is not a folder. Please select a shared folder.");
+      throw new Error("The shared item is not a folder. Please select a shared workspace.");
     }
     const nextState = { info, reference: sharedReference };
     setRootState(nextState);
     setSelection({
+      providerId: info.providerId,
       sharedId: info.sharedId,
-      driveId: info.driveId,
-      itemId: info.itemId,
+      driveId: info.driveId ?? "",
+      itemId: info.itemId ?? "",
       name: info.name,
       webUrl: info.webUrl,
     });
     return nextState;
-  }, [oneDrive, rootState, setSelection, sharedReference]);
+  }, [rootState, setSelection, sharedReference, storage]);
 
   const loadLeaseFromRemote = useCallback(
     async (root: SharedRootReference) => {
       try {
-        const result = await oneDrive.readSharedLease(root);
+        const result = await storage.readSharedLease(root);
         setLease(result);
         setLeaseError(null);
       } catch (err) {
         setLeaseError(formatGraphError(err));
       }
     },
-    [oneDrive],
+    [storage],
   );
 
   const loadFromCache = useCallback(async () => {
@@ -358,7 +359,12 @@ export function SharedDataProvider({
         setError("Invalid shared space id.");
         return;
       }
-      const cached = await readSnapshotCache(`shared:${sharedReference.sharedId}`);
+      const cacheKey = `shared:${routeProviderId}:${sharedReference.sharedId}`;
+      const cached =
+        (await readSnapshotCache(cacheKey)) ??
+        (routeProviderId === "onedrive"
+          ? await readSnapshotCache(`shared:${sharedReference.sharedId}`)
+          : null);
       if (cached) {
         applySnapshot(
           cached.snapshot,
@@ -368,10 +374,17 @@ export function SharedDataProvider({
           savedLatestEvent,
         );
       } else {
-        setStatus("error");
+        if (!isOnline) {
+          setStatus("error");
+          setSource("empty");
+          setMessage(null);
+          setError("No cached data is available.");
+          return;
+        }
+        setStatus("loading");
         setSource("empty");
         setMessage(null);
-        setError("No cached data is available.");
+        setError(null);
       }
     } catch (err) {
       setStatus("error");
@@ -381,7 +394,7 @@ export function SharedDataProvider({
     } finally {
       setActivity("idle");
     }
-  }, [applySnapshot, savedLatestEvent, sharedReference]);
+  }, [applySnapshot, isOnline, routeProviderId, savedLatestEvent, sharedReference]);
 
   const loadFromRemote = useCallback(async () => {
     if (pendingEventsRef.current.length > 0) {
@@ -392,23 +405,37 @@ export function SharedDataProvider({
     setActivity("loading");
     try {
       const root = await ensureRootInfo();
-      const result = await oneDrive.readSharedSnapshot(root.reference);
+      const result = await storage.readSharedSnapshot(root.reference);
       const latest = await loadLatestEventFromRemote(root.reference);
       if (pendingEventsRef.current.length > 0) {
         setStatus("ready");
         setMessage("Pending local changes are still processing. Try again shortly.");
         return;
       }
-      applySnapshot(result.snapshot, result.etag, "remote", "Synced from OneDrive.", latest);
+      applySnapshot(result.snapshot, result.etag, "remote", "Synced from cloud.", latest);
       void loadLeaseFromRemote(root.reference);
       await writeSnapshotCache({
-        key: `shared:${root.reference.sharedId}`,
+        key: `shared:${routeProviderId}:${root.reference.sharedId}`,
         snapshot: result.snapshot,
         etag: result.etag,
         cachedAt: new Date().toISOString(),
       });
     } catch (err) {
-      if (isGraphError(err) && err.status === 404) {
+      if (
+        routeProviderId === "gdrive" &&
+        isStoragePermissionScopeError(err) &&
+        canPromptGoogleConsent()
+      ) {
+        markGoogleConsentPrompted();
+        try {
+          await providerSession.signIn({ prompt: "consent" });
+          await loadFromRemote();
+          return;
+        } catch {
+          // Fall through to default error handling.
+        }
+      }
+      if (isStorageNotFound(err)) {
         try {
           const root = await ensureRootInfo();
           if (!root.info.canWrite) {
@@ -420,7 +447,7 @@ export function SharedDataProvider({
           }
           const now = new Date().toISOString();
           const emptySnapshot = createEmptySnapshot(now);
-          const result = await oneDrive.writeSharedSnapshot(root.reference, emptySnapshot);
+          const result = await storage.writeSharedSnapshot(root.reference, emptySnapshot);
           applySnapshot(
             emptySnapshot,
             result.etag,
@@ -429,7 +456,7 @@ export function SharedDataProvider({
             null,
           );
           await writeSnapshotCache({
-            key: `shared:${root.reference.sharedId}`,
+            key: `shared:${routeProviderId}:${root.reference.sharedId}`,
             snapshot: emptySnapshot,
             etag: result.etag,
             cachedAt: now,
@@ -444,7 +471,7 @@ export function SharedDataProvider({
           return;
         }
       }
-      if (isGraphError(err) && err.code === "network_error") {
+      if (isStorageNetworkError(err)) {
         await loadFromCache();
         setMessage("Offline mode. Showing cached data.");
         return;
@@ -462,7 +489,9 @@ export function SharedDataProvider({
     loadFromCache,
     loadLatestEventFromRemote,
     loadLeaseFromRemote,
-    oneDrive,
+    providerSession,
+    routeProviderId,
+    storage,
   ]);
   useEffect(() => {
     pendingEventsRef.current = pendingEvents;
@@ -505,12 +534,12 @@ export function SharedDataProvider({
       }
       const root = await ensureRootInfo();
       const loader = createHistoryLoader({
-        listChunkIds: () => oneDrive.listSharedEventChunkIds(root.reference),
-        readChunk: (chunkId) => oneDrive.readSharedEventChunk(root.reference, chunkId),
+        listChunkIds: () => storage.listSharedEventChunkIds(root.reference),
+        readChunk: (chunkId) => storage.readSharedEventChunk(root.reference, chunkId),
       });
       return withTimeout(loader(input), 12_000);
     },
-    [ensureRootInfo, isOnline, isSignedIn, oneDrive, sharedReference],
+    [ensureRootInfo, isOnline, isSignedIn, sharedReference, storage],
   );
 
   const flushPendingHistoryChunks = useCallback(
@@ -523,7 +552,7 @@ export function SharedDataProvider({
       for (let index = 0; index < queue.length; index += 1) {
         const chunk = queue[index];
         try {
-          await oneDrive.writeSharedEventChunk(root, chunk.chunkId, chunk.content);
+          await storage.writeSharedEventChunk(root, chunk.chunkId, chunk.content);
         } catch (err) {
           return {
             ok: false,
@@ -534,7 +563,7 @@ export function SharedDataProvider({
       }
       return { ok: true };
     },
-    [oneDrive],
+    [storage],
   );
 
   const handleConflict = useCallback(async () => {
@@ -579,7 +608,7 @@ export function SharedDataProvider({
 
     try {
       const root = await ensureRootInfo();
-      await oneDrive.ensureSharedEventsFolder(root.reference);
+      await storage.ensureSharedEventsFolder(root.reference);
 
       if (hasPendingHistoryChunks) {
         const retryResult = await flushPendingHistoryChunks(
@@ -636,11 +665,11 @@ export function SharedDataProvider({
         return { ok: false, reason: "missing_etag" };
       }
 
-      const chunkIds = await oneDrive.listSharedEventChunkIds(root.reference);
+      const chunkIds = await storage.listSharedEventChunkIds(root.reference);
       const nextChunkId = chunkIds.length === 0 ? 1 : Math.max(...chunkIds) + 1;
       const chunks = buildEventChunks(versionedEvents, nextChunkId, MAX_EVENTS_PER_CHUNK, now);
 
-      const writeResult = await oneDrive.writeSharedSnapshot(root.reference, nextSnapshot, {
+      const writeResult = await storage.writeSharedSnapshot(root.reference, nextSnapshot, {
         ifMatch: currentEtag,
       });
 
@@ -662,12 +691,12 @@ export function SharedDataProvider({
       setSource("remote");
       setStatus("ready");
       setMessage(
-        repairWarningMessage ? `${repairWarningMessage} Saved to OneDrive.` : "Saved to OneDrive.",
+        repairWarningMessage ? `${repairWarningMessage} Saved to cloud.` : "Saved to cloud.",
       );
       setError(null);
 
       await writeSnapshotCache({
-        key: `shared:${root.reference.sharedId}`,
+        key: `shared:${routeProviderId}:${root.reference.sharedId}`,
         snapshot: nextSnapshot,
         etag: nextEtag,
         cachedAt: now,
@@ -697,7 +726,7 @@ export function SharedDataProvider({
       setRetryQueueCount(0);
       return { ok: true };
     } catch (err) {
-      if (isPreconditionFailed(err)) {
+      if (isStoragePreconditionFailed(err)) {
         await handleConflict();
         return { ok: false, reason: "conflict" };
       }
@@ -715,11 +744,12 @@ export function SharedDataProvider({
     handleConflict,
     isOnline,
     isSignedIn,
-    oneDrive,
     pendingEvents,
+    routeProviderId,
     savedLatestEvent,
     sharedReference,
     snapshotRecord,
+    storage,
   ]);
 
   useEffect(() => {
@@ -733,9 +763,9 @@ export function SharedDataProvider({
     let isActive = true;
     const updateLease = async () => {
       try {
-        await oneDrive.ensureSharedLeasesFolder(sharedReference);
+        await storage.ensureSharedLeasesFolder(sharedReference);
         const payload = buildLeasePayload();
-        await oneDrive.writeSharedLease(sharedReference, payload);
+        await storage.writeSharedLease(sharedReference, payload);
         if (isActive) {
           setLease(payload);
           setLeaseError(null);
@@ -754,7 +784,7 @@ export function SharedDataProvider({
       isActive = false;
       window.clearInterval(intervalId);
     };
-  }, [buildLeasePayload, canWrite, isOnline, isSignedIn, oneDrive, pendingEvents, sharedReference]);
+  }, [buildLeasePayload, canWrite, isOnline, isSignedIn, pendingEvents, sharedReference, storage]);
 
   const ensureEditableState = useCallback((): { state: NormalizedState } | { error: string } => {
     if (!isOnline) {

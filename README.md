@@ -21,7 +21,7 @@ This app is not just an expense tracker or a simple asset manager; it focuses on
 ## ✨ Features
 
 - **Microsoft Account Only**: No proprietary account registration required.
-- **Fully Serverless (Client-to-OneDrive)**: All data is stored in the user's personal OneDrive (default: `/Apps/MazemazePiggyBank/`).
+- **Fully Serverless (Client-to-OneDrive)**: All data is stored in the user's personal OneDrive (default: `/Apps/Mazemaze Piggy Bank/`).
 - **Mobile First**: UI designed for one-handed operation on smartphones.
 - **Microsoft Fluent UI**: Adopts a design system that is both friendly and professional.
 - **Offline Viewing**: Browse the latest cached data even without an internet connection (Editing is disabled offline).
@@ -52,7 +52,7 @@ Data is stored in the user's OneDrive in the following structure.
 - **Snapshot**: A normalized JSON file holding the current state of Accounts, Positions, Goals, and Allocations.
 - **Events**: Chunked log files for auditing and recovery.
 - **Lease**: Temporary files used to control the UX for concurrent editing conflicts.
-- **Shared data**: Shared folders must live under `/Apps/MazemazePiggyBank/shared/` to appear in the Shared list.
+- **Shared data**: Shared folders must live under `/Apps/Mazemaze Piggy Bank/shared/` to appear in the Shared list.
 
 ---
 
@@ -84,7 +84,7 @@ This app supports **Personal Microsoft accounts only**.
    - `NEXT_PUBLIC_MSAL_CLIENT_ID`
    - `NEXT_PUBLIC_MSAL_REDIRECT_URI`
    - `NEXT_PUBLIC_MSAL_AUTHORITY` (recommended: `https://login.microsoftonline.com/consumers`)
-   - `NEXT_PUBLIC_ONEDRIVE_APP_ROOT` (recommended: `/Apps/MazemazePiggyBank/`)
+   - `NEXT_PUBLIC_ONEDRIVE_APP_ROOT` (recommended: `/Apps/Mazemaze Piggy Bank/`)
 
 ### OneDrive Smoke Test
 
@@ -130,7 +130,7 @@ The dev environment is intended to be **non-public**. Do not share the dev URL o
    - `NEXT_PUBLIC_MSAL_CLIENT_ID`
    - `NEXT_PUBLIC_MSAL_REDIRECT_URI` (set to the dev base URL used by the project)
    - `NEXT_PUBLIC_MSAL_AUTHORITY` (recommended: `https://login.microsoftonline.com/consumers`)
-   - `NEXT_PUBLIC_ONEDRIVE_APP_ROOT` (recommended: `/Apps/MazemazePiggyBank/`)
+   - `NEXT_PUBLIC_ONEDRIVE_APP_ROOT` (recommended: `/Apps/Mazemaze Piggy Bank/`)
 
 > Note: `NEXT_PUBLIC_MSAL_REDIRECT_URI` must be registered on the Microsoft Entra app as a Redirect URI.
 
@@ -161,7 +161,7 @@ Production is deployed to a separate Vercel project and is intended to be public
    - `NEXT_PUBLIC_MSAL_CLIENT_ID`
    - `NEXT_PUBLIC_MSAL_REDIRECT_URI` (set to the production base URL used by the project)
    - `NEXT_PUBLIC_MSAL_AUTHORITY` (recommended: `https://login.microsoftonline.com/consumers`)
-   - `NEXT_PUBLIC_ONEDRIVE_APP_ROOT` (recommended: `/Apps/MazemazePiggyBank/`)
+   - `NEXT_PUBLIC_ONEDRIVE_APP_ROOT` (recommended: `/Apps/Mazemaze Piggy Bank/`)
 
 > Note: You can use the same Entra app registration for dev and prod, but separate registrations are recommended for isolation.
 > If you use a single registration, keep Redirect URIs minimal and do not register preview URLs.

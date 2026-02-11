@@ -1,8 +1,11 @@
 "use client";
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { useStorageProviderContext } from "@/components/StorageProviderContext";
+import type { CloudProviderId } from "@/lib/storage/types";
 
 export type SharedSelection = {
+  providerId: CloudProviderId;
   sharedId: string;
   driveId: string;
   itemId: string;
@@ -12,8 +15,10 @@ export type SharedSelection = {
 
 type SharedSelectionContextValue = {
   selection: SharedSelection | null;
+  getSelection: (providerId: CloudProviderId) => SharedSelection | null;
   setSelection: (selection: SharedSelection | null) => void;
-  clearSelection: () => void;
+  setSelectionForProvider: (providerId: CloudProviderId, selection: SharedSelection | null) => void;
+  clearSelection: (providerId?: CloudProviderId) => void;
 };
 
 const STORAGE_KEY = "mazemaze-piggy-bank-shared-selection";
@@ -23,54 +28,74 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 const isString = (value: unknown): value is string => typeof value === "string";
 
-const parseSelection = (raw: string | null): SharedSelection | null => {
-  if (!raw) {
+const isProviderId = (value: unknown): value is CloudProviderId =>
+  value === "onedrive" || value === "gdrive";
+
+const parseSelection = (raw: unknown): SharedSelection | null => {
+  if (!isRecord(raw)) {
     return null;
+  }
+  if (
+    !isProviderId(raw.providerId) ||
+    !isString(raw.sharedId) ||
+    !isString(raw.driveId) ||
+    !isString(raw.itemId) ||
+    !isString(raw.name)
+  ) {
+    return null;
+  }
+  const webUrl = isString(raw.webUrl) ? raw.webUrl : undefined;
+  return {
+    providerId: raw.providerId,
+    sharedId: raw.sharedId,
+    driveId: raw.driveId,
+    itemId: raw.itemId,
+    name: raw.name,
+    webUrl,
+  };
+};
+
+const parseSelectionMap = (raw: string | null): Record<CloudProviderId, SharedSelection | null> => {
+  const empty: Record<CloudProviderId, SharedSelection | null> = {
+    onedrive: null,
+    gdrive: null,
+  };
+  if (!raw) {
+    return empty;
   }
   try {
     const parsed = JSON.parse(raw) as unknown;
     if (!isRecord(parsed)) {
-      return null;
+      return empty;
     }
-    if (!isString(parsed.sharedId) || !isString(parsed.driveId) || !isString(parsed.itemId)) {
-      return null;
-    }
-    if (!isString(parsed.name)) {
-      return null;
-    }
-    const webUrl = isString(parsed.webUrl) ? parsed.webUrl : undefined;
+    const onedrive = parseSelection(parsed.onedrive) ?? null;
+    const gdrive = parseSelection(parsed.gdrive) ?? null;
     return {
-      sharedId: parsed.sharedId,
-      driveId: parsed.driveId,
-      itemId: parsed.itemId,
-      name: parsed.name,
-      webUrl,
+      onedrive,
+      gdrive,
     };
   } catch {
-    return null;
+    return empty;
   }
 };
 
 const SharedSelectionContext = createContext<SharedSelectionContextValue | null>(null);
 
 export function SharedSelectionProvider({ children }: { children: React.ReactNode }) {
-  const [selection, setSelectionState] = useState<SharedSelection | null>(() => {
-    if (typeof window === "undefined") {
-      return null;
-    }
-    return parseSelection(window.localStorage.getItem(STORAGE_KEY));
-  });
+  const { activeProviderId } = useStorageProviderContext();
+  const [selections, setSelections] = useState<Record<CloudProviderId, SharedSelection | null>>(
+    () =>
+      typeof window === "undefined"
+        ? { onedrive: null, gdrive: null }
+        : parseSelectionMap(window.localStorage.getItem(STORAGE_KEY)),
+  );
 
   useEffect(() => {
     if (typeof window === "undefined") {
       return;
     }
-    if (selection) {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(selection));
-    } else {
-      window.localStorage.removeItem(STORAGE_KEY);
-    }
-  }, [selection]);
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(selections));
+  }, [selections]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -80,25 +105,63 @@ export function SharedSelectionProvider({ children }: { children: React.ReactNod
       if (event.key !== STORAGE_KEY) {
         return;
       }
-      setSelectionState(parseSelection(event.newValue));
+      setSelections(parseSelectionMap(event.newValue));
     };
     window.addEventListener("storage", handleStorage);
     return () => window.removeEventListener("storage", handleStorage);
   }, []);
 
-  const setSelection = useCallback((next: SharedSelection | null) => {
-    setSelectionState(next);
-  }, []);
+  const selection = selections[activeProviderId] ?? null;
 
-  const clearSelection = useCallback(() => setSelectionState(null), []);
+  const setSelectionForProvider = useCallback(
+    (providerId: CloudProviderId, next: SharedSelection | null) => {
+      setSelections((prev) => ({
+        ...prev,
+        [providerId]: next,
+      }));
+    },
+    [],
+  );
+
+  const setSelection = useCallback(
+    (next: SharedSelection | null) => {
+      if (next) {
+        setSelectionForProvider(next.providerId, next);
+        return;
+      }
+      setSelections((prev) => ({
+        ...prev,
+        [activeProviderId]: null,
+      }));
+    },
+    [activeProviderId, setSelectionForProvider],
+  );
+
+  const clearSelection = useCallback(
+    (providerId?: CloudProviderId) => {
+      const target = providerId ?? activeProviderId;
+      setSelections((prev) => ({
+        ...prev,
+        [target]: null,
+      }));
+    },
+    [activeProviderId],
+  );
+
+  const getSelection = useCallback(
+    (providerId: CloudProviderId) => selections[providerId] ?? null,
+    [selections],
+  );
 
   const value = useMemo(
     () => ({
       selection,
+      getSelection,
       setSelection,
+      setSelectionForProvider,
       clearSelection,
     }),
-    [selection, setSelection, clearSelection],
+    [selection, getSelection, setSelection, setSelectionForProvider, clearSelection],
   );
 
   return (

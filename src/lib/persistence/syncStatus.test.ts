@@ -5,6 +5,7 @@ describe("syncStatus", () => {
     expect(
       resolveSyncIndicatorState({
         isOnline: false,
+        isSignedIn: false,
         isSaving: true,
         retryQueueCount: 2,
         isViewOnly: true,
@@ -14,15 +15,17 @@ describe("syncStatus", () => {
     expect(
       resolveSyncIndicatorState({
         isOnline: true,
+        isSignedIn: false,
         isSaving: true,
         retryQueueCount: 2,
         isViewOnly: true,
       }),
-    ).toBe("saving");
+    ).toBe("sign_in_required");
 
     expect(
       resolveSyncIndicatorState({
         isOnline: true,
+        isSignedIn: true,
         isSaving: false,
         retryQueueCount: 2,
         isViewOnly: true,
@@ -32,6 +35,7 @@ describe("syncStatus", () => {
     expect(
       resolveSyncIndicatorState({
         isOnline: true,
+        isSignedIn: true,
         isSaving: false,
         retryQueueCount: 0,
         isViewOnly: true,
@@ -41,11 +45,22 @@ describe("syncStatus", () => {
     expect(
       resolveSyncIndicatorState({
         isOnline: true,
+        isSignedIn: true,
         isSaving: false,
         retryQueueCount: 0,
         isViewOnly: false,
       }),
     ).toBe("online");
+
+    expect(
+      resolveSyncIndicatorState({
+        isOnline: true,
+        isSignedIn: false,
+        isSaving: false,
+        retryQueueCount: 0,
+        isViewOnly: false,
+      }),
+    ).toBe("sign_in_required");
   });
 
   it("returns fixed labels and tones", () => {
@@ -57,5 +72,9 @@ describe("syncStatus", () => {
     });
     expect(getSyncIndicatorMeta("offline")).toEqual({ label: "Offline", tone: "red" });
     expect(getSyncIndicatorMeta("view_only")).toEqual({ label: "View-only", tone: "yellow" });
+    expect(getSyncIndicatorMeta("sign_in_required")).toEqual({
+      label: "Sign-in required",
+      tone: "yellow",
+    });
   });
 });

@@ -1,4 +1,4 @@
-import type { LeaseRecord } from "@/lib/onedrive/oneDriveService";
+import type { LeaseRecord } from "@/lib/storage/lease";
 import type { PendingEvent } from "@/lib/persistence/eventChunk";
 import type { HistoryFilter, HistoryPage } from "@/lib/persistence/history";
 import type { Snapshot } from "@/lib/persistence/snapshot";

@@ -1,24 +1,32 @@
 "use client";
 
 import { Button, Radio, RadioGroup, Spinner, Text } from "@fluentui/react-components";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import JSZip from "jszip";
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import { useAuth } from "@/components/AuthProvider";
 import { type ThemePreference, useTheme } from "@/components/AppProviders";
 import { usePersonalData } from "@/components/PersonalDataProvider";
 import { useSharedSelection } from "@/components/SharedSelectionProvider";
+import { useStorageProviderContext } from "@/components/StorageProviderContext";
 import { isAuthError } from "@/lib/auth/authErrors";
-import { getGraphScopes } from "@/lib/auth/msalConfig";
-import { createGraphClient } from "@/lib/graph/graphClient";
-import { isGraphError } from "@/lib/graph/graphErrors";
+import { DEFAULT_TEST_FILE_NAME } from "@/lib/onedrive/oneDriveService";
 import {
-  DEFAULT_TEST_FILE_NAME,
-  createOneDriveService,
-  type ShareLinkPermission,
-  type SharedRootListItem,
-  type SharedRootReference,
-} from "@/lib/onedrive/oneDriveService";
-import { clearSnapshotCache } from "@/lib/persistence/snapshotCache";
+  parseEventChunk,
+  serializeEventChunk,
+  type EventChunk,
+} from "@/lib/persistence/eventChunk";
+import { parseSnapshot, type Snapshot } from "@/lib/persistence/snapshot";
+import { clearSnapshotCache, clearSnapshotCacheForProvider } from "@/lib/persistence/snapshotCache";
 import { getSyncIndicatorMeta, resolveSyncIndicatorState } from "@/lib/persistence/syncStatus";
+import { formatStorageError, isStorageNotFound } from "@/lib/storage/storageErrors";
+import { createStorageService } from "@/lib/storage/storageService";
+import type {
+  CloudProviderId,
+  RootFolderNotice,
+  ShareLinkPermission,
+  SharedRootListItem,
+  SharedRootReference,
+} from "@/lib/storage/types";
 import { useNow } from "@/lib/time/useNow";
 
 type OperationState = {
@@ -32,13 +40,29 @@ type SharedRootsState = {
   message: string | null;
 };
 
+type MoveProgress = {
+  phase: "prepare" | "snapshot" | "events" | "cleanup";
+  message: string;
+  current?: number;
+  total?: number;
+};
+
 type SettingsSectionId =
-  | "provider-sign-in"
+  | "sign-in-storage"
   | "connection-health"
-  | "shared"
+  | "workspace"
+  | "data-portability"
   | "appearance"
   | "advanced-diagnostics"
   | "danger-zone";
+
+const SHARE_LINK_RADIO_NAME = "settings-share-link-access";
+const SHARE_LINK_RADIO_VIEW_ID = "settings-share-link-view";
+const SHARE_LINK_RADIO_EDIT_ID = "settings-share-link-edit";
+const THEME_RADIO_NAME = "settings-theme";
+const THEME_RADIO_SYSTEM_ID = "settings-theme-system";
+const THEME_RADIO_LIGHT_ID = "settings-theme-light";
+const THEME_RADIO_DARK_ID = "settings-theme-dark";
 
 const sensitiveKeys = [
   "authorization",
@@ -75,6 +99,11 @@ const looksLikeJwt = (value: string): boolean => {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null;
 
+const isString = (value: unknown): value is string => typeof value === "string";
+
+const isProviderId = (value: unknown): value is CloudProviderId =>
+  value === "onedrive" || value === "gdrive";
+
 const maskSensitiveData = (value: unknown, parentKey?: string): unknown => {
   if (typeof value === "string") {
     const key = parentKey?.toLowerCase() ?? "";
@@ -108,39 +137,12 @@ const formatPayload = (payload: unknown): string =>
 
 const getUserMessage = (error: unknown): string => {
   if (isAuthError(error)) {
-    if (error.code === "missing-config") {
-      return "Microsoft sign-in is not configured. Check your .env.local values.";
-    }
     if (error.code === "not-signed-in") {
       return "You are not signed in. Please sign in first.";
     }
-    return "Microsoft sign-in failed. Please try again.";
+    return error.message || "Sign-in failed. Please try again.";
   }
-  if (isGraphError(error)) {
-    if (error.code === "unauthorized") {
-      return "Authentication failed. Please sign in again.";
-    }
-    if (error.code === "forbidden") {
-      return "Permission denied. Please consent to the required Graph scopes.";
-    }
-    if (error.code === "not_found") {
-      return "The file or folder was not found.";
-    }
-    if (error.code === "rate_limited") {
-      return "Too many requests. Please wait and try again.";
-    }
-    if (error.code === "precondition_failed") {
-      return "The data changed on OneDrive. Please reload and try again.";
-    }
-    if (error.code === "network_error") {
-      return "Network error. Check your connection and try again.";
-    }
-    return "Microsoft Graph request failed. Please try again.";
-  }
-  if (error instanceof Error) {
-    return error.message;
-  }
-  return "Something went wrong. Please try again.";
+  return formatStorageError(error);
 };
 
 const getSaveErrorMessage = (reason: string, fallback?: string): string => {
@@ -167,22 +169,115 @@ const getSaveErrorMessage = (reason: string, fallback?: string): string => {
 
 const buildExportTimestamp = (): string => new Date().toISOString().replace(/[:.]/g, "-");
 
+const EXPORT_SCHEMA_VERSION = 1;
+const EXPORT_MANIFEST_FILE = "manifest.json";
+const EXPORT_SNAPSHOT_FILE = "snapshot.json";
+const EXPORT_EVENTS_FILE = "events.jsonl";
+
+type ExportManifest = {
+  schemaVersion: number;
+  createdAt: string;
+  scope: "personal" | "shared";
+  provider?: CloudProviderId;
+  snapshotFile: string;
+  eventsFile?: string;
+};
+
+type ImportPayload = {
+  manifest: ExportManifest;
+  snapshot: Snapshot;
+  eventChunks: EventChunk[];
+};
+
+const parseExportManifest = (value: unknown): ExportManifest => {
+  if (!isRecord(value)) {
+    throw new Error("Manifest is invalid.");
+  }
+  const schemaVersion = value.schemaVersion;
+  if (typeof schemaVersion !== "number" || schemaVersion !== EXPORT_SCHEMA_VERSION) {
+    throw new Error("Export format is not supported.");
+  }
+  if (!isString(value.createdAt)) {
+    throw new Error("Manifest createdAt is invalid.");
+  }
+  if (value.scope !== "personal" && value.scope !== "shared") {
+    throw new Error("Manifest scope is invalid.");
+  }
+  if (!isString(value.snapshotFile)) {
+    throw new Error("Manifest snapshot file is missing.");
+  }
+  const provider = isProviderId(value.provider) ? value.provider : undefined;
+  const eventsFile = isString(value.eventsFile) ? value.eventsFile : undefined;
+  return {
+    schemaVersion,
+    createdAt: value.createdAt,
+    scope: value.scope,
+    provider,
+    snapshotFile: value.snapshotFile,
+    eventsFile,
+  };
+};
+
+const parseEventArchive = (content: string): EventChunk[] => {
+  const trimmed = content.trim();
+  if (!trimmed) {
+    return [];
+  }
+  const lines = trimmed.split("\n").filter((line) => line.trim().length > 0);
+  const chunks: EventChunk[] = [];
+  let index = 0;
+  while (index < lines.length) {
+    const headerLine = lines[index];
+    let header: { eventCount?: number } & Partial<EventChunk>;
+    try {
+      header = JSON.parse(headerLine) as { eventCount?: number } & Partial<EventChunk>;
+    } catch {
+      throw new Error("Event log header is not valid JSON.");
+    }
+    if (!header || typeof header.eventCount !== "number") {
+      throw new Error("Event log header is missing eventCount.");
+    }
+    const eventCount = header.eventCount;
+    const slice = lines.slice(index, index + 1 + eventCount);
+    if (slice.length < 1 + eventCount) {
+      throw new Error("Event log is incomplete.");
+    }
+    const chunkContent = `${slice.join("\n")}\n`;
+    const parsed = parseEventChunk(chunkContent);
+    chunks.push(parsed);
+    index += 1 + eventCount;
+  }
+  return chunks;
+};
+
 const SETTINGS_SECTION_IDS: SettingsSectionId[] = [
-  "provider-sign-in",
+  "sign-in-storage",
   "connection-health",
-  "shared",
+  "workspace",
+  "data-portability",
   "appearance",
   "advanced-diagnostics",
   "danger-zone",
 ];
 
 const SETTINGS_SECTION_TITLES: Record<SettingsSectionId, string> = {
-  "provider-sign-in": "Provider & sign-in",
+  "sign-in-storage": "Sign-in & storage",
   "connection-health": "Connection health",
-  shared: "Shared",
+  workspace: "Workspace",
+  "data-portability": "Data & portability",
   appearance: "Appearance",
   "advanced-diagnostics": "Advanced / Diagnostics",
   "danger-zone": "Danger zone",
+};
+
+const PROVIDER_DESCRIPTIONS: Record<CloudProviderId, string> = {
+  onedrive: "Save to your Microsoft account.",
+  gdrive: "Save to your Google account.",
+};
+
+const PROVIDER_SIGNIN_LABELS: Record<CloudProviderId, string> = {
+  onedrive: "Sign in with Microsoft",
+  gdrive: "Sign in with Google",
 };
 
 const isSettingsSectionId = (value: string): value is SettingsSectionId =>
@@ -272,17 +367,21 @@ const mergeSharedRoots = (items: SharedRootListItem[]): SharedRootListItem[] => 
 };
 
 export function SettingsClient() {
-  const { status, account, error, signIn, signOut, getAccessToken } = useAuth();
+  const { providers, signIn, signOut, getAccessToken } = useAuth();
+  const { activeProviderId, setActiveProviderId } = useStorageProviderContext();
+  const activeProvider = providers[activeProviderId];
   const { preference, setPreference, mode } = useTheme();
   const data = usePersonalData();
   const { selection, setSelection, clearSelection } = useSharedSelection();
   const now = useNow(60_000);
   const [isMounted] = useState(() => typeof window !== "undefined");
+  const [isHydrated, setIsHydrated] = useState(false);
   const [isSelectionHydrated, setIsSelectionHydrated] = useState(false);
   const [isMobileViewport, setIsMobileViewport] = useState(false);
   const [activeSectionId, setActiveSectionId] = useState<SettingsSectionId | null>(null);
   const [overlayOrigin, setOverlayOrigin] = useState<"list" | "hash" | null>(null);
   const suppressNextHashOrigin = useRef(false);
+  const importInputRef = useRef<HTMLInputElement | null>(null);
 
   const [driveState, setDriveState] = useState<OperationState>({
     status: "idle",
@@ -292,6 +391,12 @@ export function SettingsClient() {
     status: "idle",
     message: null,
   });
+  const [importState, setImportState] = useState<OperationState>({
+    status: "idle",
+    message: null,
+  });
+  const [importPayload, setImportPayload] = useState<ImportPayload | null>(null);
+  const [importFileName, setImportFileName] = useState<string | null>(null);
   const [syncState, setSyncState] = useState<OperationState>({
     status: "idle",
     message: null,
@@ -310,6 +415,10 @@ export function SettingsClient() {
     status: "idle",
     message: null,
   });
+  const [switchState, setSwitchState] = useState<OperationState>({
+    status: "idle",
+    message: null,
+  });
   const [sharedRoots, setSharedRoots] = useState<SharedRootListItem[]>([]);
   const [sharedRootsState, setSharedRootsState] = useState<SharedRootsState>({
     status: "idle",
@@ -322,6 +431,7 @@ export function SettingsClient() {
     status: "idle",
     message: null,
   });
+  const [rootNotices, setRootNotices] = useState<RootFolderNotice[]>([]);
 
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [createFolderName, setCreateFolderName] = useState("");
@@ -330,69 +440,94 @@ export function SettingsClient() {
   const [deleteStep, setDeleteStep] = useState<1 | 2>(1);
   const [deleteAcknowledge, setDeleteAcknowledge] = useState(false);
   const [deleteConfirmText, setDeleteConfirmText] = useState("");
+  const [switchDialogOpen, setSwitchDialogOpen] = useState(false);
+  const [switchCandidates, setSwitchCandidates] = useState<
+    {
+      providerId: CloudProviderId;
+      label: string;
+      description: string;
+      status: "available" | "empty" | "not_signed_in";
+      accountLabel?: string;
+      statusNote?: string;
+      isActive: boolean;
+    }[]
+  >([]);
+  const providerSnapshots = useMemo(
+    () => ({
+      onedrive: {
+        status: providers.onedrive.status,
+        error: providers.onedrive.error,
+        account: providers.onedrive.account,
+      },
+      gdrive: {
+        status: providers.gdrive.status,
+        error: providers.gdrive.error,
+        account: providers.gdrive.account,
+      },
+    }),
+    [
+      providers.gdrive.account,
+      providers.gdrive.error,
+      providers.gdrive.status,
+      providers.onedrive.account,
+      providers.onedrive.error,
+      providers.onedrive.status,
+    ],
+  );
+  const [switchLoading, setSwitchLoading] = useState(false);
+  const [moveDialogOpen, setMoveDialogOpen] = useState(false);
+  const [moveStep, setMoveStep] = useState<1 | 2>(1);
+  const [moveAcknowledge, setMoveAcknowledge] = useState(false);
+  const [moveBackupConfirm, setMoveBackupConfirm] = useState(false);
+  const [moveConfirmText, setMoveConfirmText] = useState("");
+  const [moveTargetProviderId, setMoveTargetProviderId] = useState<CloudProviderId | null>(null);
+  const [moveProgress, setMoveProgress] = useState<MoveProgress | null>(null);
 
-  const graphScopes = useMemo(() => getGraphScopes(), []);
-  const tokenProvider = useCallback((scopes: string[]) => getAccessToken(scopes), [getAccessToken]);
-
-  const graphClient = useMemo(
-    () =>
-      createGraphClient({
-        accessTokenProvider: tokenProvider,
-        onRetry: (info) => {
-          setDriveState((prev) =>
-            prev.status === "working"
-              ? {
-                  ...prev,
-                  message: `Rate limited. Retrying in ${Math.ceil(
-                    info.delayMs / 1000,
-                  )}s (attempt ${info.attempt}/3).`,
-                }
-              : prev,
-          );
-        },
-      }),
-    [tokenProvider],
+  const tokenProviders = useMemo(
+    () => ({
+      onedrive: (scopes: string[]) => getAccessToken("onedrive", scopes),
+      gdrive: (scopes: string[]) => getAccessToken("gdrive", scopes),
+    }),
+    [getAccessToken],
   );
 
-  const oneDrive = useMemo(
-    () => createOneDriveService(graphClient, graphScopes),
-    [graphClient, graphScopes],
+  const storageByProvider = useMemo(
+    () => ({
+      onedrive: createStorageService("onedrive", tokenProviders.onedrive),
+      gdrive: createStorageService("gdrive", tokenProviders.gdrive),
+    }),
+    [tokenProviders],
   );
+  const storage = storageByProvider[activeProviderId];
 
-  const appRootLabel = process.env.NEXT_PUBLIC_ONEDRIVE_APP_ROOT ?? "/Apps/MazemazePiggyBank/";
+  const appRootLabel = isHydrated ? storage.appRootLabel : "Loading...";
+  const storageLabel = isHydrated ? storage.label : "Loading...";
   const effectiveSelection = isSelectionHydrated ? selection : null;
   const sharedRoot = useMemo<SharedRootReference | null>(() => {
     if (!effectiveSelection) {
       return null;
     }
     return {
+      providerId: activeProviderId,
       sharedId: effectiveSelection.sharedId,
       driveId: effectiveSelection.driveId,
       itemId: effectiveSelection.itemId,
     };
-  }, [effectiveSelection]);
+  }, [activeProviderId, effectiveSelection]);
 
-  const signInStatus =
-    status === "loading"
-      ? "Checking sign-in status..."
-      : status === "signed_in"
-        ? `Signed in as ${account?.name ?? account?.username ?? "Unknown"}`
-        : status === "error"
-          ? "Sign-in configuration error"
-          : "Not connected";
-
-  const isSignedIn = status === "signed_in";
+  const isSignedIn = activeProvider.status === "signed_in";
   const isDriveWorking = driveState.status === "working";
   const isExportWorking = exportState.status === "working";
+  const isImportWorking = importState.status === "working";
   const isSyncWorking = syncState.status === "working";
   const isSharedWorking = sharedState.status === "working";
   const isShareLinkWorking = shareLinkState.status === "working";
   const isDangerWorking = dangerState.status === "working";
-  const isAuthLoading = status === "loading";
-  const isAuthBlocked = status === "error";
+  const isSwitchWorking = switchState.status === "working";
 
   const currentSyncState = resolveSyncIndicatorState({
     isOnline: data.isOnline,
+    isSignedIn,
     isSaving: data.activity === "saving",
     retryQueueCount: data.retryQueueCount,
     isViewOnly: !data.canWrite,
@@ -405,8 +540,39 @@ export function SettingsClient() {
     ? formatAbsoluteTimestamp(data.snapshot.updatedAt)
     : null;
 
-  const accountLabel = account?.name ?? account?.username ?? "Unknown";
-  const providerSummary = isSignedIn ? `Signed in as ${accountLabel}` : "Not signed in";
+  useEffect(() => {
+    let cancelled = false;
+    if (!isSignedIn || !data.isOnline) {
+      setRootNotices([]);
+      return () => {
+        cancelled = true;
+      };
+    }
+    storage
+      .getRootFolderNotices()
+      .then((notices) => {
+        if (cancelled) {
+          return;
+        }
+        setRootNotices(notices);
+      })
+      .catch(() => {
+        if (cancelled) {
+          return;
+        }
+        setRootNotices([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [data.isOnline, isSignedIn, storage]);
+
+  const anySignedIn = Object.values(providers).some((provider) => provider.status === "signed_in");
+  const signInSummary = isSignedIn
+    ? `Connected to ${storage.label}`
+    : anySignedIn
+      ? "Sign-in required"
+      : "Not signed in";
 
   const selectedSharedId = effectiveSelection?.sharedId ?? "";
   const selectedSharedRoot = sharedRoots.find((root) => root.sharedId === selectedSharedId) ?? null;
@@ -432,6 +598,9 @@ export function SettingsClient() {
     return null;
   }, [data.canWrite, data.isOnline, data.retryQueueCount, isSignedIn, isSyncWorking]);
   const shareLinkDisabledReason = useMemo(() => {
+    if (!storage.capabilities.supportsShareLinks) {
+      return "Share links are unavailable for this provider.";
+    }
     if (!isSignedIn) {
       return "Sign in to create share links.";
     }
@@ -439,17 +608,51 @@ export function SettingsClient() {
       return "Reconnect to create share links.";
     }
     if (!sharedRoot) {
-      return "Select a shared folder first.";
+      return "Select a shared workspace first.";
     }
     if (isSharedWorking) {
-      return "Wait for shared folder updates to finish.";
+      return "Wait for shared workspace updates to finish.";
     }
     if (isShareLinkWorking) {
       return "Creating share link...";
     }
     return null;
-  }, [data.isOnline, isShareLinkWorking, isSharedWorking, isSignedIn, sharedRoot]);
+  }, [data.isOnline, isShareLinkWorking, isSharedWorking, isSignedIn, sharedRoot, storage]);
   const isShareLinkDisabled = Boolean(shareLinkDisabledReason);
+  const importSummary = useMemo(() => {
+    if (!importPayload) {
+      return null;
+    }
+    const eventCount = importPayload.eventChunks.reduce(
+      (sum, chunk) => sum + chunk.events.length,
+      0,
+    );
+    return {
+      scope: importPayload.manifest.scope,
+      provider: importPayload.manifest.provider,
+      createdAt: importPayload.manifest.createdAt,
+      snapshotVersion: importPayload.snapshot.version,
+      snapshotUpdatedAt: importPayload.snapshot.updatedAt,
+      eventCount,
+      chunkCount: importPayload.eventChunks.length,
+    };
+  }, [importPayload]);
+  const importApplyDisabledReason = useMemo(() => {
+    if (!importPayload) {
+      return "Choose an export file first.";
+    }
+    if (!isSignedIn) {
+      return "Sign in to import data.";
+    }
+    if (!data.isOnline) {
+      return "Reconnect to import data.";
+    }
+    if (importPayload.manifest.scope === "shared" && !sharedRoot) {
+      return "Select a shared workspace first.";
+    }
+    return null;
+  }, [data.isOnline, importPayload, isSignedIn, sharedRoot]);
+  const isImportApplyDisabled = Boolean(importApplyDisabledReason);
 
   const connectionSummary = useMemo(() => {
     if (currentSyncState === "retry_needed") {
@@ -457,6 +660,9 @@ export function SettingsClient() {
     }
     if (currentSyncState === "offline") {
       return "Offline";
+    }
+    if (currentSyncState === "sign_in_required") {
+      return "Sign-in required";
     }
     if (currentSyncState === "view_only") {
       return "View-only";
@@ -485,7 +691,7 @@ export function SettingsClient() {
       return "Not signed in";
     }
     if (!effectiveSelection) {
-      return "Not selected";
+      return "Shared workspace not selected";
     }
     const base = `Selected: ${effectiveSelection.name}`;
     if (sharedAccess.status === "loading") {
@@ -498,15 +704,16 @@ export function SettingsClient() {
   }, [effectiveSelection, isSignedIn, sharedAccess.message, sharedAccess.status]);
 
   const appearanceSummary = formatThemePreference(preference);
+  const dataPortabilitySummary = "Export & import";
   const advancedSummary = "Diagnostics & tools";
   const dangerSummary = "Delete cloud data";
 
   const settingsListItems = useMemo(
     () => [
       {
-        id: "provider-sign-in" as const,
-        title: SETTINGS_SECTION_TITLES["provider-sign-in"],
-        summary: providerSummary,
+        id: "sign-in-storage" as const,
+        title: SETTINGS_SECTION_TITLES["sign-in-storage"],
+        summary: signInSummary,
       },
       {
         id: "connection-health" as const,
@@ -514,9 +721,14 @@ export function SettingsClient() {
         summary: connectionSummary,
       },
       {
-        id: "shared" as const,
-        title: SETTINGS_SECTION_TITLES.shared,
+        id: "workspace" as const,
+        title: SETTINGS_SECTION_TITLES.workspace,
         summary: sharedSummary,
+      },
+      {
+        id: "data-portability" as const,
+        title: SETTINGS_SECTION_TITLES["data-portability"],
+        summary: dataPortabilitySummary,
       },
       {
         id: "appearance" as const,
@@ -539,7 +751,8 @@ export function SettingsClient() {
       appearanceSummary,
       connectionSummary,
       dangerSummary,
-      providerSummary,
+      dataPortabilitySummary,
+      signInSummary,
       sharedSummary,
       advancedSummary,
     ],
@@ -551,18 +764,26 @@ export function SettingsClient() {
       setSharedRootsState({ status: "idle", message: null });
       return;
     }
-    setSharedRootsState({ status: "loading", message: "Loading shared folders..." });
+    if (!storage.capabilities.supportsShared) {
+      setSharedRoots([]);
+      setSharedRootsState({
+        status: "error",
+        message: "Shared workspaces are unavailable for this provider.",
+      });
+      return;
+    }
+    setSharedRootsState({ status: "loading", message: "Loading shared workspaces..." });
     try {
       const [withMe, byMe] = await Promise.all([
-        oneDrive.listSharedWithMeRoots(),
-        oneDrive.listSharedByMeRoots(),
+        storage.listSharedWithMeRoots(),
+        storage.listSharedByMeRoots(),
       ]);
       setSharedRoots(mergeSharedRoots([...withMe, ...byMe]));
       setSharedRootsState({ status: "ready", message: null });
     } catch (err) {
       setSharedRootsState({ status: "error", message: getUserMessage(err) });
     }
-  }, [data.isOnline, isSignedIn, oneDrive]);
+  }, [data.isOnline, isSignedIn, storage]);
 
   const handleRetryNow = useCallback(async () => {
     if (data.retryQueueCount <= 0) {
@@ -611,7 +832,7 @@ export function SettingsClient() {
       message: "Checking the app folder...",
     });
     try {
-      const result = await oneDrive.ensureAppRoot();
+      const result = await storage.ensureAppRoot();
       setDriveState({
         status: "success",
         message: "App folder is ready.",
@@ -623,7 +844,7 @@ export function SettingsClient() {
         message: getUserMessage(err),
       });
     }
-  }, [oneDrive]);
+  }, [storage]);
 
   const handleWriteTestFile = useCallback(async () => {
     setDriveState({
@@ -631,12 +852,12 @@ export function SettingsClient() {
       message: `Writing ${DEFAULT_TEST_FILE_NAME}...`,
     });
     try {
-      await oneDrive.ensureAppRoot();
+      await storage.ensureAppRoot();
       const payload = {
         message: "Hello from Piggy Bank.",
         updatedAt: new Date().toISOString(),
       };
-      const result = await oneDrive.writeJsonFile(DEFAULT_TEST_FILE_NAME, payload);
+      const result = await storage.writeJsonFile(DEFAULT_TEST_FILE_NAME, payload);
       setDriveState({
         status: "success",
         message: `Wrote ${DEFAULT_TEST_FILE_NAME}.`,
@@ -648,7 +869,7 @@ export function SettingsClient() {
         message: getUserMessage(err),
       });
     }
-  }, [oneDrive]);
+  }, [storage]);
 
   const handleReadTestFile = useCallback(async () => {
     setDriveState({
@@ -656,8 +877,8 @@ export function SettingsClient() {
       message: `Reading ${DEFAULT_TEST_FILE_NAME}...`,
     });
     try {
-      await oneDrive.ensureAppRoot();
-      const result = await oneDrive.readJsonFile(DEFAULT_TEST_FILE_NAME);
+      await storage.ensureAppRoot();
+      const result = await storage.readJsonFile(DEFAULT_TEST_FILE_NAME);
       setDriveState({
         status: "success",
         message: `Read ${DEFAULT_TEST_FILE_NAME}.`,
@@ -669,98 +890,190 @@ export function SettingsClient() {
         message: getUserMessage(err),
       });
     }
-  }, [oneDrive]);
+  }, [storage]);
 
-  const handleExportSnapshot = useCallback(
+  const handleExportArchive = useCallback(
     async (scope: "personal" | "shared") => {
       if (!isSignedIn) {
         setExportState({ status: "error", message: "Sign in to export data." });
         return;
       }
       if (scope === "shared" && !sharedRoot) {
-        setExportState({ status: "error", message: "Select a shared folder first." });
+        setExportState({ status: "error", message: "Select a shared workspace first." });
         return;
       }
       setExportState({
         status: "working",
-        message: `Preparing ${scope} snapshot export...`,
+        message: `Preparing ${scope} export...`,
       });
       try {
-        const timestamp = buildExportTimestamp();
-        if (scope === "personal") {
-          await oneDrive.ensureAppRoot();
-          const result = await oneDrive.readPersonalSnapshot();
-          const payload = JSON.stringify(result.snapshot, null, 2);
-          downloadBlob(
-            new Blob([payload], { type: "application/json" }),
-            `mazemaze-piggy-bank-personal-snapshot-${timestamp}.json`,
-          );
-        } else {
-          const result = await oneDrive.readSharedSnapshot(sharedRoot as SharedRootReference);
-          const payload = JSON.stringify(result.snapshot, null, 2);
-          downloadBlob(
-            new Blob([payload], { type: "application/json" }),
-            `mazemaze-piggy-bank-shared-snapshot-${timestamp}.json`,
-          );
-        }
-        setExportState({
-          status: "success",
-          message: `Downloaded ${scope} snapshot.`,
-        });
-      } catch (err) {
-        setExportState({ status: "error", message: getUserMessage(err) });
-      }
-    },
-    [isSignedIn, oneDrive, sharedRoot],
-  );
-
-  const handleExportEvents = useCallback(
-    async (scope: "personal" | "shared") => {
-      if (!isSignedIn) {
-        setExportState({ status: "error", message: "Sign in to export data." });
-        return;
-      }
-      if (scope === "shared" && !sharedRoot) {
-        setExportState({ status: "error", message: "Select a shared folder first." });
-        return;
-      }
-      setExportState({
-        status: "working",
-        message: `Preparing ${scope} event export...`,
-      });
-      try {
-        const timestamp = buildExportTimestamp();
-        const chunkIds =
+        const snapshotResult =
           scope === "personal"
-            ? await oneDrive.listEventChunkIds()
-            : await oneDrive.listSharedEventChunkIds(sharedRoot as SharedRootReference);
-        if (chunkIds.length === 0) {
-          setExportState({ status: "error", message: "No event logs found to export." });
-          return;
+            ? await storage.readPersonalSnapshot()
+            : await storage.readSharedSnapshot(sharedRoot as SharedRootReference);
+        let chunkIds: number[] = [];
+        try {
+          chunkIds =
+            scope === "personal"
+              ? await storage.listEventChunkIds()
+              : await storage.listSharedEventChunkIds(sharedRoot as SharedRootReference);
+        } catch (err) {
+          if (!isStorageNotFound(err)) {
+            throw err;
+          }
         }
         const sortedChunkIds = [...chunkIds].sort((a, b) => a - b);
-        const chunks = await Promise.all(
-          sortedChunkIds.map((chunkId) =>
-            scope === "personal"
-              ? oneDrive.readEventChunk(chunkId)
-              : oneDrive.readSharedEventChunk(sharedRoot as SharedRootReference, chunkId),
-          ),
-        );
-        const payload = chunks.join("\n");
-        downloadBlob(
-          new Blob([payload], { type: "text/plain" }),
-          `mazemaze-piggy-bank-${scope}-events-${timestamp}.jsonl`,
-        );
-        setExportState({
-          status: "success",
-          message: `Downloaded ${scope} event logs.`,
-        });
+        const chunks =
+          sortedChunkIds.length > 0
+            ? await Promise.all(
+                sortedChunkIds.map((chunkId) =>
+                  scope === "personal"
+                    ? storage.readEventChunk(chunkId)
+                    : storage.readSharedEventChunk(sharedRoot as SharedRootReference, chunkId),
+                ),
+              )
+            : [];
+        const parsedChunks = chunks.map((content) => parseEventChunk(content));
+        const eventsPayload =
+          parsedChunks.length > 0 ? parsedChunks.map(serializeEventChunk).join("") : null;
+        const manifest: ExportManifest = {
+          schemaVersion: EXPORT_SCHEMA_VERSION,
+          createdAt: new Date().toISOString(),
+          scope,
+          provider: activeProviderId,
+          snapshotFile: EXPORT_SNAPSHOT_FILE,
+          eventsFile: eventsPayload ? EXPORT_EVENTS_FILE : undefined,
+        };
+        const zip = new JSZip();
+        zip.file(EXPORT_MANIFEST_FILE, JSON.stringify(manifest, null, 2));
+        zip.file(EXPORT_SNAPSHOT_FILE, JSON.stringify(snapshotResult.snapshot, null, 2));
+        if (eventsPayload) {
+          zip.file(EXPORT_EVENTS_FILE, eventsPayload);
+        }
+        const blob = await zip.generateAsync({ type: "blob" });
+        const timestamp = buildExportTimestamp();
+        downloadBlob(blob, `mazemaze-piggy-bank-${scope}-export-${timestamp}.zip`);
+        setExportState({ status: "success", message: `Downloaded ${scope} export.` });
       } catch (err) {
+        if (isStorageNotFound(err)) {
+          setExportState({ status: "error", message: "No snapshot found to export." });
+          return;
+        }
         setExportState({ status: "error", message: getUserMessage(err) });
       }
     },
-    [isSignedIn, oneDrive, sharedRoot],
+    [activeProviderId, isSignedIn, storage, sharedRoot],
   );
+
+  const handleImportFileChange = useCallback(async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = "";
+    if (!file) {
+      return;
+    }
+    setImportState({ status: "working", message: "Reading import file..." });
+    try {
+      const zip = await JSZip.loadAsync(file);
+      const manifestEntry = zip.file(EXPORT_MANIFEST_FILE);
+      if (!manifestEntry) {
+        throw new Error("manifest.json is missing.");
+      }
+      const manifestRaw = await manifestEntry.async("text");
+      const manifest = parseExportManifest(JSON.parse(manifestRaw) as unknown);
+      const snapshotEntry = zip.file(manifest.snapshotFile);
+      if (!snapshotEntry) {
+        throw new Error("Snapshot file is missing.");
+      }
+      const snapshotContent = await snapshotEntry.async("text");
+      const snapshot = parseSnapshot(snapshotContent);
+      let eventChunks: EventChunk[] = [];
+      if (manifest.eventsFile) {
+        const eventsEntry = zip.file(manifest.eventsFile);
+        if (!eventsEntry) {
+          throw new Error("Event log file is missing.");
+        }
+        const eventsContent = await eventsEntry.async("text");
+        eventChunks = parseEventArchive(eventsContent);
+      }
+      setImportPayload({ manifest, snapshot, eventChunks });
+      setImportFileName(file.name);
+      setImportState({ status: "success", message: "Import file is ready." });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Could not read the import file.";
+      setImportPayload(null);
+      setImportFileName(null);
+      setImportState({ status: "error", message });
+    }
+  }, []);
+
+  const handlePickImportFile = useCallback(() => {
+    importInputRef.current?.click();
+  }, []);
+
+  const handleApplyImport = useCallback(async () => {
+    if (!importPayload) {
+      setImportState({ status: "error", message: "Choose an export file first." });
+      return;
+    }
+    if (!isSignedIn) {
+      setImportState({ status: "error", message: "Sign in to import data." });
+      return;
+    }
+    if (!data.isOnline) {
+      setImportState({ status: "error", message: "Reconnect to import data." });
+      return;
+    }
+    if (importPayload.manifest.scope === "shared" && !sharedRoot) {
+      setImportState({ status: "error", message: "Select a shared workspace first." });
+      return;
+    }
+    setImportState({ status: "working", message: "Applying import..." });
+    try {
+      const sortedChunks = [...importPayload.eventChunks].sort(
+        (left, right) => left.chunkId - right.chunkId,
+      );
+      if (importPayload.manifest.scope === "personal") {
+        await storage.writePersonalSnapshot(importPayload.snapshot);
+        await storage.deleteAllEventChunks();
+        if (sortedChunks.length > 0) {
+          await storage.ensureEventsFolder();
+          for (const chunk of sortedChunks) {
+            await storage.writeEventChunk(chunk.chunkId, serializeEventChunk(chunk), {
+              assumeMissing: true,
+            });
+          }
+        }
+        await clearSnapshotCache();
+        await data.refresh();
+        setImportState({
+          status: "success",
+          message: "Import applied. Personal data refreshed.",
+        });
+      } else {
+        const targetRoot = sharedRoot as SharedRootReference;
+        await storage.writeSharedSnapshot(targetRoot, importPayload.snapshot);
+        await storage.deleteAllSharedEventChunks(targetRoot);
+        if (sortedChunks.length > 0) {
+          await storage.ensureSharedEventsFolder(targetRoot);
+          for (const chunk of sortedChunks) {
+            await storage.writeSharedEventChunk(
+              targetRoot,
+              chunk.chunkId,
+              serializeEventChunk(chunk),
+              { assumeMissing: true },
+            );
+          }
+        }
+        await clearSnapshotCache();
+        setImportState({
+          status: "success",
+          message: "Import applied. Open the shared workspace to review.",
+        });
+      }
+    } catch (err) {
+      setImportState({ status: "error", message: getUserMessage(err) });
+    }
+  }, [data, importPayload, isSignedIn, sharedRoot, storage]);
 
   const handleSharedSelectionChange = useCallback(
     (nextSharedId: string) => {
@@ -775,33 +1088,38 @@ export function SettingsClient() {
         return;
       }
       setSelection({
+        providerId: activeProviderId,
         sharedId: target.sharedId,
-        driveId: target.driveId,
-        itemId: target.itemId,
+        driveId: target.driveId ?? "",
+        itemId: target.itemId ?? "",
         name: target.name,
         webUrl: target.webUrl,
       });
     },
-    [setSelection, sharedRoots],
+    [activeProviderId, setSelection, sharedRoots],
   );
 
   const handleCreateSharedFolder = useCallback(async () => {
     if (!isSignedIn) {
-      setSharedState({ status: "error", message: "Sign in to create shared folders." });
+      setSharedState({ status: "error", message: "Sign in to create shared workspaces." });
       return;
     }
     if (!data.isOnline) {
-      setSharedState({ status: "error", message: "Reconnect to create shared folders." });
+      setSharedState({ status: "error", message: "Reconnect to create shared workspaces." });
+      return;
+    }
+    if (!storage.capabilities.supportsShared) {
+      setSharedState({ status: "error", message: "Shared workspaces are unavailable." });
       return;
     }
     const normalized = createFolderName.trim();
     if (!normalized) {
-      setSharedState({ status: "error", message: "Enter a folder name." });
+      setSharedState({ status: "error", message: "Enter a workspace name." });
       return;
     }
-    setSharedState({ status: "working", message: "Creating shared folder..." });
+    setSharedState({ status: "working", message: "Creating shared workspace..." });
     try {
-      const created = await oneDrive.createSharedFolder(normalized);
+      const created = await storage.createSharedFolder(normalized);
       setSharedRoots((prev) => mergeSharedRoots([...prev, created]));
       setCreateFolderName("");
       setCreateDialogOpen(false);
@@ -809,7 +1127,7 @@ export function SettingsClient() {
     } catch (err) {
       setSharedState({ status: "error", message: getUserMessage(err) });
     }
-  }, [createFolderName, data.isOnline, isSignedIn, oneDrive]);
+  }, [createFolderName, data.isOnline, isSignedIn, storage]);
 
   const handleCreateShareLink = useCallback(async () => {
     if (!isSignedIn) {
@@ -820,13 +1138,17 @@ export function SettingsClient() {
       setShareLinkState({ status: "error", message: "Reconnect to create share links." });
       return;
     }
+    if (!storage.capabilities.supportsShareLinks) {
+      setShareLinkState({ status: "error", message: "Share links are unavailable." });
+      return;
+    }
     if (!sharedRoot) {
-      setShareLinkState({ status: "error", message: "Select a shared folder first." });
+      setShareLinkState({ status: "error", message: "Select a shared workspace first." });
       return;
     }
     setShareLinkState({ status: "working", message: "Creating share link..." });
     try {
-      const result = await oneDrive.createShareLink(sharedRoot, shareLinkPermission);
+      const result = await storage.createShareLink(sharedRoot, shareLinkPermission);
       setShareLinkUrl(result.webUrl);
       const copied = await copyToClipboard(result.webUrl);
       setShareLinkState({
@@ -842,7 +1164,7 @@ export function SettingsClient() {
         payload: detail,
       });
     }
-  }, [data.isOnline, isSignedIn, oneDrive, shareLinkPermission, sharedRoot]);
+  }, [data.isOnline, isSignedIn, shareLinkPermission, sharedRoot, storage]);
 
   const handleCopyShareLink = useCallback(async () => {
     if (!shareLinkUrl) {
@@ -862,32 +1184,39 @@ export function SettingsClient() {
   }, [shareLinkUrl]);
 
   const handleCopySharedPath = useCallback(async () => {
-    const copied = await copyToClipboard(appRootLabel);
+    if (!isHydrated) {
+      setCopyPathMessage("Location is still loading.");
+      return;
+    }
+    const copied = await copyToClipboard(storage.appRootLabel);
     setCopyPathMessage(copied ? "Path copied." : "Copy failed. Copy the path manually.");
-  }, [appRootLabel]);
+  }, [isHydrated, storage.appRootLabel]);
 
-  const handleOpenInOneDrive = useCallback(async () => {
+  const handleOpenInDrive = useCallback(async () => {
     if (selectedSharedWebUrl) {
       window.open(selectedSharedWebUrl, "_blank", "noopener,noreferrer");
       return;
     }
     if (!sharedRoot) {
-      setShareLinkState({ status: "error", message: "Select a shared folder first." });
+      setShareLinkState({ status: "error", message: "Select a shared workspace first." });
       return;
     }
-    setShareLinkState({ status: "working", message: "Resolving OneDrive link..." });
+    setShareLinkState({
+      status: "working",
+      message: `Resolving ${storage.label} link...`,
+    });
     try {
-      const info = await oneDrive.getSharedRootInfo(sharedRoot);
+      const info = await storage.getSharedRootInfo(sharedRoot);
       if (!info.webUrl) {
-        setShareLinkState({ status: "error", message: "Could not resolve OneDrive link." });
+        setShareLinkState({ status: "error", message: "Could not resolve a link." });
         return;
       }
       window.open(info.webUrl, "_blank", "noopener,noreferrer");
-      setShareLinkState({ status: "success", message: "Opened in OneDrive." });
+      setShareLinkState({ status: "success", message: `Opened in ${storage.label}.` });
     } catch (err) {
       setShareLinkState({ status: "error", message: getUserMessage(err) });
     }
-  }, [oneDrive, selectedSharedWebUrl, sharedRoot]);
+  }, [selectedSharedWebUrl, sharedRoot, storage]);
 
   const openDeleteDialog = () => {
     setDeleteDialogOpen(true);
@@ -913,15 +1242,262 @@ export function SettingsClient() {
     }
     setDangerState({ status: "working", message: "Deleting cloud data..." });
     try {
-      await oneDrive.deleteAppCloudData();
-      await clearSnapshotCache();
+      await storage.deleteAppCloudData();
+      await clearSnapshotCacheForProvider(activeProviderId);
       clearSelection();
       setDangerState({ status: "success", message: "Cloud data deleted. Reloading..." });
       window.location.assign("/dashboard");
     } catch (err) {
       setDangerState({ status: "error", message: getUserMessage(err) });
     }
-  }, [clearSelection, isSignedIn, oneDrive]);
+  }, [activeProviderId, clearSelection, isSignedIn, storage]);
+
+  const resolveProviderAccountLabel = useCallback(
+    (providerId: CloudProviderId) =>
+      providerSnapshots[providerId].account?.name ??
+      providerSnapshots[providerId].account?.email ??
+      "Unknown",
+    [providerSnapshots],
+  );
+
+  const handleProviderSignIn = useCallback(
+    async (providerId: CloudProviderId, options?: { prompt?: string }) => {
+      setActiveProviderId(providerId);
+      setSwitchState({ status: "idle", message: null });
+      try {
+        await signIn(providerId, options);
+      } catch (err) {
+        setSwitchState({ status: "error", message: getUserMessage(err) });
+      }
+    },
+    [setActiveProviderId, signIn],
+  );
+
+  const checkProviderAvailability = useCallback(
+    async (providerId: CloudProviderId) => {
+      const provider = providerSnapshots[providerId];
+      if (provider.status !== "signed_in") {
+        return {
+          status: "not_signed_in" as const,
+          statusNote:
+            provider.status === "error"
+              ? (provider.error ?? "Sign-in unavailable.")
+              : provider.status === "loading"
+                ? "Checking sign-in status..."
+                : null,
+        };
+      }
+      if (!data.isOnline) {
+        return { status: "available" as const, statusNote: "Status unknown while offline." };
+      }
+      const targetStorage = storageByProvider[providerId];
+      try {
+        await targetStorage.readPersonalSnapshot();
+        return { status: "available" as const, statusNote: null };
+      } catch (err) {
+        if (!isStorageNotFound(err)) {
+          return { status: "available" as const, statusNote: "Status check failed." };
+        }
+        try {
+          const chunkIds = await targetStorage.listEventChunkIds();
+          if (chunkIds.length === 0) {
+            return { status: "empty" as const, statusNote: null };
+          }
+          return { status: "available" as const, statusNote: null };
+        } catch (chunkErr) {
+          if (isStorageNotFound(chunkErr)) {
+            return { status: "empty" as const, statusNote: null };
+          }
+          return { status: "available" as const, statusNote: "Status check failed." };
+        }
+      }
+    },
+    [data.isOnline, providerSnapshots, storageByProvider],
+  );
+
+  const refreshSwitchCandidates = useCallback(async () => {
+    setSwitchLoading(true);
+    setSwitchState({ status: "idle", message: null });
+    try {
+      const candidates = await Promise.all(
+        (["onedrive", "gdrive"] as CloudProviderId[]).map(async (providerId) => {
+          const availability = await checkProviderAvailability(providerId);
+          return {
+            providerId,
+            label: storageByProvider[providerId].label,
+            description: PROVIDER_DESCRIPTIONS[providerId],
+            status: availability.status,
+            statusNote: availability.statusNote ?? undefined,
+            accountLabel:
+              providerSnapshots[providerId].status === "signed_in"
+                ? resolveProviderAccountLabel(providerId)
+                : undefined,
+            isActive: providerId === activeProviderId,
+          };
+        }),
+      );
+      setSwitchCandidates(candidates);
+    } catch (err) {
+      setSwitchState({ status: "error", message: getUserMessage(err) });
+    } finally {
+      setSwitchLoading(false);
+    }
+  }, [
+    activeProviderId,
+    checkProviderAvailability,
+    providerSnapshots,
+    resolveProviderAccountLabel,
+    storageByProvider,
+  ]);
+
+  const openSwitchDialog = useCallback(() => {
+    setSwitchDialogOpen(true);
+    void refreshSwitchCandidates();
+  }, [refreshSwitchCandidates]);
+
+  const closeSwitchDialog = useCallback(() => {
+    if (isSwitchWorking) {
+      return;
+    }
+    setSwitchDialogOpen(false);
+    setSwitchState({ status: "idle", message: null });
+  }, [isSwitchWorking]);
+
+  const handleSwitchProvider = useCallback(
+    (providerId: CloudProviderId) => {
+      setActiveProviderId(providerId);
+      setSwitchState({
+        status: "success",
+        message: `Switched to ${storageByProvider[providerId].label}.`,
+      });
+      setSwitchDialogOpen(false);
+    },
+    [setActiveProviderId, storageByProvider],
+  );
+
+  const openMoveDialog = useCallback(
+    (providerId: CloudProviderId) => {
+      setMoveTargetProviderId(providerId);
+      setMoveStep(1);
+      setMoveAcknowledge(false);
+      setMoveBackupConfirm(false);
+      setMoveConfirmText("");
+      setMoveDialogOpen(true);
+      setSwitchDialogOpen(false);
+      setMoveProgress(null);
+    },
+    [setSwitchDialogOpen],
+  );
+
+  const closeMoveDialog = useCallback(() => {
+    if (isSwitchWorking) {
+      return;
+    }
+    setMoveDialogOpen(false);
+    setMoveStep(1);
+    setMoveAcknowledge(false);
+    setMoveBackupConfirm(false);
+    setMoveConfirmText("");
+    setMoveTargetProviderId(null);
+    setMoveProgress(null);
+  }, [isSwitchWorking]);
+
+  const handleMoveData = useCallback(async () => {
+    if (!moveTargetProviderId) {
+      return;
+    }
+    if (!isSignedIn) {
+      setSwitchState({ status: "error", message: "Sign in to move data." });
+      return;
+    }
+    if (!data.isOnline) {
+      setSwitchState({ status: "error", message: "Reconnect to move data." });
+      return;
+    }
+    if (moveTargetProviderId === activeProviderId) {
+      setSwitchState({ status: "error", message: "This provider is already active." });
+      return;
+    }
+    if (providers[moveTargetProviderId].status !== "signed_in") {
+      setSwitchState({ status: "error", message: "Sign in to the target provider first." });
+      return;
+    }
+    const targetLabel = storageByProvider[moveTargetProviderId].label;
+    const sourceLabel = storageByProvider[activeProviderId].label;
+    setSwitchState({
+      status: "working",
+      message: `Moving data to ${targetLabel}...`,
+    });
+    const sourceStorage = storageByProvider[activeProviderId];
+    const targetStorage = storageByProvider[moveTargetProviderId];
+    try {
+      setMoveProgress({ phase: "snapshot", message: "Reading source snapshot..." });
+      const snapshotResult = await sourceStorage.readPersonalSnapshot();
+      let chunkIds: number[] = [];
+      try {
+        chunkIds = await sourceStorage.listEventChunkIds();
+      } catch (err) {
+        if (!isStorageNotFound(err)) {
+          throw err;
+        }
+      }
+      const sortedChunkIds = [...chunkIds].sort((a, b) => a - b);
+      setMoveProgress({ phase: "prepare", message: "Preparing destination..." });
+      await targetStorage.deleteAllEventChunks();
+      await targetStorage.ensureEventsFolder();
+      setMoveProgress({ phase: "snapshot", message: `Copying snapshot to ${targetLabel}...` });
+      await targetStorage.writePersonalSnapshot(snapshotResult.snapshot);
+      if (sortedChunkIds.length > 0) {
+        setMoveProgress({
+          phase: "events",
+          message: `Copying ${sortedChunkIds.length} event chunks...`,
+          current: 0,
+          total: sortedChunkIds.length,
+        });
+        for (let index = 0; index < sortedChunkIds.length; index += 1) {
+          const chunkId = sortedChunkIds[index];
+          const content = await sourceStorage.readEventChunk(chunkId);
+          await targetStorage.writeEventChunk(chunkId, content, { assumeMissing: true });
+          setMoveProgress((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  current: index + 1,
+                }
+              : prev,
+          );
+        }
+      }
+      setMoveProgress({ phase: "cleanup", message: `Removing data from ${sourceLabel}...` });
+      await sourceStorage.deleteAppCloudData();
+      clearSelection(activeProviderId);
+      await clearSnapshotCache();
+      setActiveProviderId(moveTargetProviderId);
+      setMoveDialogOpen(false);
+      setSwitchDialogOpen(false);
+      setMoveProgress(null);
+      setSwitchState({
+        status: "success",
+        message: `Moved data to ${targetLabel}.`,
+      });
+    } catch (err) {
+      setMoveProgress(null);
+      if (isStorageNotFound(err)) {
+        setSwitchState({ status: "error", message: "No personal data found to move." });
+        return;
+      }
+      setSwitchState({ status: "error", message: getUserMessage(err) });
+    }
+  }, [
+    activeProviderId,
+    clearSelection,
+    data.isOnline,
+    isSignedIn,
+    moveTargetProviderId,
+    providers,
+    setActiveProviderId,
+    storageByProvider,
+  ]);
 
   const openSection = useCallback((sectionId: SettingsSectionId) => {
     setActiveSectionId(sectionId);
@@ -998,6 +1574,7 @@ export function SettingsClient() {
   useEffect(() => {
     const timerId = window.setTimeout(() => {
       setIsSelectionHydrated(true);
+      setIsHydrated(true);
     }, 0);
     return () => {
       window.clearTimeout(timerId);
@@ -1054,6 +1631,13 @@ export function SettingsClient() {
   }, [loadSharedRoots]);
 
   useEffect(() => {
+    if (!switchDialogOpen || moveDialogOpen || isSwitchWorking) {
+      return;
+    }
+    void refreshSwitchCandidates();
+  }, [data.isOnline, isSwitchWorking, moveDialogOpen, refreshSwitchCandidates, switchDialogOpen]);
+
+  useEffect(() => {
     let active = true;
     const run = async () => {
       if (!isSignedIn || !sharedRoot) {
@@ -1066,7 +1650,7 @@ export function SettingsClient() {
         setSharedAccess({ status: "loading", message: "Checking shared access..." });
       }
       try {
-        const info = await oneDrive.getSharedRootInfo(sharedRoot);
+        const info = await storage.getSharedRootInfo(sharedRoot);
         if (!active) {
           return;
         }
@@ -1085,45 +1669,166 @@ export function SettingsClient() {
       active = false;
       window.clearTimeout(timerId);
     };
-  }, [isSignedIn, oneDrive, sharedRoot]);
+  }, [isSignedIn, sharedRoot, storage]);
 
   const shareLinkDetail =
     typeof shareLinkState.payload === "string" ? shareLinkState.payload : null;
 
-  const renderProviderBody = () => (
-    <>
-      <div className="settings-row-grid" role="list">
-        <div className="settings-row" role="listitem">
-          <span className="app-muted">Provider</span>
-          <strong>OneDrive</strong>
+  const renderProviderSignInButton = (
+    providerId: CloudProviderId,
+    options?: { prompt?: string },
+  ) => {
+    const provider = providers[providerId];
+    const isLoading = provider.status === "loading";
+    const isDisabled = provider.status === "error" || isLoading;
+    return (
+      <button
+        type="button"
+        className={`provider-signin-button provider-signin-button-${providerId}`}
+        onClick={() => void handleProviderSignIn(providerId, options)}
+        disabled={isDisabled}
+        aria-label={PROVIDER_SIGNIN_LABELS[providerId]}
+      >
+        <span className="provider-signin-logo" aria-hidden>
+          {providerId === "onedrive" ? (
+            <svg viewBox="0 0 24 24" aria-hidden>
+              <rect x="1" y="1" width="10" height="10" fill="#F25022" />
+              <rect x="13" y="1" width="10" height="10" fill="#7FBA00" />
+              <rect x="1" y="13" width="10" height="10" fill="#00A4EF" />
+              <rect x="13" y="13" width="10" height="10" fill="#FFB900" />
+            </svg>
+          ) : (
+            <svg viewBox="0 0 18 18" aria-hidden>
+              <path
+                fill="#4285F4"
+                d="M17.64 9.2045c0-.638-.0573-1.251-.1636-1.836H9v3.476h4.8445c-.2082 1.121-.8364 2.071-1.7764 2.709v2.25h2.8845c1.689-1.554 2.688-3.846 2.688-6.282z"
+              />
+              <path
+                fill="#34A853"
+                d="M9 18c2.43 0 4.47-.806 5.96-2.188l-2.8845-2.25c-.806.54-1.836.86-3.076.86-2.364 0-4.364-1.596-5.086-3.74H0.93v2.332C2.412 15.978 5.47 18 9 18z"
+              />
+              <path
+                fill="#FBBC05"
+                d="M3.914 10.682c-.18-.54-.283-1.116-.283-1.682s.103-1.142.283-1.682V4.986H0.93C.332 6.186 0 7.54 0 9s.332 2.814.93 4.014l2.984-2.332z"
+              />
+              <path
+                fill="#EA4335"
+                d="M9 3.58c1.32 0 2.508.454 3.44 1.346l2.58-2.58C13.46.89 11.43 0 9 0 5.47 0 2.412 2.022.93 4.986l2.984 2.332C4.636 5.176 6.636 3.58 9 3.58z"
+              />
+            </svg>
+          )}
+        </span>
+        <span className="provider-signin-text">{PROVIDER_SIGNIN_LABELS[providerId]}</span>
+      </button>
+    );
+  };
+
+  const renderSignInStorageBody = () => {
+    if (!anySignedIn) {
+      return (
+        <>
+          <h3>Choose where to save</h3>
+          <p className="app-muted">Sign in to start saving your data in the cloud.</p>
+          <div className="settings-provider-grid">
+            {(["onedrive", "gdrive"] as CloudProviderId[]).map((providerId) => {
+              const provider = providers[providerId];
+              const isLoading = provider.status === "loading";
+              return (
+                <div key={providerId} className="settings-provider-card">
+                  <div className="settings-provider-card-header">
+                    <strong>{storageByProvider[providerId].label}</strong>
+                    {isLoading ? <Spinner size="tiny" /> : null}
+                  </div>
+                  <p className="app-muted">{PROVIDER_DESCRIPTIONS[providerId]}</p>
+                  {renderProviderSignInButton(providerId)}
+                  {provider.status === "error" ? (
+                    <p className="app-muted settings-help-text">
+                      {provider.error ?? "Sign-in is unavailable."}
+                    </p>
+                  ) : null}
+                </div>
+              );
+            })}
+          </div>
+          {switchState.message ? (
+            <div
+              className={`app-alert ${switchState.status === "error" ? "app-alert-error" : ""}`}
+              role="status"
+            >
+              <Text>{switchState.message}</Text>
+            </div>
+          ) : null}
+        </>
+      );
+    }
+
+    const workspaceLabel = effectiveSelection ? `Shared · ${effectiveSelection.name}` : "Personal";
+    const connectedProviderId =
+      activeProvider.status === "signed_in"
+        ? activeProviderId
+        : providers.onedrive.status === "signed_in"
+          ? "onedrive"
+          : providers.gdrive.status === "signed_in"
+            ? "gdrive"
+            : activeProviderId;
+    const connectedStorage = storageByProvider[connectedProviderId];
+    const connectedAccountLabel = resolveProviderAccountLabel(connectedProviderId);
+    const connectedProvider = providers[connectedProviderId];
+    return (
+      <>
+        <div className="settings-row-grid" role="list">
+          <div className="settings-row" role="listitem">
+            <span className="app-muted">Connected to</span>
+            <strong>{connectedStorage.label}</strong>
+          </div>
+          <div className="settings-row" role="listitem">
+            <span className="app-muted">Signed in as</span>
+            <strong>{connectedAccountLabel}</strong>
+          </div>
+          <div className="settings-row" role="listitem">
+            <span className="app-muted">Workspace</span>
+            <strong>{workspaceLabel}</strong>
+          </div>
         </div>
-        <div className="settings-row" role="listitem">
-          <span className="app-muted">Signed in as</span>
-          <strong>{isSignedIn ? accountLabel : "Not signed in"}</strong>
-        </div>
-      </div>
-      <p className="app-muted" style={{ marginTop: 8 }}>
-        {signInStatus}
-      </p>
-      <div className="app-actions" style={{ marginTop: 12 }}>
-        {status === "signed_in" ? (
-          <Button onClick={signOut} disabled={isAuthLoading}>
+        {effectiveSelection ? (
+          <p className="app-muted settings-help-text">Access: {sharedAccessLabel}</p>
+        ) : null}
+        <div className="app-actions" style={{ marginTop: 12 }}>
+          <Button
+            onClick={() => void signOut(connectedProviderId)}
+            disabled={connectedProvider.status === "loading" || isSwitchWorking}
+          >
             Sign out
           </Button>
-        ) : (
-          <Button appearance="primary" onClick={signIn} disabled={isAuthLoading || isAuthBlocked}>
-            Sign in
+          <Button appearance="primary" onClick={openSwitchDialog} disabled={isSwitchWorking}>
+            Switch…
           </Button>
-        )}
-        {isAuthLoading ? <Spinner size="tiny" /> : null}
-      </div>
-      {error ? (
-        <div className="app-alert app-alert-error" role="alert">
-          <Text>{error}</Text>
+          {connectedProvider.status === "loading" ? <Spinner size="tiny" /> : null}
         </div>
-      ) : null}
-    </>
-  );
+        {switchState.message ? (
+          <div
+            className={`app-alert ${switchState.status === "error" ? "app-alert-error" : ""}`}
+            role="status"
+          >
+            <Text>{switchState.message}</Text>
+          </div>
+        ) : null}
+      </>
+    );
+  };
+
+  const resolveRootNoticeLabel = (notice: RootFolderNotice): string => {
+    switch (notice.scope) {
+      case "app":
+        return "App folder";
+      case "personal":
+        return "Personal folder";
+      case "shared":
+        return "Shared folder";
+      default:
+        return "Folder";
+    }
+  };
 
   const renderConnectionHealthBody = () => (
     <>
@@ -1168,6 +1873,31 @@ export function SettingsClient() {
           </div>
         </div>
       </details>
+      {rootNotices.length > 0 ? (
+        <div className="app-alert" role="status">
+          <Text>
+            Notice: A folder name was changed. Sync will continue, but for backups use Export in
+            Data &amp; portability.
+          </Text>
+          <div className="settings-row-grid" role="list" style={{ marginTop: 8 }}>
+            {rootNotices.map((notice) => (
+              <div
+                className="settings-row"
+                role="listitem"
+                key={`${notice.scope}-${notice.actualName}`}
+              >
+                <span className="app-muted">{resolveRootNoticeLabel(notice)}</span>
+                <strong>
+                  {notice.actualName} (expected {notice.expectedName})
+                </strong>
+              </div>
+            ))}
+          </div>
+          <p className="app-muted settings-help-text" style={{ marginTop: 8 }}>
+            <a href="#data-portability">Open Data &amp; portability</a>
+          </p>
+        </div>
+      ) : null}
       {syncState.message ? (
         <div
           className={`app-alert ${syncState.status === "error" ? "app-alert-error" : ""}`}
@@ -1189,17 +1919,17 @@ export function SettingsClient() {
     </>
   );
 
-  const renderSharedBody = () => (
+  const renderWorkspaceBody = () => (
     <>
-      <p className="app-muted">Manage shared folder selection in one place.</p>
+      <p className="app-muted">Manage shared workspace selection and access in one place.</p>
       <div className="settings-subsection">
-        <h3>Shared folder</h3>
-        <p className="app-muted">Select or create the shared folder used by this app.</p>
+        <h3>Shared workspace</h3>
+        <p className="app-muted">Select or create the shared workspace used by this app.</p>
         <div className="settings-row-grid" role="list">
           <div className="settings-row" role="listitem">
-            <span className="app-muted">Selected folder</span>
+            <span className="app-muted">Selected workspace</span>
             <strong>
-              {effectiveSelection ? effectiveSelection.name : "No shared folder selected"}
+              {effectiveSelection ? effectiveSelection.name : "No shared workspace selected"}
             </strong>
           </div>
           <div className="settings-row" role="listitem">
@@ -1211,7 +1941,7 @@ export function SettingsClient() {
             )}
           </div>
           <div className="settings-row" role="listitem">
-            <span className="app-muted">Available folders</span>
+            <span className="app-muted">Available workspaces</span>
             <strong>{sharedRoots.length}</strong>
           </div>
         </div>
@@ -1221,7 +1951,9 @@ export function SettingsClient() {
             <span className="settings-truncate" title={appRootLabel}>
               {appRootLabel}
             </span>
-            <Button onClick={() => void handleCopySharedPath()}>Copy path</Button>
+            <Button onClick={() => void handleCopySharedPath()} disabled={!isHydrated}>
+              Copy path
+            </Button>
           </div>
           {copyPathMessage ? (
             <p className="app-muted settings-help-text">{copyPathMessage}</p>
@@ -1229,7 +1961,7 @@ export function SettingsClient() {
         </div>
         <div style={{ marginTop: 12 }}>
           <label className="app-muted" htmlFor="settings-shared-folder">
-            Shared folder
+            Shared workspace
           </label>
           <select
             id="settings-shared-folder"
@@ -1255,7 +1987,7 @@ export function SettingsClient() {
             }}
             disabled={!isSignedIn || !data.isOnline || isSharedWorking}
           >
-            Create shared folder…
+            Create shared workspace…
           </Button>
           <Button
             onClick={() => void loadSharedRoots()}
@@ -1268,7 +2000,7 @@ export function SettingsClient() {
           ) : null}
         </div>
         <p className="app-muted" style={{ marginTop: 10 }}>
-          Creating a folder doesn&apos;t share it automatically.
+          Creating a workspace doesn&apos;t share it automatically.
         </p>
         {sharedRootsState.message ? (
           <div
@@ -1290,7 +2022,7 @@ export function SettingsClient() {
       </div>
       <div className="settings-subsection">
         <h3>Share link</h3>
-        <p className="app-muted">Create a share link for the selected folder.</p>
+        <p className="app-muted">Create a share link for the selected workspace.</p>
         <div className="settings-field">
           <span className="app-muted">Access type</span>
           <RadioGroup
@@ -1300,9 +2032,10 @@ export function SettingsClient() {
             }
             aria-label="Share link access type"
             className="settings-access-type"
+            name={SHARE_LINK_RADIO_NAME}
           >
-            <Radio value="view" label="View" />
-            <Radio value="edit" label="Edit" />
+            <Radio id={SHARE_LINK_RADIO_VIEW_ID} value="view" label="View" />
+            <Radio id={SHARE_LINK_RADIO_EDIT_ID} value="edit" label="Edit" />
           </RadioGroup>
         </div>
         <div className="app-actions" style={{ marginTop: 12 }}>
@@ -1347,11 +2080,123 @@ export function SettingsClient() {
             ) : null}
             {shareLinkState.status === "error" && sharedRoot ? (
               <div className="app-actions" style={{ marginTop: 8 }}>
-                <Button onClick={() => void handleOpenInOneDrive()} disabled={isShareLinkWorking}>
-                  Open in OneDrive
+                <Button onClick={() => void handleOpenInDrive()} disabled={isShareLinkWorking}>
+                  Open in {storageLabel}
                 </Button>
               </div>
             ) : null}
+          </div>
+        ) : null}
+      </div>
+    </>
+  );
+
+  const renderDataPortabilityBody = () => (
+    <>
+      <p className="app-muted">
+        Export or import a zip archive containing snapshots and event logs.
+      </p>
+      <div className="settings-subsection">
+        <h3>Export</h3>
+        <p className="app-muted">Download a zip archive of your cloud data.</p>
+        <div className="app-actions">
+          <Button
+            onClick={() => void handleExportArchive("personal")}
+            disabled={!isSignedIn || isExportWorking}
+          >
+            Export personal data
+          </Button>
+          <Button
+            onClick={() => void handleExportArchive("shared")}
+            disabled={!isSignedIn || isExportWorking || !sharedRoot}
+          >
+            Export shared data
+          </Button>
+          {isExportWorking ? <Spinner size="tiny" /> : null}
+        </div>
+        {exportState.message ? (
+          <div
+            className={`app-alert ${exportState.status === "error" ? "app-alert-error" : ""}`}
+            role="status"
+          >
+            <Text>{exportState.message}</Text>
+          </div>
+        ) : null}
+      </div>
+      <div className="settings-subsection">
+        <h3>Import</h3>
+        <p className="app-muted">
+          Import a zip archive exported from Mazemaze Piggy Bank. This overwrites existing data.
+        </p>
+        <div className="settings-import-row">
+          <input
+            ref={importInputRef}
+            type="file"
+            accept=".zip"
+            onChange={handleImportFileChange}
+            className="settings-file-input"
+            aria-label="Import file"
+          />
+          <Button onClick={handlePickImportFile} disabled={isImportWorking}>
+            Choose file
+          </Button>
+          <span className="app-muted settings-import-filename">
+            {importFileName ?? "No file selected"}
+          </span>
+        </div>
+        {importSummary ? (
+          <div className="settings-import-preview">
+            <div className="settings-row-grid" role="list">
+              <div className="settings-row" role="listitem">
+                <span className="app-muted">Scope</span>
+                <strong>{importSummary.scope === "personal" ? "Personal" : "Shared"}</strong>
+              </div>
+              <div className="settings-row" role="listitem">
+                <span className="app-muted">Snapshot version</span>
+                <strong>{importSummary.snapshotVersion}</strong>
+              </div>
+              <div className="settings-row" role="listitem">
+                <span className="app-muted">Snapshot updated</span>
+                <strong>{formatAbsoluteTimestamp(importSummary.snapshotUpdatedAt)}</strong>
+              </div>
+              <div className="settings-row" role="listitem">
+                <span className="app-muted">Event logs</span>
+                <strong>
+                  {importSummary.eventCount} events · {importSummary.chunkCount} chunks
+                </strong>
+              </div>
+              <div className="settings-row" role="listitem">
+                <span className="app-muted">Exported at</span>
+                <strong>{formatAbsoluteTimestamp(importSummary.createdAt)}</strong>
+              </div>
+              {importSummary.provider ? (
+                <div className="settings-row" role="listitem">
+                  <span className="app-muted">Exported from</span>
+                  <strong>{storageByProvider[importSummary.provider].label}</strong>
+                </div>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
+        <div className="app-actions" style={{ marginTop: 12 }}>
+          <Button
+            appearance="primary"
+            onClick={() => void handleApplyImport()}
+            disabled={isImportApplyDisabled || isImportWorking}
+          >
+            Apply import
+          </Button>
+          {isImportWorking ? <Spinner size="tiny" /> : null}
+        </div>
+        {importApplyDisabledReason ? (
+          <p className="app-muted settings-help-text">{importApplyDisabledReason}</p>
+        ) : null}
+        {importState.message ? (
+          <div
+            className={`app-alert ${importState.status === "error" ? "app-alert-error" : ""}`}
+            role="status"
+          >
+            <Text>{importState.message}</Text>
           </div>
         ) : null}
       </div>
@@ -1365,10 +2210,11 @@ export function SettingsClient() {
         value={preference}
         onChange={(_, radioData) => setPreference(radioData.value as ThemePreference)}
         aria-label="Theme selection"
+        name={THEME_RADIO_NAME}
       >
-        <Radio value="system" label="System" />
-        <Radio value="light" label="Light" />
-        <Radio value="dark" label="Dark" />
+        <Radio id={THEME_RADIO_SYSTEM_ID} value="system" label="System" />
+        <Radio id={THEME_RADIO_LIGHT_ID} value="light" label="Light" />
+        <Radio id={THEME_RADIO_DARK_ID} value="dark" label="Dark" />
       </RadioGroup>
       <p className="app-muted">
         Current mode:{" "}
@@ -1384,8 +2230,10 @@ export function SettingsClient() {
       <summary>Show diagnostics</summary>
       <div className="section-stack" style={{ marginTop: 12 }}>
         <div className="app-surface">
-          <h3>OneDrive checks</h3>
-          <p className="app-muted">Run low-level checks against the app folder.</p>
+          <h3>Storage checks</h3>
+          <p className="app-muted">
+            Run low-level checks against the app folder in {storageLabel}.
+          </p>
           <div className="app-actions">
             <Button onClick={handleEnsureRoot} disabled={!isSignedIn || isDriveWorking}>
               Check app folder
@@ -1411,48 +2259,6 @@ export function SettingsClient() {
             <pre className="app-code">{formatPayload(driveState.payload)}</pre>
           ) : null}
         </div>
-
-        <div className="app-surface">
-          <h3>Export</h3>
-          <p className="app-muted">
-            Download snapshots and event logs for personal data or the selected shared folder.
-          </p>
-          <div className="app-actions">
-            <Button
-              onClick={() => void handleExportSnapshot("personal")}
-              disabled={!isSignedIn || isExportWorking}
-            >
-              Download personal snapshot
-            </Button>
-            <Button
-              onClick={() => void handleExportEvents("personal")}
-              disabled={!isSignedIn || isExportWorking}
-            >
-              Download personal events
-            </Button>
-            <Button
-              onClick={() => void handleExportSnapshot("shared")}
-              disabled={!isSignedIn || isExportWorking || !sharedRoot}
-            >
-              Download shared snapshot
-            </Button>
-            <Button
-              onClick={() => void handleExportEvents("shared")}
-              disabled={!isSignedIn || isExportWorking || !sharedRoot}
-            >
-              Download shared events
-            </Button>
-            {isExportWorking ? <Spinner size="tiny" /> : null}
-          </div>
-          {exportState.message ? (
-            <div
-              className={`app-alert ${exportState.status === "error" ? "app-alert-error" : ""}`}
-              role="status"
-            >
-              <Text>{exportState.message}</Text>
-            </div>
-          ) : null}
-        </div>
       </div>
     </details>
   );
@@ -1460,7 +2266,8 @@ export function SettingsClient() {
   const renderDangerBody = () => (
     <>
       <p className="app-muted">
-        Delete cloud data removes the app folder content under your configured app root in OneDrive.
+        Delete cloud data removes the app folder content under your configured app root in{" "}
+        {storageLabel}.
       </p>
       <div className="app-actions" style={{ marginTop: 12 }}>
         <Button
@@ -1485,12 +2292,14 @@ export function SettingsClient() {
 
   const renderSectionBody = (sectionId: SettingsSectionId) => {
     switch (sectionId) {
-      case "provider-sign-in":
-        return renderProviderBody();
+      case "sign-in-storage":
+        return renderSignInStorageBody();
       case "connection-health":
         return renderConnectionHealthBody();
-      case "shared":
-        return renderSharedBody();
+      case "workspace":
+        return renderWorkspaceBody();
+      case "data-portability":
+        return renderDataPortabilityBody();
       case "appearance":
         return renderAppearanceBody();
       case "advanced-diagnostics":
@@ -1560,6 +2369,196 @@ export function SettingsClient() {
         </div>
       ) : null}
 
+      {switchDialogOpen ? (
+        <div className="settings-modal-overlay" onClick={closeSwitchDialog}>
+          <div
+            className="settings-modal settings-switch-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="switch-storage-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h3 id="switch-storage-title">Switch storage</h3>
+            <p className="app-muted">
+              Open or move your personal data across OneDrive and Google Drive.
+            </p>
+            {switchLoading ? <p className="app-muted">Loading providers...</p> : null}
+            <div className="settings-switch-list">
+              {switchCandidates.map((candidate) => {
+                const statusLabel =
+                  candidate.status === "available"
+                    ? "Available"
+                    : candidate.status === "empty"
+                      ? "Empty"
+                      : "Not signed in";
+                const isActive = candidate.isActive;
+                const openLabel =
+                  candidate.status === "empty" ? "Create" : isActive ? "Current" : "Open";
+                return (
+                  <div
+                    key={candidate.providerId}
+                    className={`settings-switch-card ${isActive ? "settings-switch-card-active" : ""}`}
+                  >
+                    <div className="settings-switch-card-header">
+                      <div>
+                        <strong>{candidate.label}</strong>
+                        <div className="app-muted">{candidate.accountLabel ?? "Not signed in"}</div>
+                      </div>
+                      <span className="settings-chip">{statusLabel}</span>
+                    </div>
+                    <p className="app-muted">{candidate.description}</p>
+                    {candidate.statusNote ? (
+                      <p className="app-muted settings-help-text">{candidate.statusNote}</p>
+                    ) : null}
+                    <div className="app-actions">
+                      {candidate.status === "not_signed_in" ? (
+                        renderProviderSignInButton(candidate.providerId)
+                      ) : (
+                        <>
+                          <Button
+                            appearance="primary"
+                            onClick={() => handleSwitchProvider(candidate.providerId)}
+                            disabled={isSwitchWorking || isActive}
+                          >
+                            {openLabel}
+                          </Button>
+                          <Button
+                            onClick={() => openMoveDialog(candidate.providerId)}
+                            disabled={isSwitchWorking || isActive}
+                          >
+                            Move data…
+                          </Button>
+                          <Button
+                            onClick={() =>
+                              void handleProviderSignIn(candidate.providerId, {
+                                prompt: "select_account",
+                              })
+                            }
+                            disabled={isSwitchWorking}
+                          >
+                            Switch account
+                          </Button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            {switchState.message ? (
+              <div
+                className={`app-alert ${switchState.status === "error" ? "app-alert-error" : ""}`}
+                role="status"
+              >
+                <Text>{switchState.message}</Text>
+              </div>
+            ) : null}
+            <div className="app-actions" style={{ marginTop: 16 }}>
+              <Button onClick={closeSwitchDialog} disabled={isSwitchWorking}>
+                Close
+              </Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {moveDialogOpen && moveTargetProviderId ? (
+        <div className="settings-modal-overlay" onClick={closeMoveDialog}>
+          <div
+            className="settings-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="move-data-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h3 id="move-data-title">
+              Move data to {storageByProvider[moveTargetProviderId].label}
+            </h3>
+            {moveStep === 1 ? (
+              <>
+                <p className="app-muted">
+                  This copies your personal data from {storageByProvider[activeProviderId].label} to{" "}
+                  {storageByProvider[moveTargetProviderId].label} and then deletes the original app
+                  folder content in {storageByProvider[activeProviderId].label}. Existing data in
+                  the destination will be overwritten. Shared workspaces in the source provider will
+                  also be removed.
+                </p>
+                <label className="settings-checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={moveAcknowledge}
+                    onChange={(event) => setMoveAcknowledge(event.target.checked)}
+                  />
+                  <span>I understand this will overwrite data in the destination.</span>
+                </label>
+                <label className="settings-checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={moveBackupConfirm}
+                    onChange={(event) => setMoveBackupConfirm(event.target.checked)}
+                  />
+                  <span>I have a backup of my data.</span>
+                </label>
+                <div className="app-actions" style={{ marginTop: 16 }}>
+                  <Button onClick={closeMoveDialog} disabled={isSwitchWorking}>
+                    Cancel
+                  </Button>
+                  <Button
+                    appearance="primary"
+                    disabled={!moveAcknowledge || !moveBackupConfirm || isSwitchWorking}
+                    onClick={() => setMoveStep(2)}
+                  >
+                    Continue
+                  </Button>
+                </div>
+              </>
+            ) : (
+              <>
+                <p className="app-muted">Type MOVE to confirm.</p>
+                <input
+                  className="settings-text-input"
+                  value={moveConfirmText}
+                  onChange={(event) => setMoveConfirmText(event.target.value)}
+                  autoFocus
+                />
+                <div className="app-actions" style={{ marginTop: 16 }}>
+                  <Button onClick={() => setMoveStep(1)} disabled={isSwitchWorking}>
+                    Back
+                  </Button>
+                  <Button
+                    appearance="primary"
+                    disabled={moveConfirmText !== "MOVE" || isSwitchWorking}
+                    onClick={() => void handleMoveData()}
+                  >
+                    Move data
+                  </Button>
+                </div>
+                {isSwitchWorking && moveProgress ? (
+                  <div className="section-stack" style={{ marginTop: 12 }}>
+                    <p className="app-muted">{moveProgress.message}</p>
+                    {moveProgress.total && moveProgress.total > 0 ? (
+                      <>
+                        <progress
+                          value={moveProgress.current ?? 0}
+                          max={moveProgress.total}
+                          aria-label="Move progress"
+                          style={{ width: "100%" }}
+                        />
+                        <p className="app-muted">
+                          {moveProgress.current ?? 0} / {moveProgress.total}
+                        </p>
+                      </>
+                    ) : (
+                      <Spinner size="tiny" />
+                    )}
+                  </div>
+                ) : null}
+              </>
+            )}
+          </div>
+        </div>
+      ) : null}
+
       {createDialogOpen ? (
         <div className="settings-modal-overlay" onClick={() => setCreateDialogOpen(false)}>
           <div
@@ -1569,12 +2568,12 @@ export function SettingsClient() {
             aria-labelledby="create-shared-folder-title"
             onClick={(event) => event.stopPropagation()}
           >
-            <h3 id="create-shared-folder-title">Create shared folder</h3>
+            <h3 id="create-shared-folder-title">Create shared workspace</h3>
             <p className="app-muted">
-              Enter a folder name. The folder is not shared automatically.
+              Enter a workspace name. The workspace is not shared automatically.
             </p>
             <label className="app-muted" htmlFor="create-shared-folder-input">
-              Folder name
+              Workspace name
             </label>
             <input
               id="create-shared-folder-input"
@@ -1593,7 +2592,7 @@ export function SettingsClient() {
                 onClick={() => void handleCreateSharedFolder()}
                 disabled={isSharedWorking}
               >
-                Create folder
+                Create workspace
               </Button>
             </div>
           </div>
@@ -1614,7 +2613,7 @@ export function SettingsClient() {
               <>
                 <p className="app-muted">
                   This permanently removes snapshots, events, and leases from your app folder in
-                  OneDrive.
+                  {storageLabel}.
                 </p>
                 <label className="settings-checkbox-row">
                   <input
