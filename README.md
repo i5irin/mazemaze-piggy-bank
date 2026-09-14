@@ -149,6 +149,36 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000).
 
+## Development / Test Data Reset
+
+During development, incompatible data does not require migration or recovery. Reset disposable workspaces when needed. Use this procedure if incompatible data prevents the application's reset UI from working.
+
+### Before deleting data
+
+- Confirm the cloud account and the actual app folder. Development and production can share cloud data when they use the same account and app registration; different site URLs do not isolate storage.
+- Close all app tabs and installed PWA windows on every test device so an old session cannot save data again. Reset only disposable data you own. Deleting a shared workspace also affects its other members.
+- Reset the whole app root, including `personal/`, owned workspaces under `shared/`, `events/index.json`, event chunks, leases, and root metadata. Deleting only a snapshot leaves unrelated history and metadata behind. Do not delete the parent `Apps` folder or other applications' data.
+
+### OneDrive
+
+1. Open OneDrive in the browser with the test Microsoft account. Locate the application's folder under `Apps` (the documented default is `Mazemaze Piggy Bank`). The code uses Microsoft Graph's `/me/drive/special/approot`; the actual folder name may differ, especially after renaming or changing the app registration. `NEXT_PUBLIC_ONEDRIVE_APP_ROOT` is only a display label.
+2. Confirm the folder contents, then delete that app root. Its `.mpb-pointer.json` is inside the root and is deleted with it. If test roots were manually moved outside it, also remove those identified test roots.
+3. Leave unrelated files and the rest of the recycle bin alone. Do not restore the deleted test root during this test. On the next online initialization, the app resolves or creates its app root again.
+
+### Google Drive
+
+1. Open Google Drive in the browser with the test Google account. Locate the actual app root, normally `My Drive/Apps/MazemazePiggyBank` (or the configured Google app root). Confirm its contents and move that root to the trash. A rename alone is not a reset: the app follows folder IDs. Remove any additional disposable test roots with the same name that could be selected during recovery, and any identified test roots moved outside the app root.
+2. The pointer `.mpb-pointer.json` is in the hidden `appDataFolder`, **outside** the visible app root. For a full reset, open Drive settings → **Manage apps**, identify this application's OAuth app, and use its hidden-app-data deletion option when available. This clears this app's hidden data, not just one visible workspace. See [Google's hidden app data guidance](https://support.google.com/drive/answer/6374270?hl=en) and [application data folder documentation](https://developers.google.com/workspace/drive/api/guides/appdata).
+3. If no hidden-data deletion option is offered, deleting all identified test roots is enough for the current pointer recovery logic: a pointer to a deleted or trashed folder is discarded and rewritten on initialization. If an incompatible future pointer prevents recovery, use an isolated test account/app registration rather than restoring old data. Do not delete unrelated hidden app data or empty the entire trash.
+
+### Clear local state and verify
+
+1. Clear site data for the app's exact origin in the browser (local development, dev deployment, or production as applicable). Include IndexedDB, local/session storage, Cache Storage, and the Service Worker registration. The snapshot database is `mazemaze-piggy-bank`. This also clears local provider/shared-workspace selections and sign-in state. Repeat for each browser/profile or installed PWA used for testing; a hard reload alone is insufficient.
+2. Reopen the app online, sign in, select the intended provider, and open Personal. Complete empty-workspace creation if prompted. Confirm there are no old accounts, goals, or history entries. Owned shared workspaces should be gone; workspaces owned by someone else may still appear under `Shared with me` and are not part of this reset.
+3. Create a small test account, position, and goal; save an allocation, reload, and check the values and history. If old data reappears, recheck the account, actual root IDs/duplicate folders, and other running sessions. Do not import an incompatible old backup to validate a clean reset.
+
+The reset procedure is manual; no reset is performed by installing dependencies or running tests. The event index is derived from current-format event chunks and may be rebuilt after a failed save or a supported Import / Move; this is not migration of incompatible development data.
+
 ## 🔍 Quality Commands
 
 ```bash
