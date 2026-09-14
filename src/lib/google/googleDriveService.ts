@@ -3,6 +3,7 @@
 import { createGoogleDriveClient, buildMultipartBody } from "@/lib/google/googleDriveClient";
 import { GoogleDriveError, isGoogleDriveError } from "@/lib/google/googleDriveErrors";
 import { getGoogleDriveAppRoot } from "@/lib/auth/googleConfig";
+import { parseEventIndex, type EventIndex } from "@/lib/persistence/eventIndex";
 import { parseSnapshot, type Snapshot } from "@/lib/persistence/snapshot";
 import type { LeaseRecord } from "@/lib/storage/lease";
 
@@ -15,6 +16,7 @@ const LEASES_FOLDER_NAME = "leases";
 const LEASE_FILE_NAME = "lease.json";
 const EVENT_FILE_PREFIX = "event-";
 const EVENT_FILE_EXTENSION = ".jsonl";
+const EVENT_INDEX_FILE_NAME = "index.json";
 const SHARED_ROOT_FOLDER_NAME = "shared";
 const PERSONAL_ROOT_FOLDER_NAME = "personal";
 const POINTER_SCHEMA_VERSION = 1;
@@ -36,6 +38,7 @@ type DriveFile = {
 
 type DriveListResponse = {
   files: DriveFile[];
+  nextPageToken?: string;
 };
 
 type PointerRecord = {
@@ -315,14 +318,21 @@ const listChildren = async (
   if (extraQuery) {
     queryParts.push(extraQuery);
   }
-  const data = (await client.getJson("/files", scopes, {
-    q: buildListQuery(queryParts),
-    fields: DRIVE_FIELDS,
-    supportsAllDrives: "true",
-    includeItemsFromAllDrives: "true",
-    pageSize: "1000",
-  })) as DriveListResponse;
-  return data.files ?? [];
+  const files: DriveFile[] = [];
+  let pageToken: string | undefined;
+  do {
+    const data = (await client.getJson("/files", scopes, {
+      q: buildListQuery(queryParts),
+      fields: `${DRIVE_FIELDS},nextPageToken`,
+      supportsAllDrives: "true",
+      includeItemsFromAllDrives: "true",
+      pageSize: "1000",
+      ...(pageToken ? { pageToken } : {}),
+    })) as DriveListResponse;
+    files.push(...(data.files ?? []));
+    pageToken = data.nextPageToken;
+  } while (pageToken);
+  return files;
 };
 
 const listAppDataFilesByName = async (
@@ -594,6 +604,8 @@ export const createGoogleDriveService = (client: DriveClient, scopes: string[]) 
   let sharedRootPromise: Promise<DriveFile | null> | null = null;
   let rootProbePromise: Promise<void> | null = null;
   let rootProbeRootId: string | null = null;
+  const personalEventChunkFileIds = new Map<number, string>();
+  const sharedEventChunkFileIds = new Map<string, Map<number, string>>();
 
   const resetRootCaches = () => {
     pointerPromise = null;
@@ -604,6 +616,34 @@ export const createGoogleDriveService = (client: DriveClient, scopes: string[]) 
     sharedRootPromise = null;
     rootProbePromise = null;
     rootProbeRootId = null;
+    personalEventChunkFileIds.clear();
+    sharedEventChunkFileIds.clear();
+  };
+
+  const getSharedEventFileIdMap = (rootId: string): Map<number, string> => {
+    const existing = sharedEventChunkFileIds.get(rootId);
+    if (existing) {
+      return existing;
+    }
+    const next = new Map<number, string>();
+    sharedEventChunkFileIds.set(rootId, next);
+    return next;
+  };
+
+  const applyFileIdsToIndex = (index: EventIndex, map: Map<number, string>): EventIndex => ({
+    ...index,
+    chunks: index.chunks.map((chunk) => ({
+      ...chunk,
+      fileId: map.get(chunk.chunkId) ?? chunk.fileId,
+    })),
+  });
+
+  const primeCacheFromIndex = (index: EventIndex, map: Map<number, string>) => {
+    for (const chunk of index.chunks) {
+      if (chunk.fileId && !map.has(chunk.chunkId)) {
+        map.set(chunk.chunkId, chunk.fileId);
+      }
+    }
   };
 
   const getPointerRecord = async (): Promise<PointerRecord | null> => {
@@ -897,9 +937,44 @@ export const createGoogleDriveService = (client: DriveClient, scopes: string[]) 
         eventsFolderPromise = Promise.resolve(eventsFolder);
       }
       const files = await listChildren(client, scopes, eventsFolder.id);
+      for (const file of files) {
+        const chunkId = parseEventChunkId(file.name);
+        if (chunkId !== null) {
+          personalEventChunkFileIds.set(chunkId, file.id);
+        }
+      }
       return files
         .map((file) => parseEventChunkId(file.name))
         .filter((value): value is number => typeof value === "number");
+    },
+    readEventIndex: async (): Promise<EventIndex | null> => {
+      const root = await getPersonalRootFolder();
+      const eventsFolder = await findChildByName(client, scopes, root.id, EVENTS_FOLDER_NAME);
+      if (!eventsFolder) {
+        return null;
+      }
+      const file = await findChildByName(client, scopes, eventsFolder.id, EVENT_INDEX_FILE_NAME);
+      if (!file) {
+        return null;
+      }
+      const content = await readFileText(client, scopes, file.id);
+      const parsed = parseEventIndex(parseJson(content));
+      if (parsed) {
+        primeCacheFromIndex(parsed, personalEventChunkFileIds);
+      }
+      return parsed;
+    },
+    writeEventIndex: async (index: EventIndex) => {
+      const eventsFolder = await getEventsFolder();
+      const payload = applyFileIdsToIndex(index, personalEventChunkFileIds);
+      await upsertFile(
+        client,
+        scopes,
+        eventsFolder.id,
+        EVENT_INDEX_FILE_NAME,
+        "application/json",
+        JSON.stringify(payload),
+      );
     },
     writeEventChunk: async (
       chunkId: number,
@@ -907,7 +982,7 @@ export const createGoogleDriveService = (client: DriveClient, scopes: string[]) 
       options?: { assumeMissing?: boolean },
     ) => {
       const eventsFolder = await getEventsFolder();
-      await upsertFile(
+      const updated = await upsertFile(
         client,
         scopes,
         eventsFolder.id,
@@ -916,9 +991,22 @@ export const createGoogleDriveService = (client: DriveClient, scopes: string[]) 
         content,
         options,
       );
+      personalEventChunkFileIds.set(chunkId, updated.id);
     },
     readEventChunk: async (chunkId: number): Promise<string> => {
       const eventsFolder = await getEventsFolder();
+      const cachedId = personalEventChunkFileIds.get(chunkId);
+      if (cachedId) {
+        try {
+          return await readFileText(client, scopes, cachedId);
+        } catch (error) {
+          if (isGoogleDriveError(error) && error.code === "not_found") {
+            personalEventChunkFileIds.delete(chunkId);
+          } else {
+            throw error;
+          }
+        }
+      }
       const target = await findChildByName(
         client,
         scopes,
@@ -928,14 +1016,17 @@ export const createGoogleDriveService = (client: DriveClient, scopes: string[]) 
       if (!target) {
         throw new GoogleDriveError("Event chunk not found.", { status: 404, code: "not_found" });
       }
+      personalEventChunkFileIds.set(chunkId, target.id);
       return readFileText(client, scopes, target.id);
     },
     deleteEventChunk: async (chunkId: number) => {
+      personalEventChunkFileIds.clear();
       const root = await getPersonalRootFolder();
       const eventsFolder = await findChildByName(client, scopes, root.id, EVENTS_FOLDER_NAME);
       if (!eventsFolder) {
         return;
       }
+      await deleteFileByName(client, scopes, eventsFolder.id, EVENT_INDEX_FILE_NAME);
       await deleteFileByName(
         client,
         scopes,
@@ -944,11 +1035,13 @@ export const createGoogleDriveService = (client: DriveClient, scopes: string[]) 
       );
     },
     deleteAllEventChunks: async () => {
+      personalEventChunkFileIds.clear();
       const root = await getPersonalRootFolder();
       const eventsFolder = await findChildByName(client, scopes, root.id, EVENTS_FOLDER_NAME);
       if (!eventsFolder) {
         return;
       }
+      await deleteFileByName(client, scopes, eventsFolder.id, EVENT_INDEX_FILE_NAME);
       if (!eventsFolderPromise) {
         eventsFolderPromise = Promise.resolve(eventsFolder);
       }
@@ -1170,9 +1263,50 @@ export const createGoogleDriveService = (client: DriveClient, scopes: string[]) 
         return [];
       }
       const files = await listChildren(client, scopes, eventsFolder.id);
+      const cache = getSharedEventFileIdMap(root.fileId);
+      for (const file of files) {
+        const chunkId = parseEventChunkId(file.name);
+        if (chunkId !== null) {
+          cache.set(chunkId, file.id);
+        }
+      }
       return files
         .map((file) => parseEventChunkId(file.name))
         .filter((value): value is number => typeof value === "number");
+    },
+    readSharedEventIndex: async (root: SharedRootReference): Promise<EventIndex | null> => {
+      const eventsFolder = await findChildByName(client, scopes, root.fileId, EVENTS_FOLDER_NAME);
+      if (!eventsFolder) {
+        return null;
+      }
+      const file = await findChildByName(client, scopes, eventsFolder.id, EVENT_INDEX_FILE_NAME);
+      if (!file) {
+        return null;
+      }
+      const content = await readFileText(client, scopes, file.id);
+      const parsed = parseEventIndex(parseJson(content));
+      if (parsed) {
+        primeCacheFromIndex(parsed, getSharedEventFileIdMap(root.fileId));
+      }
+      return parsed;
+    },
+    writeSharedEventIndex: async (root: SharedRootReference, index: EventIndex) => {
+      const eventsFolder = await ensureFolderByName(
+        client,
+        scopes,
+        root.fileId,
+        EVENTS_FOLDER_NAME,
+      );
+      const cache = getSharedEventFileIdMap(root.fileId);
+      const payload = applyFileIdsToIndex(index, cache);
+      await upsertFile(
+        client,
+        scopes,
+        eventsFolder.id,
+        EVENT_INDEX_FILE_NAME,
+        "application/json",
+        JSON.stringify(payload),
+      );
     },
     writeSharedEventChunk: async (
       root: SharedRootReference,
@@ -1186,7 +1320,7 @@ export const createGoogleDriveService = (client: DriveClient, scopes: string[]) 
         root.fileId,
         EVENTS_FOLDER_NAME,
       );
-      await upsertFile(
+      const updated = await upsertFile(
         client,
         scopes,
         eventsFolder.id,
@@ -1195,6 +1329,7 @@ export const createGoogleDriveService = (client: DriveClient, scopes: string[]) 
         content,
         options,
       );
+      getSharedEventFileIdMap(root.fileId).set(chunkId, updated.id);
     },
     readSharedEventChunk: async (root: SharedRootReference, chunkId: number): Promise<string> => {
       const eventsFolder = await ensureFolderByName(
@@ -1203,6 +1338,19 @@ export const createGoogleDriveService = (client: DriveClient, scopes: string[]) 
         root.fileId,
         EVENTS_FOLDER_NAME,
       );
+      const cache = getSharedEventFileIdMap(root.fileId);
+      const cachedId = cache.get(chunkId);
+      if (cachedId) {
+        try {
+          return await readFileText(client, scopes, cachedId);
+        } catch (error) {
+          if (isGoogleDriveError(error) && error.code === "not_found") {
+            cache.delete(chunkId);
+          } else {
+            throw error;
+          }
+        }
+      }
       const target = await findChildByName(
         client,
         scopes,
@@ -1212,13 +1360,16 @@ export const createGoogleDriveService = (client: DriveClient, scopes: string[]) 
       if (!target) {
         throw new GoogleDriveError("Event chunk not found.", { status: 404, code: "not_found" });
       }
+      cache.set(chunkId, target.id);
       return readFileText(client, scopes, target.id);
     },
     deleteSharedEventChunk: async (root: SharedRootReference, chunkId: number) => {
+      getSharedEventFileIdMap(root.fileId).clear();
       const eventsFolder = await findChildByName(client, scopes, root.fileId, EVENTS_FOLDER_NAME);
       if (!eventsFolder) {
         return;
       }
+      await deleteFileByName(client, scopes, eventsFolder.id, EVENT_INDEX_FILE_NAME);
       await deleteFileByName(
         client,
         scopes,
@@ -1227,10 +1378,12 @@ export const createGoogleDriveService = (client: DriveClient, scopes: string[]) 
       );
     },
     deleteAllSharedEventChunks: async (root: SharedRootReference) => {
+      getSharedEventFileIdMap(root.fileId).clear();
       const eventsFolder = await findChildByName(client, scopes, root.fileId, EVENTS_FOLDER_NAME);
       if (!eventsFolder) {
         return;
       }
+      await deleteFileByName(client, scopes, eventsFolder.id, EVENT_INDEX_FILE_NAME);
       const files = await listChildren(client, scopes, eventsFolder.id);
       for (const file of files) {
         if (parseEventChunkId(file.name) !== null) {

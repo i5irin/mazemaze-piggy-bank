@@ -9,6 +9,17 @@ export const formatCurrency = (value: number | null): string => {
   return `¥${value.toLocaleString("en-US")}`;
 };
 
+export const formatSignedCurrency = (value: number): string => {
+  if (!Number.isFinite(value)) {
+    return "—";
+  }
+  if (value === 0) {
+    return formatCurrency(0);
+  }
+  const sign = value > 0 ? "+" : "-";
+  return `${sign}${formatCurrency(Math.abs(value))}`;
+};
+
 export const formatIntegerInput = (raw: string): string => {
   const trimmed = raw.trim();
   if (trimmed.length === 0) {

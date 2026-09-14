@@ -2,6 +2,7 @@
 
 import { createGraphClient } from "@/lib/graph/graphClient";
 import { isGraphError } from "@/lib/graph/graphErrors";
+import { parseEventIndex, type EventIndex } from "@/lib/persistence/eventIndex";
 import { parseSnapshot, type Snapshot } from "@/lib/persistence/snapshot";
 import type { LeaseRecord } from "@/lib/storage/lease";
 
@@ -16,6 +17,7 @@ const LEASES_FOLDER_NAME = "leases";
 const LEASE_FILE_NAME = "lease.json";
 const EVENT_FILE_PREFIX = "event-";
 const EVENT_FILE_EXTENSION = ".jsonl";
+const EVENT_INDEX_FILE_NAME = "index.json";
 const SHARED_WITH_ME_PATH = "/me/drive/sharedWithMe";
 const SHARED_ROOT_FOLDER_NAME = "shared";
 const PERSONAL_ROOT_FOLDER_NAME = "personal";
@@ -623,6 +625,39 @@ export const createOneDriveService = (client: GraphClient, scopes: string[]) => 
   let rootProbePromise: Promise<void> | null = null;
   let rootProbeRootKey: string | null = null;
 
+  const listEventFileNames = async (root: Pick<SharedRootReference, "driveId" | "itemId">) => {
+    let path: string | null = buildSharedChildrenPathFromSegments(root, [EVENTS_FOLDER_NAME]);
+    const names: string[] = [];
+    while (path) {
+      const data = await client.getJson(path, scopes);
+      names.push(...parseChildNames(data));
+      const next = isRecord(data) ? data["@odata.nextLink"] : undefined;
+      if (typeof next === "string") {
+        const base = "https://graph.microsoft.com/v1.0";
+        if (!next.startsWith(`${base}/`)) {
+          throw new Error("Unexpected event listing continuation URL.");
+        }
+        path = next.slice(base.length);
+      } else {
+        path = null;
+      }
+    }
+    return names;
+  };
+
+  const deleteEventIndex = async (root: Pick<SharedRootReference, "driveId" | "itemId">) => {
+    try {
+      await client.delete(
+        buildSharedItemPathFromSegments(root, [EVENTS_FOLDER_NAME, EVENT_INDEX_FILE_NAME]),
+        scopes,
+      );
+    } catch (error) {
+      if (!isGraphError(error) || error.status !== 404) {
+        throw error;
+      }
+    }
+  };
+
   const resetRootCaches = () => {
     pointerPromise = null;
     appRootPromise = null;
@@ -947,17 +982,60 @@ export const createOneDriveService = (client: GraphClient, scopes: string[]) => 
     listEventChunkIds: async (): Promise<number[]> => {
       const personal = await getPersonalRootReference();
       try {
-        const data = await client.getJson(
-          buildSharedChildrenPathFromSegments(personal, [EVENTS_FOLDER_NAME]),
-          scopes,
-        );
-        const names = parseChildNames(data);
+        const names = await listEventFileNames(personal);
         return names
           .map(parseEventChunkId)
           .filter((value): value is number => typeof value === "number");
       } catch (error) {
         if (isGraphError(error) && error.status === 404) {
           return [];
+        }
+        throw error;
+      }
+    },
+    readEventIndex: async (): Promise<EventIndex | null> => {
+      const personal = await getPersonalRootReference();
+      try {
+        const response = await client.getText(
+          buildSharedContentPathFromSegments(personal, [EVENTS_FOLDER_NAME, EVENT_INDEX_FILE_NAME]),
+          scopes,
+        );
+        return parseEventIndex(parseJson(response));
+      } catch (error) {
+        if (isGraphError(error) && error.status === 404) {
+          return null;
+        }
+        throw error;
+      }
+    },
+    writeEventIndex: async (index: EventIndex) => {
+      const personal = await getPersonalRootReference();
+      try {
+        await client.putJson(
+          buildSharedContentPathFromSegments(personal, [EVENTS_FOLDER_NAME, EVENT_INDEX_FILE_NAME]),
+          index,
+          scopes,
+        );
+      } catch (error) {
+        if (isGraphError(error) && error.status === 404) {
+          await client.postJson(
+            buildSharedChildrenPathFromSegments(personal, []),
+            {
+              name: EVENTS_FOLDER_NAME,
+              folder: {},
+              "@microsoft.graph.conflictBehavior": "fail",
+            },
+            scopes,
+          );
+          await client.putJson(
+            buildSharedContentPathFromSegments(personal, [
+              EVENTS_FOLDER_NAME,
+              EVENT_INDEX_FILE_NAME,
+            ]),
+            index,
+            scopes,
+          );
+          return;
         }
         throw error;
       }
@@ -990,6 +1068,7 @@ export const createOneDriveService = (client: GraphClient, scopes: string[]) => 
     },
     deleteEventChunk: async (chunkId: number) => {
       const personal = await getPersonalRootReference();
+      await deleteEventIndex(personal);
       try {
         await client.delete(
           buildSharedItemPathFromSegments(personal, [
@@ -1007,12 +1086,9 @@ export const createOneDriveService = (client: GraphClient, scopes: string[]) => 
     },
     deleteAllEventChunks: async () => {
       const personal = await getPersonalRootReference();
+      await deleteEventIndex(personal);
       try {
-        const data = await client.getJson(
-          buildSharedChildrenPathFromSegments(personal, [EVENTS_FOLDER_NAME]),
-          scopes,
-        );
-        const names = parseChildNames(data);
+        const names = await listEventFileNames(personal);
         const chunkIds = names
           .map(parseEventChunkId)
           .filter((value): value is number => typeof value === "number");
@@ -1271,17 +1347,55 @@ export const createOneDriveService = (client: GraphClient, scopes: string[]) => 
     },
     listSharedEventChunkIds: async (root: SharedRootReference): Promise<number[]> => {
       try {
-        const data = await client.getJson(
-          buildSharedChildrenPathFromSegments(root, [EVENTS_FOLDER_NAME]),
-          scopes,
-        );
-        const names = parseChildNames(data);
+        const names = await listEventFileNames(root);
         return names
           .map(parseEventChunkId)
           .filter((value): value is number => typeof value === "number");
       } catch (error) {
         if (isGraphError(error) && error.status === 404) {
           return [];
+        }
+        throw error;
+      }
+    },
+    readSharedEventIndex: async (root: SharedRootReference): Promise<EventIndex | null> => {
+      try {
+        const response = await client.getText(
+          buildSharedContentPathFromSegments(root, [EVENTS_FOLDER_NAME, EVENT_INDEX_FILE_NAME]),
+          scopes,
+        );
+        return parseEventIndex(parseJson(response));
+      } catch (error) {
+        if (isGraphError(error) && error.status === 404) {
+          return null;
+        }
+        throw error;
+      }
+    },
+    writeSharedEventIndex: async (root: SharedRootReference, index: EventIndex) => {
+      try {
+        await client.putJson(
+          buildSharedContentPathFromSegments(root, [EVENTS_FOLDER_NAME, EVENT_INDEX_FILE_NAME]),
+          index,
+          scopes,
+        );
+      } catch (error) {
+        if (isGraphError(error) && error.status === 404) {
+          await client.postJson(
+            buildSharedChildrenPathFromSegments(root, []),
+            {
+              name: EVENTS_FOLDER_NAME,
+              folder: {},
+              "@microsoft.graph.conflictBehavior": "fail",
+            },
+            scopes,
+          );
+          await client.putJson(
+            buildSharedContentPathFromSegments(root, [EVENTS_FOLDER_NAME, EVENT_INDEX_FILE_NAME]),
+            index,
+            scopes,
+          );
+          return;
         }
         throw error;
       }
@@ -1311,6 +1425,7 @@ export const createOneDriveService = (client: GraphClient, scopes: string[]) => 
         scopes,
       ),
     deleteSharedEventChunk: async (root: SharedRootReference, chunkId: number) => {
+      await deleteEventIndex(root);
       try {
         await client.delete(
           buildSharedItemPathFromSegments(root, [
@@ -1327,12 +1442,9 @@ export const createOneDriveService = (client: GraphClient, scopes: string[]) => 
       }
     },
     deleteAllSharedEventChunks: async (root: SharedRootReference) => {
+      await deleteEventIndex(root);
       try {
-        const data = await client.getJson(
-          buildSharedChildrenPathFromSegments(root, [EVENTS_FOLDER_NAME]),
-          scopes,
-        );
-        const names = parseChildNames(data);
+        const names = await listEventFileNames(root);
         const chunkIds = names
           .map(parseEventChunkId)
           .filter((value): value is number => typeof value === "number");

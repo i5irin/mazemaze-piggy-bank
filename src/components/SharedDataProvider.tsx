@@ -29,6 +29,7 @@ import {
   serializeEventChunk,
   type PendingEvent,
 } from "@/lib/persistence/eventChunk";
+import { refreshEventIndex } from "@/lib/persistence/eventIndex";
 import { createHistoryLoader, type HistoryPage } from "@/lib/persistence/history";
 import {
   createAccount as createAccountDomain,
@@ -536,10 +537,12 @@ export function SharedDataProvider({
       const loader = createHistoryLoader({
         listChunkIds: () => storage.listSharedEventChunkIds(root.reference),
         readChunk: (chunkId) => storage.readSharedEventChunk(root.reference, chunkId),
+        readIndex: () => storage.readSharedEventIndex(root.reference),
+        getSnapshotVersion: () => snapshotRecord?.snapshot.version ?? null,
       });
       return withTimeout(loader(input), 12_000);
     },
-    [ensureRootInfo, isOnline, isSignedIn, sharedReference, storage],
+    [ensureRootInfo, isOnline, isSignedIn, sharedReference, snapshotRecord, storage],
   );
 
   const flushPendingHistoryChunks = useCallback(
@@ -561,6 +564,12 @@ export function SharedDataProvider({
           };
         }
       }
+      await refreshEventIndex({
+        listChunkIds: () => storage.listSharedEventChunkIds(root),
+        readChunk: (chunkId) => storage.readSharedEventChunk(root, chunkId),
+        readIndex: () => storage.readSharedEventIndex(root),
+        writeIndex: (index) => storage.writeSharedEventIndex(root, index),
+      });
       return { ok: true };
     },
     [storage],

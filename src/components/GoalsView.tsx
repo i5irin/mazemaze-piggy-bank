@@ -17,6 +17,7 @@ import { useStorageProviderContext } from "@/components/StorageProviderContext";
 import {
   formatCurrency,
   formatIntegerInput,
+  formatSignedCurrency,
   getIntegerInputError,
   parseIntegerInput,
 } from "@/lib/numberFormat";
@@ -1764,8 +1765,16 @@ export function GoalsView({ data }: { data: DataContextValue }) {
                                 <span className="app-muted">{formatDateTime(item.timestamp)}</span>
                               </div>
                               <div>{item.summary}</div>
+                              {item.progress ? (
+                                <div className="app-muted">
+                                  Progress: {formatCurrency(item.progress.currentAmount)} /{" "}
+                                  {formatCurrency(item.progress.targetAmount)}
+                                </div>
+                              ) : null}
                               {typeof item.amountDelta === "number" ? (
-                                <div className="app-muted">{formatCurrency(item.amountDelta)}</div>
+                                <div className="app-muted">
+                                  {formatSignedCurrency(item.amountDelta)}
+                                </div>
                               ) : null}
                             </div>
                           ))}

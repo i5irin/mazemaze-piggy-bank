@@ -26,6 +26,7 @@ import {
   serializeEventChunk,
   type PendingEvent,
 } from "@/lib/persistence/eventChunk";
+import { refreshEventIndex } from "@/lib/persistence/eventIndex";
 import { createHistoryLoader, type HistoryPage } from "@/lib/persistence/history";
 import {
   createAccount as createAccountDomain,
@@ -174,8 +175,10 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       createHistoryLoader({
         listChunkIds: () => storage.listEventChunkIds(),
         readChunk: (chunkId) => storage.readEventChunk(chunkId),
+        readIndex: () => storage.readEventIndex(),
+        getSnapshotVersion: () => snapshotRecord?.snapshot.version ?? null,
       }),
-    [storage],
+    [snapshotRecord, storage],
   );
 
   const applySnapshot = useCallback(
@@ -457,6 +460,12 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
           };
         }
       }
+      await refreshEventIndex({
+        listChunkIds: () => storage.listEventChunkIds(),
+        readChunk: (chunkId) => storage.readEventChunk(chunkId),
+        readIndex: () => storage.readEventIndex(),
+        writeIndex: (index) => storage.writeEventIndex(index),
+      });
       return { ok: true };
     },
     [storage],

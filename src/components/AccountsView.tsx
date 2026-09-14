@@ -16,6 +16,7 @@ import type { DataContextValue, DomainActionOutcome } from "@/components/dataCon
 import {
   formatCurrency,
   formatIntegerInput,
+  formatSignedCurrency,
   getIntegerInputError,
   parseIntegerInput,
 } from "@/lib/numberFormat";
@@ -1485,7 +1486,9 @@ export function AccountsView({ data }: { data: DataContextValue }) {
                             </div>
                             <div>{item.summary}</div>
                             {typeof item.amountDelta === "number" ? (
-                              <div className="app-muted">{formatCurrency(item.amountDelta)}</div>
+                              <div className="app-muted">
+                                {formatSignedCurrency(item.amountDelta)}
+                              </div>
                             ) : null}
                           </div>
                         ))}

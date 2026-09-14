@@ -15,6 +15,7 @@ import {
   serializeEventChunk,
   type EventChunk,
 } from "@/lib/persistence/eventChunk";
+import { refreshEventIndex } from "@/lib/persistence/eventIndex";
 import { parseSnapshot, type Snapshot } from "@/lib/persistence/snapshot";
 import { clearSnapshotCache, clearSnapshotCacheForProvider } from "@/lib/persistence/snapshotCache";
 import { getSyncIndicatorMeta, resolveSyncIndicatorState } from "@/lib/persistence/syncStatus";
@@ -1033,8 +1034,8 @@ export function SettingsClient() {
         (left, right) => left.chunkId - right.chunkId,
       );
       if (importPayload.manifest.scope === "personal") {
-        await storage.writePersonalSnapshot(importPayload.snapshot);
         await storage.deleteAllEventChunks();
+        await storage.writePersonalSnapshot(importPayload.snapshot);
         if (sortedChunks.length > 0) {
           await storage.ensureEventsFolder();
           for (const chunk of sortedChunks) {
@@ -1043,6 +1044,12 @@ export function SettingsClient() {
             });
           }
         }
+        await refreshEventIndex({
+          listChunkIds: () => storage.listEventChunkIds(),
+          readChunk: (chunkId) => storage.readEventChunk(chunkId),
+          readIndex: () => storage.readEventIndex(),
+          writeIndex: (index) => storage.writeEventIndex(index),
+        });
         await clearSnapshotCache();
         await data.refresh();
         setImportState({
@@ -1051,8 +1058,8 @@ export function SettingsClient() {
         });
       } else {
         const targetRoot = sharedRoot as SharedRootReference;
-        await storage.writeSharedSnapshot(targetRoot, importPayload.snapshot);
         await storage.deleteAllSharedEventChunks(targetRoot);
+        await storage.writeSharedSnapshot(targetRoot, importPayload.snapshot);
         if (sortedChunks.length > 0) {
           await storage.ensureSharedEventsFolder(targetRoot);
           for (const chunk of sortedChunks) {
@@ -1064,6 +1071,12 @@ export function SettingsClient() {
             );
           }
         }
+        await refreshEventIndex({
+          listChunkIds: () => storage.listSharedEventChunkIds(targetRoot),
+          readChunk: (chunkId) => storage.readSharedEventChunk(targetRoot, chunkId),
+          readIndex: () => storage.readSharedEventIndex(targetRoot),
+          writeIndex: (index) => storage.writeSharedEventIndex(targetRoot, index),
+        });
         await clearSnapshotCache();
         setImportState({
           status: "success",
@@ -1468,6 +1481,12 @@ export function SettingsClient() {
           );
         }
       }
+      await refreshEventIndex({
+        listChunkIds: () => targetStorage.listEventChunkIds(),
+        readChunk: (chunkId) => targetStorage.readEventChunk(chunkId),
+        readIndex: () => targetStorage.readEventIndex(),
+        writeIndex: (index) => targetStorage.writeEventIndex(index),
+      });
       setMoveProgress({ phase: "cleanup", message: `Removing data from ${sourceLabel}...` });
       await sourceStorage.deleteAppCloudData();
       clearSelection(activeProviderId);

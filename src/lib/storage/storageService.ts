@@ -13,6 +13,7 @@ import {
   type SharedRootReference as OneDriveSharedRootReference,
 } from "@/lib/onedrive/oneDriveService";
 import type { Snapshot } from "@/lib/persistence/snapshot";
+import type { EventIndex } from "@/lib/persistence/eventIndex";
 import type { LeaseRecord } from "@/lib/storage/lease";
 import type {
   CloudProviderId,
@@ -56,6 +57,8 @@ export type StorageService = {
   ) => Promise<void>;
   deleteEventChunk: (chunkId: number) => Promise<void>;
   deleteAllEventChunks: () => Promise<void>;
+  readEventIndex: () => Promise<EventIndex | null>;
+  writeEventIndex: (index: EventIndex) => Promise<void>;
   ensureSharedRootFolder: () => Promise<SharedRootListItem>;
   createSharedFolder: (name: string) => Promise<SharedRootListItem>;
   listSharedWithMeRoots: () => Promise<SharedRootListItem[]>;
@@ -86,6 +89,8 @@ export type StorageService = {
   ) => Promise<void>;
   deleteSharedEventChunk: (root: SharedRootReference, chunkId: number) => Promise<void>;
   deleteAllSharedEventChunks: (root: SharedRootReference) => Promise<void>;
+  readSharedEventIndex: (root: SharedRootReference) => Promise<EventIndex | null>;
+  writeSharedEventIndex: (root: SharedRootReference, index: EventIndex) => Promise<void>;
   readSharedLease: (root: SharedRootReference) => Promise<LeaseRecord | null>;
   writeSharedLease: (root: SharedRootReference, lease: LeaseRecord) => Promise<void>;
   getRootFolderNotices: () => Promise<RootFolderNotice[]>;
@@ -277,6 +282,8 @@ export const createStorageService = (
       writeEventChunk: google.writeEventChunk,
       deleteEventChunk: google.deleteEventChunk,
       deleteAllEventChunks: google.deleteAllEventChunks,
+      readEventIndex: google.readEventIndex,
+      writeEventIndex: google.writeEventIndex,
       ensureSharedRootFolder: async () => {
         const root = await google.ensureSharedRootFolder();
         return toSharedRootListItem(providerId, {
@@ -379,12 +386,23 @@ export const createStorageService = (
           { sharedId: root.sharedId, fileId: root.itemId ?? root.sharedId, driveId: root.driveId },
           chunkId,
         ),
+      readSharedEventIndex: async (root) =>
+        google.readSharedEventIndex({
+          sharedId: root.sharedId,
+          fileId: root.itemId ?? root.sharedId,
+          driveId: root.driveId,
+        }),
       writeSharedEventChunk: async (root, chunkId, content, options) =>
         google.writeSharedEventChunk(
           { sharedId: root.sharedId, fileId: root.itemId ?? root.sharedId, driveId: root.driveId },
           chunkId,
           content,
           options,
+        ),
+      writeSharedEventIndex: async (root, index) =>
+        google.writeSharedEventIndex(
+          { sharedId: root.sharedId, fileId: root.itemId ?? root.sharedId, driveId: root.driveId },
+          index,
         ),
       deleteSharedEventChunk: async (root, chunkId) =>
         google.deleteSharedEventChunk(
@@ -450,6 +468,8 @@ export const createStorageService = (
     deleteAllEventChunks: async () => {
       await oneDrive.deleteAllEventChunks();
     },
+    readEventIndex: oneDrive.readEventIndex,
+    writeEventIndex: oneDrive.writeEventIndex,
     ensureSharedRootFolder: async () => {
       const root = await oneDrive.ensureSharedRootFolder();
       return toSharedRootListItem(providerId, root);
@@ -481,8 +501,12 @@ export const createStorageService = (
       oneDrive.listSharedEventChunkIds(toOneDriveReference(root)),
     readSharedEventChunk: async (root, chunkId) =>
       oneDrive.readSharedEventChunk(toOneDriveReference(root), chunkId),
+    readSharedEventIndex: async (root) =>
+      oneDrive.readSharedEventIndex(toOneDriveReference(root)),
     writeSharedEventChunk: async (root, chunkId, content, options) =>
       oneDrive.writeSharedEventChunk(toOneDriveReference(root), chunkId, content, options),
+    writeSharedEventIndex: async (root, index) =>
+      oneDrive.writeSharedEventIndex(toOneDriveReference(root), index),
     deleteSharedEventChunk: async (root, chunkId) => {
       await oneDrive.deleteSharedEventChunk(toOneDriveReference(root), chunkId);
     },
