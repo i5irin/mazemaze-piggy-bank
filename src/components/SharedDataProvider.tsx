@@ -188,6 +188,7 @@ export function SharedDataProvider({
   const [retryQueueCount, setRetryQueueCount] = useState(0);
   const pendingEventsRef = useRef<PendingEvent[]>([]);
   const pendingHistoryChunksRef = useRef<QueuedChunkWrite[]>([]);
+  const loadFromRemoteRef = useRef<(() => Promise<void>) | null>(null);
   const [rootState, setRootState] = useState<SharedRootState | null>(null);
 
   const tokenProvider = useCallback(
@@ -575,12 +576,35 @@ export function SharedDataProvider({
     [storage],
   );
 
-  const handleConflict = useCallback(async () => {
-    await loadFromRemote();
-    setMessage(
-      "Save failed because the data changed elsewhere. Reloaded the latest data and discarded your edits.",
-    );
-  }, [loadFromRemote]);
+  const handleConflict = useCallback(async (): Promise<SaveChangesOutcome> => {
+    try {
+      // Conflict recovery must bypass the ordinary refresh guard for pending edits.
+      const root = await ensureRootInfo();
+      const result = await storage.readSharedSnapshot(root.reference);
+      const latest = await loadLatestEventFromRemote(root.reference);
+      // Update the cache before applying the snapshot so cache effects cannot restore stale data.
+      await writeSnapshotCache({
+        key: `shared:${routeProviderId}:${root.reference.sharedId}`,
+        snapshot: result.snapshot,
+        etag: result.etag,
+        cachedAt: new Date().toISOString(),
+      });
+      applySnapshot(
+        result.snapshot,
+        result.etag,
+        "remote",
+        "Save failed because the data changed elsewhere. Reloaded the latest data and discarded your edits.",
+        latest,
+      );
+      return { ok: false, reason: "conflict" };
+    } catch (err) {
+      const detail = `Data changed elsewhere, but the latest data could not be loaded. Your changes were not saved. Please try again before editing. ${formatGraphError(err)}`;
+      setStatus("error");
+      setMessage(null);
+      setError(detail);
+      return { ok: false, reason: "error", error: detail };
+    }
+  }, [applySnapshot, ensureRootInfo, loadLatestEventFromRemote, routeProviderId, storage]);
 
   const saveChanges = useCallback(async (): Promise<SaveChangesOutcome> => {
     if (!isOnline) {
@@ -736,8 +760,7 @@ export function SharedDataProvider({
       return { ok: true };
     } catch (err) {
       if (isStoragePreconditionFailed(err)) {
-        await handleConflict();
-        return { ok: false, reason: "conflict" };
+        return await handleConflict();
       }
       const message = formatGraphError(err);
       setError(message);
@@ -1189,10 +1212,14 @@ export function SharedDataProvider({
   }, [loadFromCache]);
 
   useEffect(() => {
+    loadFromRemoteRef.current = loadFromRemote;
+  }, [loadFromRemote]);
+
+  useEffect(() => {
     if (isOnline && isSignedIn) {
-      void loadFromRemote();
+      void loadFromRemoteRef.current?.();
     }
-  }, [isOnline, isSignedIn, loadFromRemote]);
+  }, [isOnline, isSignedIn, sharedReference]);
 
   useEffect(() => {
     upsertSyncSignal({

@@ -471,12 +471,34 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
     [storage],
   );
 
-  const handleConflict = useCallback(async () => {
-    await loadFromRemote();
-    setMessage(
-      "Save failed because the data changed elsewhere. Reloaded the latest data and discarded your edits.",
-    );
-  }, [loadFromRemote]);
+  const handleConflict = useCallback(async (): Promise<SaveChangesOutcome> => {
+    try {
+      // Conflict recovery must bypass the ordinary refresh guard for pending edits.
+      const result = await storage.readPersonalSnapshot();
+      const latest = await loadLatestEventFromRemote();
+      // Update the cache before applying the snapshot so cache effects cannot restore stale data.
+      await writeSnapshotCache({
+        key: `personal:${activeProviderId}`,
+        snapshot: result.snapshot,
+        etag: result.etag,
+        cachedAt: new Date().toISOString(),
+      });
+      applySnapshot(
+        result.snapshot,
+        result.etag,
+        "remote",
+        "Save failed because the data changed elsewhere. Reloaded the latest data and discarded your edits.",
+        latest,
+      );
+      return { ok: false, reason: "conflict" };
+    } catch (err) {
+      const detail = `Data changed elsewhere, but the latest data could not be loaded. Your changes were not saved. Please try again before editing. ${formatGraphError(err)}`;
+      setStatus("error");
+      setMessage(null);
+      setError(detail);
+      return { ok: false, reason: "error", error: detail };
+    }
+  }, [activeProviderId, applySnapshot, loadLatestEventFromRemote, storage]);
 
   const saveChanges = useCallback(async (): Promise<SaveChangesOutcome> => {
     if (!isOnline) {
@@ -621,8 +643,7 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
       return { ok: true };
     } catch (err) {
       if (isStoragePreconditionFailed(err)) {
-        await handleConflict();
-        return { ok: false, reason: "conflict" };
+        return await handleConflict();
       }
       const message = formatGraphError(err);
       setError(message);
