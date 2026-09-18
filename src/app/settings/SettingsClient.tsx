@@ -5,7 +5,9 @@ import JSZip from "jszip";
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import { useAuth } from "@/components/AuthProvider";
 import { type ThemePreference, useTheme } from "@/components/AppProviders";
+import { OneDriveJoin } from "@/components/OneDriveJoin";
 import { usePersonalData } from "@/components/PersonalDataProvider";
+import { useSharedRoots } from "@/components/useSharedRoots";
 import { useSharedSelection } from "@/components/SharedSelectionProvider";
 import { useStorageProviderContext } from "@/components/StorageProviderContext";
 import { isAuthError } from "@/lib/auth/authErrors";
@@ -25,7 +27,6 @@ import type {
   CloudProviderId,
   RootFolderNotice,
   ShareLinkPermission,
-  SharedRootListItem,
   SharedRootReference,
 } from "@/lib/storage/types";
 import { useNow } from "@/lib/time/useNow";
@@ -34,11 +35,6 @@ type OperationState = {
   status: "idle" | "working" | "success" | "error";
   message: string | null;
   payload?: unknown;
-};
-
-type SharedRootsState = {
-  status: "idle" | "loading" | "ready" | "error";
-  message: string | null;
 };
 
 type MoveProgress = {
@@ -359,14 +355,6 @@ const formatRelativeTimestamp = (value: string, now: number): string => {
   return parsed.toLocaleDateString("en-US");
 };
 
-const mergeSharedRoots = (items: SharedRootListItem[]): SharedRootListItem[] => {
-  const byId = new Map<string, SharedRootListItem>();
-  for (const item of items) {
-    byId.set(item.sharedId, item);
-  }
-  return [...byId.values()].sort((left, right) => left.name.localeCompare(right.name));
-};
-
 export function SettingsClient() {
   const { providers, signIn, signOut, getAccessToken } = useAuth();
   const { activeProviderId, setActiveProviderId } = useStorageProviderContext();
@@ -417,11 +405,6 @@ export function SettingsClient() {
     message: null,
   });
   const [switchState, setSwitchState] = useState<OperationState>({
-    status: "idle",
-    message: null,
-  });
-  const [sharedRoots, setSharedRoots] = useState<SharedRootListItem[]>([]);
-  const [sharedRootsState, setSharedRootsState] = useState<SharedRootsState>({
     status: "idle",
     message: null,
   });
@@ -500,6 +483,15 @@ export function SettingsClient() {
     [tokenProviders],
   );
   const storage = storageByProvider[activeProviderId];
+  const {
+    roots: sharedRoots,
+    refresh: loadSharedRoots,
+    ...sharedRootsState
+  } = useSharedRoots(
+    storage,
+    `${activeProviderId}:${activeProvider.account?.id ?? activeProvider.account?.email ?? ""}`,
+    activeProvider.status === "signed_in" && data.isOnline,
+  );
 
   const appRootLabel = isHydrated ? storage.appRootLabel : "Loading...";
   const storageLabel = isHydrated ? storage.label : "Loading...";
@@ -758,33 +750,6 @@ export function SettingsClient() {
       advancedSummary,
     ],
   );
-
-  const loadSharedRoots = useCallback(async () => {
-    if (!isSignedIn || !data.isOnline) {
-      setSharedRoots([]);
-      setSharedRootsState({ status: "idle", message: null });
-      return;
-    }
-    if (!storage.capabilities.supportsShared) {
-      setSharedRoots([]);
-      setSharedRootsState({
-        status: "error",
-        message: "Shared workspaces are unavailable for this provider.",
-      });
-      return;
-    }
-    setSharedRootsState({ status: "loading", message: "Loading shared workspaces..." });
-    try {
-      const [withMe, byMe] = await Promise.all([
-        storage.listSharedWithMeRoots(),
-        storage.listSharedByMeRoots(),
-      ]);
-      setSharedRoots(mergeSharedRoots([...withMe, ...byMe]));
-      setSharedRootsState({ status: "ready", message: null });
-    } catch (err) {
-      setSharedRootsState({ status: "error", message: getUserMessage(err) });
-    }
-  }, [data.isOnline, isSignedIn, storage]);
 
   const handleRetryNow = useCallback(async () => {
     if (data.retryQueueCount <= 0) {
@@ -1133,14 +1098,14 @@ export function SettingsClient() {
     setSharedState({ status: "working", message: "Creating shared workspace..." });
     try {
       const created = await storage.createSharedFolder(normalized);
-      setSharedRoots((prev) => mergeSharedRoots([...prev, created]));
+      await loadSharedRoots();
       setCreateFolderName("");
       setCreateDialogOpen(false);
       setSharedState({ status: "success", message: `Created "${created.name}".` });
     } catch (err) {
       setSharedState({ status: "error", message: getUserMessage(err) });
     }
-  }, [createFolderName, data.isOnline, isSignedIn, storage]);
+  }, [createFolderName, data.isOnline, isSignedIn, storage, loadSharedRoots]);
 
   const handleCreateShareLink = useCallback(async () => {
     if (!isSignedIn) {
@@ -1643,13 +1608,6 @@ export function SettingsClient() {
   }, [copyPathMessage]);
 
   useEffect(() => {
-    const timerId = window.setTimeout(() => {
-      void loadSharedRoots();
-    }, 0);
-    return () => window.clearTimeout(timerId);
-  }, [loadSharedRoots]);
-
-  useEffect(() => {
     if (!switchDialogOpen || moveDialogOpen || isSwitchWorking) {
       return;
     }
@@ -1998,6 +1956,19 @@ export function SettingsClient() {
             ))}
           </select>
         </div>
+        {activeProviderId === "onedrive" ? (
+          <OneDriveJoin
+            key={`${activeProvider.account?.id ?? "signed-out"}:${activeProvider.status}`}
+            storage={storage}
+            disabled={!isSignedIn || !data.isOnline}
+            selectedId={selectedSharedId}
+            onForgot={() => clearSelection()}
+            onJoined={(root) => {
+              setSelection({ ...root, driveId: root.driveId ?? "", itemId: root.itemId ?? "" });
+              void loadSharedRoots();
+            }}
+          />
+        ) : null}
         <div className="app-actions" style={{ marginTop: 12 }}>
           <Button
             onClick={() => {

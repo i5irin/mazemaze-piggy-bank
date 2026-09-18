@@ -13,6 +13,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { useAuth } from "@/components/AuthProvider";
 import { useStorageProviderContext } from "@/components/StorageProviderContext";
+import { useSharedRoots } from "@/components/useSharedRoots";
 import { useSharedSelection } from "@/components/SharedSelectionProvider";
 import { StatusIndicator } from "@/components/StatusIndicator";
 import {
@@ -101,10 +102,6 @@ export function AppShell({ children }: AppShellProps) {
   const isOnline = useOnlineStatus();
   const activeProvider = providers[activeProviderId];
   const isSignedIn = activeProvider.status === "signed_in";
-  const [sharedRoots, setSharedRoots] = useState<SharedRootListItem[]>([]);
-  const [sharedRootsStatus, setSharedRootsStatus] = useState<
-    "idle" | "loading" | "ready" | "error"
-  >("idle");
   const [syncSignals, setSyncSignals] = useState<Record<string, SyncSignalEntry>>(() =>
     getSyncSignalsSnapshot(),
   );
@@ -115,6 +112,16 @@ export function AppShell({ children }: AppShellProps) {
   const storage = useMemo(
     () => createStorageService(activeProviderId, tokenProvider),
     [activeProviderId, tokenProvider],
+  );
+
+  const {
+    roots: sharedRoots,
+    status: sharedRootsStatus,
+    refresh: loadSharedRoots,
+  } = useSharedRoots(
+    storage,
+    `${activeProviderId}:${activeProvider.account?.id ?? activeProvider.account?.email ?? ""}`,
+    isSignedIn && isOnline,
   );
 
   const pathSegments = useMemo(() => pathname.split("/").filter(Boolean), [pathname]);
@@ -200,37 +207,6 @@ export function AppShell({ children }: AppShellProps) {
       ? `/shared/${encodeURIComponent(buildSharedRouteKey(activeProviderId, selectedSharedId))}/dashboard`
       : "/dashboard";
 
-  const loadSharedRoots = useCallback(async (): Promise<SharedRootListItem[]> => {
-    if (!isSignedIn || !isOnline) {
-      setSharedRoots([]);
-      setSharedRootsStatus("idle");
-      return [];
-    }
-    setSharedRootsStatus("loading");
-    try {
-      if (!storage.capabilities.supportsShared) {
-        setSharedRoots([]);
-        setSharedRootsStatus("ready");
-        return [];
-      }
-      const [withMe, byMe] = await Promise.all([
-        storage.listSharedWithMeRoots(),
-        storage.listSharedByMeRoots(),
-      ]);
-      const byId = new Map<string, SharedRootListItem>();
-      for (const root of [...withMe, ...byMe]) {
-        byId.set(root.sharedId, root);
-      }
-      const merged = [...byId.values()].sort((left, right) => left.name.localeCompare(right.name));
-      setSharedRoots(merged);
-      setSharedRootsStatus("ready");
-      return merged;
-    } catch {
-      setSharedRootsStatus("error");
-      return [];
-    }
-  }, [isOnline, isSignedIn, storage]);
-
   useEffect(() => {
     const timerId = window.setTimeout(() => {
       setIsHydrated(true);
@@ -239,20 +215,6 @@ export function AppShell({ children }: AppShellProps) {
       window.clearTimeout(timerId);
     };
   }, []);
-
-  useEffect(() => {
-    const timerId = window.setTimeout(() => {
-      if (isSignedIn && isOnline) {
-        void loadSharedRoots();
-        return;
-      }
-      setSharedRoots([]);
-      setSharedRootsStatus("idle");
-    }, 0);
-    return () => {
-      window.clearTimeout(timerId);
-    };
-  }, [isOnline, isSignedIn, loadSharedRoots]);
 
   useEffect(() => subscribeSyncSignals(() => setSyncSignals(getSyncSignalsSnapshot())), []);
 

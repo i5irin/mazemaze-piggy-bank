@@ -62,6 +62,8 @@ export type StorageService = {
   ensureSharedRootFolder: () => Promise<SharedRootListItem>;
   createSharedFolder: (name: string) => Promise<SharedRootListItem>;
   listSharedWithMeRoots: () => Promise<SharedRootListItem[]>;
+  joinSharedRootByLink?: (link: string) => Promise<SharedRootListItem>;
+  forgetJoinedRoot?: (sharedId: string) => Promise<void>;
   listSharedByMeRoots: () => Promise<SharedRootListItem[]>;
   getSharedRootInfo: (root: SharedRootReference) => Promise<SharedRootInfo>;
   createShareLink: (
@@ -476,12 +478,18 @@ export const createStorageService = (
     },
     createSharedFolder: async (name: string) =>
       toSharedRootListItem(providerId, await oneDrive.createSharedFolder(name)),
+    joinSharedRootByLink: async (link) =>
+      toSharedRootListItem(providerId, await oneDrive.joinSharedRootByLink(link)),
+    forgetJoinedRoot: oneDrive.forgetJoinedRoot,
     listSharedWithMeRoots: async () =>
       (await oneDrive.listSharedWithMeRoots()).map((item) =>
         toSharedRootListItem(providerId, item),
       ),
     listSharedByMeRoots: async () =>
-      (await oneDrive.listSharedByMeRoots()).map((item) => toSharedRootListItem(providerId, item)),
+      // Do not reuse a cached owner root across account switches when listing workspaces.
+      (await createOneDriveService(graphClient, getGraphScopes()).listSharedByMeRoots()).map(
+        (item) => toSharedRootListItem(providerId, item),
+      ),
     getSharedRootInfo: async (root) =>
       toSharedRootInfo(providerId, await oneDrive.getSharedRootInfo(toOneDriveReference(root))),
     createShareLink: async (root, permission) =>
@@ -501,8 +509,7 @@ export const createStorageService = (
       oneDrive.listSharedEventChunkIds(toOneDriveReference(root)),
     readSharedEventChunk: async (root, chunkId) =>
       oneDrive.readSharedEventChunk(toOneDriveReference(root), chunkId),
-    readSharedEventIndex: async (root) =>
-      oneDrive.readSharedEventIndex(toOneDriveReference(root)),
+    readSharedEventIndex: async (root) => oneDrive.readSharedEventIndex(toOneDriveReference(root)),
     writeSharedEventChunk: async (root, chunkId, content, options) =>
       oneDrive.writeSharedEventChunk(toOneDriveReference(root), chunkId, content, options),
     writeSharedEventIndex: async (root, index) =>

@@ -1,6 +1,7 @@
 "use client";
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { useAuth } from "@/components/AuthProvider";
 import { useStorageProviderContext } from "@/components/StorageProviderContext";
 import type { CloudProviderId } from "@/lib/storage/types";
 
@@ -55,27 +56,24 @@ const parseSelection = (raw: unknown): SharedSelection | null => {
   };
 };
 
-const parseSelectionMap = (raw: string | null): Record<CloudProviderId, SharedSelection | null> => {
-  const empty: Record<CloudProviderId, SharedSelection | null> = {
-    onedrive: null,
-    gdrive: null,
-  };
-  if (!raw) {
-    return empty;
-  }
+const parseSelectionMap = (raw: string | null): Record<string, SharedSelection | null> => {
+  if (!raw) return {};
   try {
-    const parsed = JSON.parse(raw) as unknown;
-    if (!isRecord(parsed)) {
-      return empty;
+    const parsed: unknown = JSON.parse(raw);
+    if (!isRecord(parsed)) return {};
+    const selections: Record<string, SharedSelection | null> = {};
+    for (const [key, value] of Object.entries(parsed)) {
+      const selection = parseSelection(value);
+      // Old OneDrive selections have no account identity and cannot be safely adopted.
+      if (
+        (key === "gdrive" && selection?.providerId === "gdrive") ||
+        (key.startsWith("onedrive:") && selection?.providerId === "onedrive")
+      )
+        selections[key] = selection;
     }
-    const onedrive = parseSelection(parsed.onedrive) ?? null;
-    const gdrive = parseSelection(parsed.gdrive) ?? null;
-    return {
-      onedrive,
-      gdrive,
-    };
+    return selections;
   } catch {
-    return empty;
+    return {};
   }
 };
 
@@ -83,11 +81,18 @@ const SharedSelectionContext = createContext<SharedSelectionContextValue | null>
 
 export function SharedSelectionProvider({ children }: { children: React.ReactNode }) {
   const { activeProviderId } = useStorageProviderContext();
-  const [selections, setSelections] = useState<Record<CloudProviderId, SharedSelection | null>>(
-    () =>
-      typeof window === "undefined"
-        ? { onedrive: null, gdrive: null }
-        : parseSelectionMap(window.localStorage.getItem(STORAGE_KEY)),
+  const { providers } = useAuth();
+  const microsoftId =
+    providers.onedrive.status === "signed_in" ? providers.onedrive.account?.id : undefined;
+  const selectionKey = useCallback(
+    (providerId: CloudProviderId) =>
+      providerId === "gdrive" ? "gdrive" : microsoftId ? `onedrive:${microsoftId}` : null,
+    [microsoftId],
+  );
+  const [selections, setSelections] = useState<Record<string, SharedSelection | null>>(() =>
+    typeof window === "undefined"
+      ? {}
+      : parseSelectionMap(window.localStorage.getItem(STORAGE_KEY)),
   );
 
   useEffect(() => {
@@ -111,16 +116,16 @@ export function SharedSelectionProvider({ children }: { children: React.ReactNod
     return () => window.removeEventListener("storage", handleStorage);
   }, []);
 
-  const selection = selections[activeProviderId] ?? null;
+  const activeKey = selectionKey(activeProviderId);
+  const selection = activeKey ? (selections[activeKey] ?? null) : null;
 
   const setSelectionForProvider = useCallback(
     (providerId: CloudProviderId, next: SharedSelection | null) => {
-      setSelections((prev) => ({
-        ...prev,
-        [providerId]: next,
-      }));
+      const key = selectionKey(providerId);
+      if (!key || (next && next.providerId !== providerId)) return;
+      setSelections((prev) => ({ ...prev, [key]: next }));
     },
-    [],
+    [selectionKey],
   );
 
   const setSelection = useCallback(
@@ -129,10 +134,7 @@ export function SharedSelectionProvider({ children }: { children: React.ReactNod
         setSelectionForProvider(next.providerId, next);
         return;
       }
-      setSelections((prev) => ({
-        ...prev,
-        [activeProviderId]: null,
-      }));
+      setSelectionForProvider(activeProviderId, null);
     },
     [activeProviderId, setSelectionForProvider],
   );
@@ -140,17 +142,17 @@ export function SharedSelectionProvider({ children }: { children: React.ReactNod
   const clearSelection = useCallback(
     (providerId?: CloudProviderId) => {
       const target = providerId ?? activeProviderId;
-      setSelections((prev) => ({
-        ...prev,
-        [target]: null,
-      }));
+      setSelectionForProvider(target, null);
     },
-    [activeProviderId],
+    [activeProviderId, setSelectionForProvider],
   );
 
   const getSelection = useCallback(
-    (providerId: CloudProviderId) => selections[providerId] ?? null,
-    [selections],
+    (providerId: CloudProviderId) => {
+      const key = selectionKey(providerId);
+      return key ? (selections[key] ?? null) : null;
+    },
+    [selections, selectionKey],
   );
 
   const value = useMemo(

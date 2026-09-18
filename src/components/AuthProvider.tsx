@@ -47,6 +47,7 @@ type AuthContextValue = {
 const AuthContext = createContext<AuthContextValue | null>(null);
 
 const toMicrosoftAccount = (account: AccountInfo): ProviderAccount => ({
+  id: account.homeAccountId,
   name: account.name ?? account.username,
   email: account.username,
 });

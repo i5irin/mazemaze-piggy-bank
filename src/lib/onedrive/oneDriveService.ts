@@ -4,6 +4,12 @@ import { createGraphClient } from "@/lib/graph/graphClient";
 import { isGraphError } from "@/lib/graph/graphErrors";
 import { parseEventIndex, type EventIndex } from "@/lib/persistence/eventIndex";
 import { parseSnapshot, type Snapshot } from "@/lib/persistence/snapshot";
+import {
+  encodeOneDriveSharingUrl,
+  readJoinedRoots,
+  rememberJoinedRoot,
+  forgetJoinedRoot,
+} from "./joinedRoots";
 import type { LeaseRecord } from "@/lib/storage/lease";
 
 export const DEFAULT_TEST_FILE_NAME = "pb-test.json";
@@ -18,7 +24,6 @@ const LEASE_FILE_NAME = "lease.json";
 const EVENT_FILE_PREFIX = "event-";
 const EVENT_FILE_EXTENSION = ".jsonl";
 const EVENT_INDEX_FILE_NAME = "index.json";
-const SHARED_WITH_ME_PATH = "/me/drive/sharedWithMe";
 const SHARED_ROOT_FOLDER_NAME = "shared";
 const PERSONAL_ROOT_FOLDER_NAME = "personal";
 const POINTER_SCHEMA_VERSION = 1;
@@ -208,50 +213,6 @@ const parseLeaseRecord = (text: string): LeaseRecord => {
     throw new Error("Lease file has an invalid shape.");
   }
   return data;
-};
-
-const parseSharedListItems = (data: unknown): SharedRootListItem[] => {
-  if (!isRecord(data) || !Array.isArray(data.value)) {
-    return [];
-  }
-  const items: SharedRootListItem[] = [];
-  for (const entry of data.value) {
-    if (!isRecord(entry)) {
-      continue;
-    }
-    const remoteItem = entry.remoteItem;
-    if (!isRecord(remoteItem)) {
-      continue;
-    }
-    const parentReference = remoteItem.parentReference;
-    if (!isRecord(parentReference)) {
-      continue;
-    }
-    if (!isString(remoteItem.id) || !isString(parentReference.driveId)) {
-      continue;
-    }
-    const name = isString(remoteItem.name)
-      ? remoteItem.name
-      : isString(entry.name)
-        ? entry.name
-        : "Shared item";
-    const webUrl = isString(remoteItem.webUrl) ? remoteItem.webUrl : undefined;
-    const isFolder = isRecord(remoteItem.folder);
-    const driveId = parentReference.driveId;
-    const itemId = remoteItem.id;
-    const item: SharedRootListItem = {
-      sharedId: encodeSharedId(driveId, itemId),
-      driveId,
-      itemId,
-      name,
-      isFolder,
-    };
-    if (webUrl) {
-      item.webUrl = webUrl;
-    }
-    items.push(item);
-  }
-  return items;
 };
 
 type DriveItemInfo = {
@@ -624,6 +585,14 @@ export const createOneDriveService = (client: GraphClient, scopes: string[]) => 
   let sharedRootPromise: Promise<DriveItemInfo | null> | null = null;
   let rootProbePromise: Promise<void> | null = null;
   let rootProbeRootKey: string | null = null;
+
+  const getAccountId = async (): Promise<string> => {
+    // Resolve on each operation: this service can survive an account switch.
+    const profile = await client.getJson("/me?$select=id", scopes);
+    if (!isRecord(profile) || !isString(profile.id) || !profile.id)
+      throw new Error("Could not identify the signed-in account. Sign in again.");
+    return profile.id;
+  };
 
   const listEventFileNames = async (root: Pick<SharedRootReference, "driveId" | "itemId">) => {
     let path: string | null = buildSharedChildrenPathFromSegments(root, [EVENTS_FOLDER_NAME]);
@@ -1211,22 +1180,47 @@ export const createOneDriveService = (client: GraphClient, scopes: string[]) => 
         throw error;
       }
     },
-    listSharedWithMeRoots: async (): Promise<SharedRootListItem[]> => {
-      const data = await client.getJson(SHARED_WITH_ME_PATH, scopes);
-      const candidates = parseSharedListItems(data).filter((item) => item.isFolder);
-      const filtered: SharedRootListItem[] = [];
-      for (const candidate of candidates) {
-        if (
-          await hasSharedSnapshot(client, scopes, {
-            driveId: candidate.driveId,
-            itemId: candidate.itemId,
-          })
-        ) {
-          filtered.push(candidate);
-        }
-      }
-      return filtered;
+    listSharedWithMeRoots: async (): Promise<SharedRootListItem[]> =>
+      readJoinedRoots(await getAccountId()),
+    joinSharedRootByLink: async (link: string): Promise<SharedRootListItem> => {
+      const encoded = encodeOneDriveSharingUrl(link);
+      const accountId = await getAccountId();
+      // Redeeming is intentional only when the user chooses to join this link.
+      const data = await client.getJson(`/shares/${encoded}/driveItem`, scopes, {
+        prefer: "redeemSharingLink",
+      });
+      const item = parseDriveItem(
+        isRecord(data) && isRecord(data.remoteItem) ? data.remoteItem : data,
+      );
+      if (!item?.isFolder) throw new Error("Choose a shared workspace folder, not a file.");
+      const direct = parseDriveItem(
+        await client.getJson(
+          buildSharedRootPath({ driveId: item.driveId, itemId: item.id }),
+          scopes,
+        ),
+      );
+      if (!direct?.isFolder || direct.id !== item.id || direct.driveId !== item.driveId)
+        throw new Error("Could not verify the shared workspace. Ask the owner for a new link.");
+      const snapshot = parseSnapshot(
+        await client.getText(
+          buildSharedContentPathFromSegments({ driveId: item.driveId, itemId: item.id }, [
+            SNAPSHOT_SHARED_FILE_NAME,
+          ]),
+          scopes,
+        ),
+      );
+      if (
+        snapshot.stateJson.accounts.some((entry) => entry.scope !== "shared") ||
+        snapshot.stateJson.goals.some((entry) => entry.scope !== "shared")
+      )
+        throw new Error("This folder does not contain a shared workspace.");
+      if ((await getAccountId()) !== accountId)
+        throw new Error("The signed-in account changed. Join again with the intended account.");
+      const root = toSharedRootListItem(direct);
+      rememberJoinedRoot(accountId, root);
+      return root;
     },
+    forgetJoinedRoot: async (sharedId: string) => forgetJoinedRoot(await getAccountId(), sharedId),
     listSharedByMeRoots: async (): Promise<SharedRootListItem[]> => {
       const sharedRoot = await getSharedRootFolder({ createIfMissing: false });
       if (!sharedRoot || !sharedRoot.isFolder) {
@@ -1267,10 +1261,25 @@ export const createOneDriveService = (client: GraphClient, scopes: string[]) => 
       etag: string | null;
       lastModified: string | null;
     }> => {
-      const response = await client.getTextWithHeaders(
-        buildSharedContentPathFromSegments(root, [SNAPSHOT_SHARED_FILE_NAME]),
-        scopes,
-      );
+      let response;
+      try {
+        response = await client.getTextWithHeaders(
+          buildSharedContentPathFromSegments(root, [SNAPSHOT_SHARED_FILE_NAME]),
+          scopes,
+        );
+      } catch (error) {
+        if (
+          isGraphError(error) &&
+          error.status === 404 &&
+          readJoinedRoots(await getAccountId()).some((item) => item.sharedId === root.sharedId)
+        ) {
+          // A joined workspace already had a snapshot. Never recreate it after lost access or deletion.
+          throw new Error(
+            "This joined workspace is unavailable. Check sharing with the owner and rejoin; no data was recreated.",
+          );
+        }
+        throw error;
+      }
       const snapshot = parseSnapshot(response.data);
       return {
         snapshot,

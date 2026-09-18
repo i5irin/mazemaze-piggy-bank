@@ -1,6 +1,7 @@
 export type CloudProviderId = "onedrive" | "gdrive";
 
 export type ProviderAccount = {
+  id?: string;
   name: string;
   email: string;
 };
