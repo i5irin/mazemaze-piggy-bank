@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import { PersonalDataProvider, usePersonalData } from "./PersonalDataProvider";
 import { SharedDataProvider, useSharedData } from "./SharedDataProvider";
 import { GraphError } from "@/lib/graph/graphErrors";
+import { GoogleDriveError } from "@/lib/google/googleDriveErrors";
 import type { EventIndex } from "@/lib/persistence/eventIndex";
 import { parseEventChunk } from "@/lib/persistence/eventChunk";
 import { createEmptySnapshot, type Snapshot } from "@/lib/persistence/snapshot";
@@ -42,7 +43,12 @@ jest.mock("@/lib/persistence/syncSignalStore", () => ({
 let mockProviderId: CloudProviderId = "onedrive";
 const mockSetProvider = jest.fn();
 const mockSetSelection = jest.fn();
-const mockSession = { status: "signed_in", account: { name: "Test user" } };
+const mockSession = {
+  status: "signed_in",
+  account: { name: "Test user" },
+  requireReauthentication: jest.fn(),
+  signIn: jest.fn(),
+};
 const mockAuth = {
   providers: { onedrive: mockSession, gdrive: mockSession },
   getAccessToken: jest.fn(),
@@ -168,6 +174,18 @@ describe.each(["onedrive", "gdrive"] as const)("%s conflict recovery", (provider
         expect(await a.result.current.saveChanges()).toEqual({ ok: true });
       });
       return b;
+    }
+
+    if (providerId === "gdrive") {
+      it("requests explicit consent after scope failure without opening authentication", async () => {
+        const device = await mount();
+        read.mockRejectedValueOnce(
+          new GoogleDriveError("Insufficient OAuth scopes.", { code: "forbidden", status: 403 }),
+        );
+        await act(() => device.result.current.refresh());
+        expect(mockSession.requireReauthentication).toHaveBeenCalledWith("consent");
+        expect(mockSession.signIn).not.toHaveBeenCalled();
+      });
     }
 
     it("replaces losing edits and allows the next save with the new generation", async () => {

@@ -290,7 +290,20 @@ The [Brand Specification](./brand/README.md) is authoritative for visual brand e
   - Show progress in the UI
   - If it fails partway through, **run Move again** (deletion occurs last)
   - If source data has already been deleted, **recover through backup / Import**
-- If Google Drive returns a **403 due to insufficient scopes**, **automatically prompt for consent** (once per session)
+- If Google Drive returns a **403 due to insufficient scopes**, stop the affected cloud operation and offer an explicit sign-in action to renew consent. Do not open consent automatically or retry it recursively. An ordinary sharing-permission denial is not evidence of insufficient OAuth scopes.
+
+#### 8.7 Remembered Connections and Reauthentication
+
+- Keep the selected provider separate from a per-provider record of successful connection on this browser. A default or merely selected provider is not evidence of previous use.
+- Record a successful explicit sign-in, or a successfully restored Microsoft connection with a usable token. The new preference stores provider flags only, not account names, email addresses, sharing links, or credentials; MSAL continues to manage its own authentication cache.
+- On startup, never open an authentication popup automatically. Without a successful-connection record, show the normal storage choices rather than a reauthentication reminder.
+- When online, offer a non-modal reminder only for the current workspace's provider if it was previously connected and now needs sign-in. Do not prompt for the other provider or automatically switch storage. Existing manual sign-in choices remain available.
+- Preserve Microsoft's silent token acquisition and renewal. If user interaction is required, stop the affected cloud operation and wait for an explicit sign-in action; do not automatically fall back to a popup. A transient network failure alone must not be treated as a demand for reauthentication.
+- Google token acquisition starts only from an explicit sign-in action. Page reload and token expiry may require another action; `prompt: none` is not a popup-free renewal mechanism. Do not add persistent Google token storage for this preference.
+- Open authentication or renewed-consent popups only after the user activates a sign-in button. Handle popup blocking, cancellation, and authentication errors without leaving the UI indefinitely busy; allow retry and prevent simultaneous interactive requests for the same provider.
+- Successful explicit sign-out clears that provider's reminder eligibility while preserving the selected storage provider. Do not immediately ask the user to reconnect. A later successful sign-in enables reminders again.
+- While offline, hide reauthentication reminders and retain the existing view-only behavior. If local preferences are unavailable or invalid, sign-in must remain usable, but remembering the connection across reloads is not guaranteed.
+- Legacy provider selection alone is not migrated into a successful-connection record. Connection records are local to this browser and do not grant access to cloud data.
 
 ---
 
@@ -1514,6 +1527,7 @@ This chapter defines the UI when allocations are automatically adjusted because 
     - `Sign out`
     - `Switch…` (**also includes Switch account**)
 - Restore the last-selected provider on reload (do not automatically switch providers even when signed out)
+- Apply §8.7 for remembered connections: show a reminder for the current provider only when previously connected, online, and in need of sign-in. Use the official sign-in button; keep the normal choices available for first-time use and deliberate switching. An authenticated inactive provider must not be displayed as the current connection.
 - **Switch… dialog**
   - List candidates across OneDrive / Google Drive
   - States: `Available` / `Empty` / `Not signed in`
@@ -1535,7 +1549,7 @@ This chapter defines the UI when allocations are automatically adjusted because 
   - `Clear cache & reload`
   - `Reload from cloud`
 - Show `Sign-in required` when online but signed out / expired.
-- On Google Drive insufficient scopes (403 / insufficient scopes), **automatically prompt for consent** (once per session).
+- On Google Drive insufficient scopes (403 / insufficient scopes), show a permission-renewal message and let the user explicitly activate sign-in with consent. Do not open a popup from background loading or recovery (§8.7).
 - Google Drive scopes are `drive.file` + `drive.appdata` (the pointer is stored in appDataFolder).
 - When `Retry now` is disabled, **always show** short helper text directly below the button (do not rely on hover).
   - Examples: `No queued retries.` / `You're offline.` / `Read-only mode.`

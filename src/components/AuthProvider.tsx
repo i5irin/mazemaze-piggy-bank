@@ -15,6 +15,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { rememberConnection, useConnectionMemory } from "@/lib/auth/connectionMemory";
 import { AuthError } from "@/lib/auth/authErrors";
 import { getGoogleClientId, getGoogleScopes } from "@/lib/auth/googleConfig";
 import { getMsalInstance } from "@/lib/auth/msalClient";
@@ -32,6 +33,8 @@ type ProviderSession = {
   status: AuthStatus;
   account: ProviderAccount | null;
   error: string | null;
+  reauthPrompt: "consent" | "select_account" | null;
+  requireReauthentication: (prompt?: "consent" | "select_account") => void;
   signIn: (options?: AuthSignInOptions) => Promise<void>;
   signOut: () => Promise<void>;
   getAccessToken: (scopes: string[]) => Promise<string>;
@@ -39,6 +42,7 @@ type ProviderSession = {
 
 type AuthContextValue = {
   providers: Record<CloudProviderId, ProviderSession>;
+  rememberedProviders: Record<CloudProviderId, boolean>;
   signIn: (providerId: CloudProviderId, options?: AuthSignInOptions) => Promise<void>;
   signOut: (providerId: CloudProviderId) => Promise<void>;
   getAccessToken: (providerId: CloudProviderId, scopes: string[]) => Promise<string>;
@@ -134,6 +138,18 @@ const useMicrosoftAuth = (): ProviderSession => {
   const [account, setAccount] = useState<ProviderAccount | null>(null);
   const [error, setError] = useState<string | null>(() => msalInit.error);
   const msalReady = msalInit.ready;
+  const [reauthPrompt, setReauthPrompt] = useState<"consent" | "select_account" | null>(null);
+  const interactionRequired = useRef(false);
+  const generation = useRef(0);
+  const interactive = useRef(false);
+  const requireReauthentication = useCallback(
+    (prompt: "consent" | "select_account" = "select_account") => {
+      interactionRequired.current = true;
+      setReauthPrompt((previous) => (previous === "consent" ? previous : prompt));
+      setStatus("signed_out");
+    },
+    [],
+  );
 
   const syncAccount = useCallback((accountInfo: AccountInfo | null) => {
     setError(null);
@@ -142,6 +158,8 @@ const useMicrosoftAuth = (): ProviderSession => {
       setStatus("signed_out");
       return;
     }
+    interactionRequired.current = false;
+    setReauthPrompt(null);
     setAccount(toMicrosoftAccount(accountInfo));
     setStatus("signed_in");
   }, []);
@@ -163,6 +181,7 @@ const useMicrosoftAuth = (): ProviderSession => {
         if (result?.account) {
           msalInstance.setActiveAccount(result.account);
           syncAccount(result.account);
+          rememberConnection("onedrive", true);
           return;
         }
         const currentAccount =
@@ -196,6 +215,7 @@ const useMicrosoftAuth = (): ProviderSession => {
 
   const signIn = useCallback(
     async (options?: AuthSignInOptions) => {
+      if (interactive.current) return;
       setError(null);
       if (!msalReady) {
         setError("Microsoft sign-in is not configured.");
@@ -203,26 +223,38 @@ const useMicrosoftAuth = (): ProviderSession => {
         return;
       }
       const msalInstance = getMsalInstance();
+      interactive.current = true;
+      const request = ++generation.current;
       try {
         setStatus("loading");
         const result = await msalInstance.loginPopup({
           scopes: getGraphScopes(),
-          prompt: options?.prompt ?? "select_account",
+          prompt: options?.prompt ?? reauthPrompt ?? "select_account",
         });
+        if (request !== generation.current) return;
         if (result.account) {
           msalInstance.setActiveAccount(result.account);
         }
-        syncAccount(result.account ?? pickAccount(msalInstance.getAllAccounts()));
+        const connected = result.account ?? pickAccount(msalInstance.getAllAccounts());
+        syncAccount(connected);
+        if (connected) rememberConnection("onedrive", true);
       } catch (err) {
+        if (request !== generation.current) return;
+        if (interactionRequired.current) setStatus("signed_out");
+        else
+          syncAccount(
+            msalInstance.getActiveAccount() ?? pickAccount(msalInstance.getAllAccounts()),
+          );
         setError(toAuthErrorMessage(err));
-        const currentAccount = pickAccount(msalInstance.getAllAccounts());
-        syncAccount(currentAccount);
+      } finally {
+        interactive.current = false;
       }
     },
-    [msalReady, syncAccount],
+    [msalReady, reauthPrompt, syncAccount],
   );
 
   const signOut = useCallback(async () => {
+    if (interactive.current) return;
     setError(null);
     if (!msalReady) {
       setError("Microsoft sign-in is not configured.");
@@ -230,6 +262,8 @@ const useMicrosoftAuth = (): ProviderSession => {
       return;
     }
     const msalInstance = getMsalInstance();
+    interactive.current = true;
+    generation.current++;
     try {
       setStatus("loading");
       const currentAccount =
@@ -237,11 +271,18 @@ const useMicrosoftAuth = (): ProviderSession => {
       await msalInstance.logoutPopup({
         account: currentAccount ?? undefined,
       });
+      interactionRequired.current = true;
+      setReauthPrompt(null);
+      rememberConnection("onedrive", false);
       syncAccount(null);
     } catch (err) {
+      const currentAccount =
+        msalInstance.getActiveAccount() ?? pickAccount(msalInstance.getAllAccounts());
+      if (interactionRequired.current) setStatus("signed_out");
+      else syncAccount(currentAccount);
       setError(toAuthErrorMessage(err));
-      const currentAccount = pickAccount(msalInstance.getAllAccounts());
-      syncAccount(currentAccount);
+    } finally {
+      interactive.current = false;
     }
   }, [msalReady, syncAccount]);
 
@@ -250,10 +291,15 @@ const useMicrosoftAuth = (): ProviderSession => {
       if (!msalReady) {
         throw new AuthError("missing-config", "Microsoft sign-in is not configured.");
       }
+      if (interactionRequired.current || interactive.current) {
+        throw new AuthError("interaction-required", "Microsoft sign-in required.");
+      }
+      const request = generation.current;
       const msalInstance = getMsalInstance();
       const currentAccount =
         msalInstance.getActiveAccount() ?? pickAccount(msalInstance.getAllAccounts());
       if (!currentAccount) {
+        requireReauthentication();
         throw new AuthError("not-signed-in", "You are not signed in.");
       }
       try {
@@ -261,20 +307,19 @@ const useMicrosoftAuth = (): ProviderSession => {
           account: currentAccount,
           scopes,
         });
+        if (request !== generation.current || interactionRequired.current)
+          throw new AuthError("interaction-required", "Microsoft sign-in required.");
+        rememberConnection("onedrive", true);
         return result.accessToken;
       } catch (err) {
         if (err instanceof InteractionRequiredAuthError) {
-          const result = await msalInstance.acquireTokenPopup({ scopes });
-          if (result.account) {
-            msalInstance.setActiveAccount(result.account);
-            syncAccount(result.account);
-          }
-          return result.accessToken;
+          if (request === generation.current) requireReauthentication();
+          throw new AuthError("interaction-required", "Microsoft sign-in required.");
         }
         throw err;
       }
     },
-    [msalReady, syncAccount],
+    [msalReady, requireReauthentication],
   );
 
   return {
@@ -282,6 +327,8 @@ const useMicrosoftAuth = (): ProviderSession => {
     status,
     account,
     error,
+    reauthPrompt,
+    requireReauthentication,
     signIn,
     signOut,
     getAccessToken,
@@ -296,6 +343,22 @@ const useGoogleAuth = (): ProviderSession => {
   const [error, setError] = useState<string | null>(null);
   const scopes = useMemo(() => getGoogleScopes(), []);
   const clientIdRef = useRef<string | null>(null);
+  const pendingReject = useRef<((error: Error) => void) | null>(null);
+  const generation = useRef(0);
+  const interactive = useRef(false);
+  const cancelPendingRequest = useCallback(() => {
+    generation.current++;
+    pendingReject.current?.(new Error("Sign-in was interrupted."));
+  }, []);
+  const [reauthPrompt, setReauthPrompt] = useState<"consent" | "select_account" | null>(null);
+  const requireReauthentication = useCallback(
+    (prompt: "consent" | "select_account" = "select_account") => {
+      tokenRef.current = null;
+      setReauthPrompt((previous) => (previous === "consent" ? previous : prompt));
+      setStatus("signed_out");
+    },
+    [],
+  );
 
   const resolveAccessToken = useCallback((response: GoogleTokenResponse): string => {
     const token = response.access_token?.trim();
@@ -313,14 +376,28 @@ const useGoogleAuth = (): ProviderSession => {
           reject(new AuthError("missing-config", "Google sign-in is not configured."));
           return;
         }
+        if (pendingReject.current) {
+          reject(new Error("Sign-in is already in progress."));
+          return;
+        }
+        const finishReject = (error: Error) => {
+          pendingReject.current = null;
+          reject(error);
+        };
+        pendingReject.current = finishReject;
         tokenClient.callback = (response) => {
+          pendingReject.current = null;
           if (response.error) {
             reject(new Error(response.error_description ?? response.error));
             return;
           }
           resolve(response);
         };
-        tokenClient.requestAccessToken({ prompt });
+        try {
+          tokenClient.requestAccessToken({ prompt });
+        } catch (error) {
+          finishReject(error instanceof Error ? error : new Error("Google sign-in failed."));
+        }
       }),
     [],
   );
@@ -355,36 +432,22 @@ const useGoogleAuth = (): ProviderSession => {
           client_id: clientId,
           scope: scopes.join(" "),
           callback: () => undefined,
+          error_callback: (error) => {
+            pendingReject.current?.(
+              new Error(
+                error.type === "popup_closed"
+                  ? "Sign-in was canceled. You can try again."
+                  : "Could not open Google sign-in. Allow popups for this site and try again.",
+              ),
+            );
+          },
         });
         if (!tokenClient) {
           throw new Error("Failed to initialize Google sign-in.");
         }
         tokenClientRef.current = tokenClient;
         setError(null);
-        try {
-          const response = await requestToken("none");
-          const accessToken = resolveAccessToken(response);
-          const expiresAt = Date.now() + response.expires_in * 1000;
-          tokenRef.current = { value: accessToken, expiresAt };
-          let profile: ProviderAccount | null = null;
-          try {
-            profile = await loadUserInfo(accessToken);
-          } catch {
-            profile = null;
-          }
-          if (!isMounted) {
-            return;
-          }
-          setAccount(profile);
-          setStatus("signed_in");
-        } catch {
-          if (!isMounted) {
-            return;
-          }
-          tokenRef.current = null;
-          setAccount(null);
-          setStatus("signed_out");
-        }
+        setStatus("signed_out");
       } catch (err) {
         if (!isMounted) {
           return;
@@ -396,37 +459,53 @@ const useGoogleAuth = (): ProviderSession => {
     void init();
     return () => {
       isMounted = false;
+      cancelPendingRequest();
     };
-  }, [loadUserInfo, requestToken, resolveAccessToken, scopes]);
+  }, [scopes, cancelPendingRequest]);
 
   const signIn = useCallback(
     async (options?: AuthSignInOptions) => {
+      if (interactive.current) return;
       setError(null);
       if (!tokenClientRef.current) {
         setError("Google sign-in is not configured.");
         setStatus("error");
         return;
       }
+      interactive.current = true;
+      const request = ++generation.current;
       try {
         setStatus("loading");
-        const response = await requestToken(options?.prompt ?? "select_account");
+        const response = await requestToken(options?.prompt ?? reauthPrompt ?? "select_account");
         const accessToken = resolveAccessToken(response);
         const expiresAt = Date.now() + response.expires_in * 1000;
-        tokenRef.current = { value: accessToken, expiresAt };
         const profile = await loadUserInfo(accessToken);
+        if (request !== generation.current) return;
+        tokenRef.current = { value: accessToken, expiresAt };
+        setReauthPrompt(null);
+        rememberConnection("gdrive", true);
         setAccount(profile);
         setStatus("signed_in");
       } catch (err) {
+        if (request !== generation.current) return;
         setError(toAuthErrorMessage(err));
-        if (!tokenRef.current) {
-          setStatus("signed_out");
-        }
+        setStatus(
+          tokenRef.current && tokenRef.current.expiresAt > Date.now() + 30_000
+            ? "signed_in"
+            : "signed_out",
+        );
+      } finally {
+        interactive.current = false;
       }
     },
-    [loadUserInfo, requestToken, resolveAccessToken],
+    [loadUserInfo, requestToken, resolveAccessToken, reauthPrompt],
   );
 
   const signOut = useCallback(async () => {
+    generation.current++;
+    pendingReject.current?.(new Error("Sign-in was interrupted."));
+    rememberConnection("gdrive", false);
+    setReauthPrompt(null);
     setError(null);
     const token = tokenRef.current?.value ?? null;
     if (token && window.google?.accounts.oauth2) {
@@ -444,27 +523,10 @@ const useGoogleAuth = (): ProviderSession => {
       if (token && token.expiresAt > Date.now() + 30_000) {
         return token.value;
       }
-      if (!tokenClientRef.current) {
-        throw new AuthError("missing-config", "Google sign-in is not configured.");
-      }
-      try {
-        const response = await requestToken("");
-        const accessToken = resolveAccessToken(response);
-        const expiresAt = Date.now() + response.expires_in * 1000;
-        tokenRef.current = { value: accessToken, expiresAt };
-        if (!account) {
-          const profile = await loadUserInfo(accessToken);
-          setAccount(profile);
-        }
-        setStatus("signed_in");
-        return accessToken;
-      } catch (err) {
-        setError(toAuthErrorMessage(err));
-        setStatus(account ? "signed_in" : "signed_out");
-        throw new AuthError("interaction-required", "Google sign-in required.");
-      }
+      requireReauthentication();
+      throw new AuthError("interaction-required", "Google sign-in required.");
     },
-    [account, loadUserInfo, requestToken, resolveAccessToken],
+    [requireReauthentication],
   );
 
   return {
@@ -472,6 +534,8 @@ const useGoogleAuth = (): ProviderSession => {
     status,
     account,
     error,
+    reauthPrompt,
+    requireReauthentication,
     signIn,
     signOut,
     getAccessToken,
@@ -481,6 +545,7 @@ const useGoogleAuth = (): ProviderSession => {
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const microsoft = useMicrosoftAuth();
   const google = useGoogleAuth();
+  const rememberedProviders = useConnectionMemory();
 
   const providers = useMemo(
     () => ({
@@ -513,11 +578,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const value = useMemo(
     () => ({
       providers,
+      rememberedProviders,
       signIn,
       signOut,
       getAccessToken,
     }),
-    [getAccessToken, providers, signIn, signOut],
+    [getAccessToken, providers, rememberedProviders, signIn, signOut],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

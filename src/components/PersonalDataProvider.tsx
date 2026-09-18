@@ -66,7 +66,6 @@ import type {
   SaveChangesOutcome,
   SpaceInfo,
 } from "@/components/dataContext";
-import { canPromptGoogleConsent, markGoogleConsentPrompted } from "@/lib/auth/googleConsent";
 
 const MAX_EVENTS_PER_CHUNK = 500;
 const LEASE_DURATION_MS = 90_000;
@@ -314,19 +313,8 @@ export function PersonalDataProvider({ children }: { children: React.ReactNode }
           cachedAt: new Date().toISOString(),
         });
       } catch (err) {
-        if (
-          activeProviderId === "gdrive" &&
-          isStoragePermissionScopeError(err) &&
-          canPromptGoogleConsent()
-        ) {
-          markGoogleConsentPrompted();
-          try {
-            await activeProvider.signIn({ prompt: "consent" });
-            await loadFromRemote(options);
-            return;
-          } catch {
-            // Fall through to default error handling.
-          }
+        if (activeProviderId === "gdrive" && isStoragePermissionScopeError(err)) {
+          activeProvider.requireReauthentication("consent");
         }
         if (isStorageNotFound(err)) {
           try {

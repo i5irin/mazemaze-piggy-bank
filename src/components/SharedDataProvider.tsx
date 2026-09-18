@@ -73,7 +73,6 @@ import {
   isStoragePreconditionFailed,
 } from "@/lib/storage/storageErrors";
 import type { CloudProviderId, SharedRootInfo, SharedRootReference } from "@/lib/storage/types";
-import { canPromptGoogleConsent, markGoogleConsentPrompted } from "@/lib/auth/googleConsent";
 
 const MAX_EVENTS_PER_CHUNK = 500;
 const LEASE_DURATION_MS = 90_000;
@@ -423,19 +422,8 @@ export function SharedDataProvider({
         cachedAt: new Date().toISOString(),
       });
     } catch (err) {
-      if (
-        routeProviderId === "gdrive" &&
-        isStoragePermissionScopeError(err) &&
-        canPromptGoogleConsent()
-      ) {
-        markGoogleConsentPrompted();
-        try {
-          await providerSession.signIn({ prompt: "consent" });
-          await loadFromRemote();
-          return;
-        } catch {
-          // Fall through to default error handling.
-        }
+      if (routeProviderId === "gdrive" && isStoragePermissionScopeError(err)) {
+        providerSession.requireReauthentication("consent");
       }
       if (isStorageNotFound(err)) {
         try {

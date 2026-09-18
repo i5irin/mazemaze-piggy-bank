@@ -22,6 +22,7 @@ declare global {
         scope: string;
         prompt?: string;
         callback: (response: GoogleTokenResponse) => void;
+        error_callback?: (error: { type: string }) => void;
       }) => GoogleTokenClient;
       revoke: (token: string, done: () => void) => void;
     };

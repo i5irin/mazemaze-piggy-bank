@@ -14,6 +14,7 @@ import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react
 import { useAuth } from "@/components/AuthProvider";
 import { useStorageProviderContext } from "@/components/StorageProviderContext";
 import { useSharedRoots } from "@/components/useSharedRoots";
+import { ReauthenticationNotice } from "@/components/ReauthenticationNotice";
 import { useSharedSelection } from "@/components/SharedSelectionProvider";
 import { StatusIndicator } from "@/components/StatusIndicator";
 import {
@@ -407,7 +408,10 @@ export function AppShell({ children }: AppShellProps) {
           <StatusIndicator state={syncIndicatorState} className="status-indicator-header" />
         </div>
       </header>
-      <main className="app-main">{children}</main>
+      <main className="app-main">
+        <ReauthenticationNotice providerId={routeProviderId} isOnline={isOnline} />
+        {children}
+      </main>
       <nav className="app-nav" aria-label="Primary">
         <div className="app-nav-brand">
           <Link href={dashboardHref} className="brand-link" aria-label="Mazemaze Piggy Bank">
