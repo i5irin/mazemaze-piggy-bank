@@ -127,7 +127,7 @@ export function AppShell({ children }: AppShellProps) {
 
   const pathSegments = useMemo(() => pathname.split("/").filter(Boolean), [pathname]);
   const isSharedRoute = pathSegments[0] === "shared" && pathSegments.length >= 2;
-  const routeKey = isSharedRoute ? decodeURIComponent(pathSegments[1]) : null;
+  const routeKey = isSharedRoute ? pathSegments[1] : null;
   const routeInfo = useMemo(() => (routeKey ? parseSharedRouteKey(routeKey) : null), [routeKey]);
   const routeProviderId = routeInfo?.providerId ?? activeProviderId;
   const routeSharedId = routeInfo?.sharedId ?? null;
