@@ -17,6 +17,7 @@
     "@azure/msal-browser": "^3.0.0",
     "@fluentui/react-components": "^9.72.10",
     "@fluentui/react-icons": "^2.0.0",
+    "jszip": "^3.10.1",
     "next": "16.1.4",
     "react": "19.2.3",
     "react-dom": "19.2.3"

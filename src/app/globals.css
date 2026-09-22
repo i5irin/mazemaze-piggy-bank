@@ -471,6 +471,117 @@ a {
   min-width: 0;
 }
 
+.settings-provider-grid {
+  display: grid;
+  gap: var(--space-3);
+  margin-top: var(--space-2);
+}
+
+.settings-provider-card {
+  border: 1px solid var(--app-border);
+  border-radius: var(--radius-2);
+  padding: var(--space-3);
+  background: color-mix(in srgb, var(--app-surface) 96%, transparent);
+  display: grid;
+  gap: 8px;
+}
+
+.settings-provider-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.provider-signin-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 6px;
+  border: 1px solid #d0d0d0;
+  background: #fff;
+  color: #1a1a1a;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.05s ease;
+}
+
+.provider-signin-button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.provider-signin-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.provider-signin-logo {
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.provider-signin-logo svg {
+  width: 20px;
+  height: 20px;
+  display: block;
+}
+
+.settings-import-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: center;
+  margin-top: 10px;
+}
+
+.settings-file-input {
+  display: none;
+}
+
+.settings-import-filename {
+  font-size: 13px;
+}
+
+.settings-import-preview {
+  margin-top: 12px;
+}
+
+.settings-switch-modal {
+  width: min(640px, 100%);
+}
+
+.settings-switch-list {
+  display: grid;
+  gap: var(--space-3);
+  margin-top: 12px;
+}
+
+.settings-switch-card {
+  border: 1px solid var(--app-border);
+  border-radius: var(--radius-2);
+  padding: var(--space-3);
+  background: color-mix(in srgb, var(--app-surface) 96%, transparent);
+  display: grid;
+  gap: 8px;
+}
+
+.settings-switch-card-active {
+  border-color: color-mix(in srgb, var(--app-accent) 45%, var(--app-border));
+  background: color-mix(in srgb, var(--app-accent) 10%, var(--app-surface));
+}
+
+.settings-switch-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-2);
+}
+
 .settings-overlay {
   position: fixed;
   inset: 0;

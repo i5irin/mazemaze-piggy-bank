@@ -1,4 +1,5 @@
 import type { DataActivity } from "@/components/dataContext";
+import type { CloudProviderId } from "@/lib/storage/types";
 
 export type SyncSignalEntry = {
   key: string;
@@ -9,9 +10,11 @@ export type SyncSignalEntry = {
   lastSyncedAt: string | null;
 };
 
-export const PERSONAL_SYNC_SIGNAL_KEY = "personal";
+export const buildPersonalSyncSignalKey = (providerId: CloudProviderId): string =>
+  `personal:${providerId}`;
 
-export const buildSharedSyncSignalKey = (sharedId: string): string => `shared:${sharedId}`;
+export const buildSharedSyncSignalKey = (providerId: CloudProviderId, sharedId: string): string =>
+  `shared:${providerId}:${sharedId}`;
 
 const signals = new Map<string, SyncSignalEntry>();
 const listeners = new Set<() => void>();

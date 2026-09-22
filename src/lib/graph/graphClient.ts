@@ -164,7 +164,7 @@ export const createGraphClient = ({ accessTokenProvider, onRetry }: GraphClientO
       { scopes, responseType: "json", onRetry },
       accessTokenProvider,
     ),
-  getJson: async (path: string, scopes: string[]) =>
+  getJson: async (path: string, scopes: string[], options?: { prefer?: "redeemSharingLink" }) =>
     (
       await requestGraph<unknown>(
         path,
@@ -172,6 +172,7 @@ export const createGraphClient = ({ accessTokenProvider, onRetry }: GraphClientO
           method: "GET",
           headers: {
             Accept: "application/json",
+            ...(options?.prefer ? { Prefer: options.prefer } : {}),
           },
         },
         { scopes, responseType: "json", onRetry },

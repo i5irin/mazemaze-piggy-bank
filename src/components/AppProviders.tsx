@@ -10,7 +10,9 @@ import { createContext, useContext, useEffect, useMemo, useState } from "react";
 import { AppShell } from "@/components/AppShell";
 import { AuthProvider } from "@/components/AuthProvider";
 import { PersonalDataProvider } from "@/components/PersonalDataProvider";
+import { StorageProviderContextProvider } from "@/components/StorageProviderContext";
 import { SharedSelectionProvider } from "@/components/SharedSelectionProvider";
+import { configureAppServiceWorker } from "@/lib/pwa/serviceWorker";
 
 const THEME_STORAGE_KEY = "mazemaze-piggy-bank-theme";
 
@@ -127,12 +129,7 @@ export function AppProviders({ children }: { children: React.ReactNode }) {
   }, [preference]);
 
   useEffect(() => {
-    if (process.env.NODE_ENV !== "production") {
-      return;
-    }
-    if ("serviceWorker" in navigator) {
-      navigator.serviceWorker.register("/sw.js").catch(() => undefined);
-    }
+    void configureAppServiceWorker(process.env.NODE_ENV === "production").catch(() => undefined);
   }, []);
 
   const theme = useMemo(() => (mode === "dark" ? darkTheme : lightTheme), [mode]);
@@ -142,11 +139,13 @@ export function AppProviders({ children }: { children: React.ReactNode }) {
       <FluentProvider theme={theme}>
         <ThemeContext.Provider value={{ mode, preference, setPreference }}>
           <AuthProvider>
-            <SharedSelectionProvider>
-              <PersonalDataProvider>
-                <AppShell>{children}</AppShell>
-              </PersonalDataProvider>
-            </SharedSelectionProvider>
+            <StorageProviderContextProvider>
+              <SharedSelectionProvider>
+                <PersonalDataProvider>
+                  <AppShell>{children}</AppShell>
+                </PersonalDataProvider>
+              </SharedSelectionProvider>
+            </StorageProviderContextProvider>
           </AuthProvider>
         </ThemeContext.Provider>
       </FluentProvider>

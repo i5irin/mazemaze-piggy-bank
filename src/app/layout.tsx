@@ -8,7 +8,7 @@ export const metadata: Metadata = {
     template: "%s | Mazemaze Piggy Bank",
   },
   description:
-    "A mobile-first PWA for tracking personal and shared savings allocations with OneDrive.",
+    "A mobile-first PWA for tracking personal and shared savings allocations with OneDrive or Google Drive storage.",
   applicationName: "Mazemaze Piggy Bank",
   manifest: "/manifest.webmanifest",
   icons: {

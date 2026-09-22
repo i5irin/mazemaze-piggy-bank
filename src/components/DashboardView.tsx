@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { DataContextValue } from "@/components/dataContext";
+import { useStorageProviderContext } from "@/components/StorageProviderContext";
 import {
   buildAccountSummary,
   buildAssetSummary,
@@ -15,6 +16,7 @@ import {
 } from "@/components/dashboard/dashboardData";
 import type { HistoryItem } from "@/lib/persistence/history";
 import { getDeviceId } from "@/lib/lease/deviceId";
+import { buildSharedRouteKey } from "@/lib/storage/sharedRoute";
 import { useNow } from "@/lib/time/useNow";
 
 const ACTIVITY_LIMIT = 5;
@@ -74,6 +76,7 @@ const formatDelta = (amount: number): string => {
 };
 
 export function DashboardView({ data }: { data: DataContextValue }) {
+  const { activeProviderId } = useStorageProviderContext();
   const {
     draftState,
     isOnline,
@@ -176,11 +179,11 @@ export function DashboardView({ data }: { data: DataContextValue }) {
 
   const accountsBasePath =
     space.scope === "shared" && space.sharedId
-      ? `/shared/${encodeURIComponent(space.sharedId)}/accounts`
+      ? `/shared/${encodeURIComponent(buildSharedRouteKey(activeProviderId, space.sharedId))}/accounts`
       : "/accounts";
   const goalsBasePath =
     space.scope === "shared" && space.sharedId
-      ? `/shared/${encodeURIComponent(space.sharedId)}/goals`
+      ? `/shared/${encodeURIComponent(buildSharedRouteKey(activeProviderId, space.sharedId))}/goals`
       : "/goals";
 
   const buildAccountHref = (accountId: string) => {

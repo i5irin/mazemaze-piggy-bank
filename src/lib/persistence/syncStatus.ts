@@ -1,4 +1,10 @@
-export type SyncIndicatorState = "online" | "saving" | "retry_needed" | "offline" | "view_only";
+export type SyncIndicatorState =
+  | "online"
+  | "saving"
+  | "retry_needed"
+  | "offline"
+  | "view_only"
+  | "sign_in_required";
 
 export type SyncDotTone = "green" | "yellow" | "red";
 
@@ -13,6 +19,7 @@ const SYNC_INDICATOR_META: Record<SyncIndicatorState, SyncIndicatorMeta> = {
   retry_needed: { label: "Retry needed", tone: "red" },
   offline: { label: "Offline", tone: "red" },
   view_only: { label: "View-only", tone: "yellow" },
+  sign_in_required: { label: "Sign-in required", tone: "yellow" },
 };
 
 export const getSyncIndicatorMeta = (state: SyncIndicatorState): SyncIndicatorMeta =>
@@ -20,12 +27,16 @@ export const getSyncIndicatorMeta = (state: SyncIndicatorState): SyncIndicatorMe
 
 export const resolveSyncIndicatorState = (input: {
   isOnline: boolean;
+  isSignedIn: boolean;
   isSaving: boolean;
   retryQueueCount: number;
   isViewOnly: boolean;
 }): SyncIndicatorState => {
   if (!input.isOnline) {
     return "offline";
+  }
+  if (!input.isSignedIn) {
+    return "sign_in_required";
   }
   if (input.isSaving) {
     return "saving";

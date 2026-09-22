@@ -173,6 +173,55 @@ const getGoalAllocationTotal = (
     return total + allocation.allocatedAmount;
   }, 0);
 
+const buildGoalProgressPayload = (
+  goal: Goal | undefined,
+  allocations: Allocation[],
+): { currentAmount: number; targetAmount: number } | null => {
+  if (!goal) {
+    return null;
+  }
+  const currentAmount = allocations.reduce((sum, allocation) => {
+    if (allocation.goalId !== goal.id) {
+      return sum;
+    }
+    return sum + allocation.allocatedAmount;
+  }, 0);
+  return { currentAmount, targetAmount: goal.targetAmount };
+};
+
+const buildAllocationEventPayload = (input: {
+  allocationId?: string | null;
+  goal: Goal;
+  position: Position;
+  accountName: string | null;
+  amountBefore: number;
+  amountAfter: number;
+  allocations: Allocation[];
+  origin?: "user" | "system";
+  trigger?: string;
+  marketValueBefore?: number;
+  marketValueAfter?: number;
+}): Record<string, unknown> => {
+  const progress = buildGoalProgressPayload(input.goal, input.allocations);
+  return {
+    allocationId: input.allocationId ?? undefined,
+    goalId: input.goal.id,
+    positionId: input.position.id,
+    goalName: input.goal.name,
+    positionLabel: input.position.label,
+    accountName: input.accountName,
+    amountBefore: input.amountBefore,
+    amountAfter: input.amountAfter,
+    amountDelta: input.amountAfter - input.amountBefore,
+    amount: input.amountAfter,
+    origin: input.origin,
+    trigger: input.trigger,
+    marketValueBefore: input.marketValueBefore,
+    marketValueAfter: input.marketValueAfter,
+    goalProgress: progress ?? undefined,
+  };
+};
+
 const buildRemainingByGoal = (state: NormalizedState, positionId: string): Map<string, number> => {
   const totals = new Map<string, number>();
   for (const allocation of state.allocations) {
@@ -756,14 +805,17 @@ export const updatePosition = (
     return { error: "Allocation mode is invalid." };
   }
 
+  const goalsById = new Map(state.goals.map((goal) => [goal.id, goal]));
   const marketValueChanged = position.marketValue !== input.marketValue;
   let nextAllocations = state.allocations;
   let recalculated = false;
   let notice: AllocationNotice | null = null;
+  let positionAllocations: Allocation[] = [];
+  let nextPositionAllocations: Allocation[] = [];
+  let changes: AllocationChange[] = [];
 
   if (marketValueChanged) {
-    const positionAllocations = getAllocationsForPosition(state, position.id);
-    const goalsById = new Map(state.goals.map((goal) => [goal.id, goal]));
+    positionAllocations = getAllocationsForPosition(state, position.id);
     let recalculatedAllocations = positionAllocations;
     if (input.allocationMode === "fixed") {
       const remainingByGoal = buildRemainingByGoal(state, position.id);
@@ -876,10 +928,10 @@ export const updatePosition = (
       (allocation) => recalculatedById.get(allocation.id) ?? allocation,
     );
     nextAllocations = removeZeroAllocations(mergedAllocations);
-    const nextPositionAllocations = nextAllocations.filter(
+    nextPositionAllocations = nextAllocations.filter(
       (allocation) => allocation.positionId === position.id,
     );
-    const changes = buildAllocationChanges(positionAllocations, nextPositionAllocations);
+    changes = buildAllocationChanges(positionAllocations, nextPositionAllocations);
     recalculated = changes.length > 0;
     notice = buildAllocationNotice(meta, "position_recalc", changes, goalsById, {
       thresholdBase: input.marketValue,
@@ -896,6 +948,61 @@ export const updatePosition = (
     updatedAt: marketValueChanged ? meta.createdAt : position.updatedAt,
   };
 
+  const recalcEvents: PendingEvent[] = [];
+  if (marketValueChanged && recalculated) {
+    const allocationIdByKeyBefore = new Map(
+      positionAllocations.map((allocation) => [
+        allocationKey(allocation.goalId, allocation.positionId),
+        allocation.id,
+      ]),
+    );
+    const allocationIdByKeyAfter = new Map(
+      nextPositionAllocations.map((allocation) => [
+        allocationKey(allocation.goalId, allocation.positionId),
+        allocation.id,
+      ]),
+    );
+    const sortedChanges = [...changes].sort((left, right) => {
+      if (left.goalId !== right.goalId) {
+        return left.goalId.localeCompare(right.goalId);
+      }
+      return left.positionId.localeCompare(right.positionId);
+    });
+    for (const change of sortedChanges) {
+      const goal = goalsById.get(change.goalId);
+      if (!goal) {
+        continue;
+      }
+      const key = allocationKey(change.goalId, change.positionId);
+      const allocationId = allocationIdByKeyAfter.get(key) ?? allocationIdByKeyBefore.get(key);
+      const eventType =
+        change.before === 0
+          ? "allocation_created"
+          : change.after === 0
+            ? "allocation_deleted"
+            : "allocation_updated";
+      recalcEvents.push(
+        buildEvent(
+          meta,
+          eventType,
+          buildAllocationEventPayload({
+            allocationId,
+            goal,
+            position,
+            accountName,
+            amountBefore: change.before,
+            amountAfter: change.after,
+            allocations: nextAllocations,
+            origin: "system",
+            trigger: "position_recalc",
+            marketValueBefore: position.marketValue,
+            marketValueAfter: input.marketValue,
+          }),
+        ),
+      );
+    }
+  }
+
   return {
     nextState: {
       ...state,
@@ -904,6 +1011,7 @@ export const updatePosition = (
     },
     notice: notice ?? undefined,
     events: [
+      ...recalcEvents,
       buildEvent(meta, "position_updated", {
         positionId: position.id,
         accountName,
@@ -997,6 +1105,7 @@ export const createGoal = (
         name: goal.name,
         targetAmount: goal.targetAmount,
         status: goal.status,
+        goalProgress: buildGoalProgressPayload(goal, state.allocations) ?? undefined,
       }),
     ],
   };
@@ -1095,6 +1204,7 @@ export const updateGoal = (
         name: nextGoal.name,
         targetAmount: nextGoal.targetAmount,
         status: nextGoal.status,
+        goalProgress: buildGoalProgressPayload(nextGoal, nextAllocations) ?? undefined,
       }),
     ],
   };
@@ -1167,14 +1277,19 @@ export const createAllocation = (
     return {
       nextState: { ...state, allocations: nextAllocations },
       events: [
-        buildEvent(meta, "allocation_deleted", {
-          allocationId: existing.id,
-          goalId: existing.goalId,
-          positionId: existing.positionId,
-          goalName: goal.name,
-          positionLabel: position.label,
-          accountName: account.name,
-        }),
+        buildEvent(
+          meta,
+          "allocation_deleted",
+          buildAllocationEventPayload({
+            allocationId: existing.id,
+            goal,
+            position,
+            accountName: account.name,
+            amountBefore: existing.allocatedAmount,
+            amountAfter: 0,
+            allocations: nextAllocations,
+          }),
+        ),
       ],
     };
   }
@@ -1196,15 +1311,19 @@ export const createAllocation = (
     return {
       nextState: { ...state, allocations: nextAllocations },
       events: [
-        buildEvent(meta, "allocation_updated", {
-          allocationId: existing.id,
-          goalId: existing.goalId,
-          positionId: existing.positionId,
-          amount: nextAllocation.allocatedAmount,
-          goalName: goal.name,
-          positionLabel: position.label,
-          accountName: account.name,
-        }),
+        buildEvent(
+          meta,
+          "allocation_updated",
+          buildAllocationEventPayload({
+            allocationId: existing.id,
+            goal,
+            position,
+            accountName: account.name,
+            amountBefore: existing.allocatedAmount,
+            amountAfter: nextAllocation.allocatedAmount,
+            allocations: nextAllocations,
+          }),
+        ),
       ],
     };
   }
@@ -1229,15 +1348,19 @@ export const createAllocation = (
   return {
     nextState: { ...state, allocations: [...state.allocations, allocation] },
     events: [
-      buildEvent(meta, "allocation_created", {
-        allocationId: allocation.id,
-        goalId: allocation.goalId,
-        positionId: allocation.positionId,
-        amount: allocation.allocatedAmount,
-        goalName: goal.name,
-        positionLabel: position.label,
-        accountName: account.name,
-      }),
+      buildEvent(
+        meta,
+        "allocation_created",
+        buildAllocationEventPayload({
+          allocationId: allocation.id,
+          goal,
+          position,
+          accountName: account.name,
+          amountBefore: 0,
+          amountAfter: allocation.allocatedAmount,
+          allocations: [...state.allocations, allocation],
+        }),
+      ),
     ],
   };
 };
@@ -1286,20 +1409,28 @@ export const updateAllocation = (
     return { error: "Allocation total exceeds the goal target amount." };
   }
   const nextAllocation: Allocation = { ...allocation, allocatedAmount: input.allocatedAmount };
+  const nextAllocations = state.allocations.map((item) =>
+    item.id === allocation.id ? nextAllocation : item,
+  );
   return {
     nextState: {
       ...state,
-      allocations: state.allocations.map((item) =>
-        item.id === allocation.id ? nextAllocation : item,
-      ),
+      allocations: nextAllocations,
     },
     events: [
-      buildEvent(meta, "allocation_updated", {
-        allocationId: allocation.id,
-        goalId: allocation.goalId,
-        positionId: allocation.positionId,
-        amount: nextAllocation.allocatedAmount,
-      }),
+      buildEvent(
+        meta,
+        "allocation_updated",
+        buildAllocationEventPayload({
+          allocationId: allocation.id,
+          goal,
+          position,
+          accountName: account.name,
+          amountBefore: allocation.allocatedAmount,
+          amountAfter: nextAllocation.allocatedAmount,
+          allocations: nextAllocations,
+        }),
+      ),
     ],
   };
 };
@@ -1319,20 +1450,38 @@ export const deleteAllocation = (
   }
   const position = findPosition(state, allocation.positionId);
   const accountName = position ? (findAccount(state, position.accountId)?.name ?? null) : null;
+  const nextAllocations = state.allocations.filter((item) => item.id !== allocationId);
   return {
     nextState: {
       ...state,
-      allocations: state.allocations.filter((item) => item.id !== allocationId),
+      allocations: nextAllocations,
     },
     events: [
-      buildEvent(meta, "allocation_deleted", {
-        allocationId,
-        goalId: allocation.goalId,
-        positionId: allocation.positionId,
-        goalName: goal?.name ?? null,
-        positionLabel: position?.label ?? null,
-        accountName,
-      }),
+      buildEvent(
+        meta,
+        "allocation_deleted",
+        goal && position
+          ? buildAllocationEventPayload({
+              allocationId,
+              goal,
+              position,
+              accountName,
+              amountBefore: allocation.allocatedAmount,
+              amountAfter: 0,
+              allocations: nextAllocations,
+            })
+          : {
+              allocationId,
+              goalId: allocation.goalId,
+              positionId: allocation.positionId,
+              goalName: goal?.name ?? null,
+              positionLabel: position?.label ?? null,
+              accountName,
+              amountBefore: allocation.allocatedAmount,
+              amountAfter: 0,
+              amountDelta: -allocation.allocatedAmount,
+            },
+      ),
     ],
   };
 };
@@ -1395,6 +1544,13 @@ export const reduceAllocations = (
   const affectedPositionIds = Array.from(
     new Set(normalized.map((item) => item.allocation.positionId)),
   );
+  const goalsById = new Map(state.goals.map((goal) => [goal.id, goal]));
+  const positionsById = new Map(state.positions.map((position) => [position.id, position]));
+  const accountsById = new Map(state.accounts.map((account) => [account.id, account]));
+  const progressGoal =
+    affectedGoalIds.length === 1 ? goalsById.get(affectedGoalIds[0]) : undefined;
+  const goalProgress =
+    progressGoal ? buildGoalProgressPayload(progressGoal, nextAllocations) : null;
 
   return {
     nextState: { ...state, allocations: nextAllocations },
@@ -1402,12 +1558,25 @@ export const reduceAllocations = (
       buildEvent(meta, "allocations_reduced", {
         affectedGoalIds,
         affectedPositionIds,
-        reductions: normalized.map((item) => ({
-          allocationId: item.allocation.id,
-          goalId: item.allocation.goalId,
-          positionId: item.allocation.positionId,
-          amount: item.amount,
-        })),
+        goalProgress: goalProgress ?? undefined,
+        reductions: normalized.map((item) => {
+          const goal = goalsById.get(item.allocation.goalId);
+          const position = positionsById.get(item.allocation.positionId);
+          const accountName = position
+            ? (accountsById.get(position.accountId)?.name ?? null)
+            : null;
+          return {
+            allocationId: item.allocation.id,
+            goalId: item.allocation.goalId,
+            positionId: item.allocation.positionId,
+            amount: item.amount,
+            amountBefore: item.allocation.allocatedAmount,
+            amountAfter: item.allocation.allocatedAmount - item.amount,
+            goalName: goal?.name ?? null,
+            positionLabel: position?.label ?? null,
+            accountName,
+          };
+        }),
       }),
     ],
   };
@@ -1609,6 +1778,7 @@ type SpendEventPayload = {
   payments: SpendPayment[];
   allocations: Allocation[];
   positions: { id: string; marketValueBefore: number; marketValueAfter: number }[];
+  goalProgress?: { currentAmount: number; targetAmount: number };
 };
 
 const isSpendEventPayload = (value: unknown): value is SpendEventPayload => {
@@ -1756,6 +1926,7 @@ export const spendGoal = (
       marketValueBefore: update.before,
       marketValueAfter: update.after,
     })),
+    goalProgress: buildGoalProgressPayload(nextGoal, nextAllocations) ?? undefined,
   };
 
   return {
@@ -1837,6 +2008,11 @@ export const undoSpend = (
         goalId: goal.id,
         goalName: goal.name,
         spentAt: payload.spentAt,
+        goalProgress:
+          buildGoalProgressPayload(
+            repair.nextState.goals.find((item) => item.id === goal.id),
+            repair.nextState.allocations,
+          ) ?? undefined,
       }),
       ...repair.events,
     ],

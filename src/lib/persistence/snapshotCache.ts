@@ -74,3 +74,47 @@ export const clearSnapshotCache = async (): Promise<void> => {
     tx.onerror = () => db.close();
   });
 };
+
+export const clearSnapshotCacheForProvider = async (providerId: string): Promise<void> => {
+  if (typeof indexedDB === "undefined") {
+    return;
+  }
+  const db = await openDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    const store = tx.objectStore(STORE_NAME);
+    const request = store.openCursor();
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) {
+        return;
+      }
+      const record = cursor.value as CachedSnapshot | undefined;
+      if (!record || typeof record.key !== "string") {
+        cursor.continue();
+        return;
+      }
+      const key = record.key;
+      if (key.startsWith(`personal:${providerId}`) || key.startsWith(`shared:${providerId}:`)) {
+        cursor.delete();
+        cursor.continue();
+        return;
+      }
+      if (providerId === "onedrive") {
+        if (key === "personal" || key.startsWith("shared:")) {
+          cursor.delete();
+          cursor.continue();
+          return;
+        }
+      }
+      cursor.continue();
+    };
+    request.onerror = () => reject(request.error);
+    tx.oncomplete = () => {
+      db.close();
+      resolve();
+    };
+    tx.onabort = () => db.close();
+    tx.onerror = () => db.close();
+  });
+};

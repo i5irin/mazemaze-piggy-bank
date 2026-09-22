@@ -1,5 +1,6 @@
 import { formatCurrency } from "@/lib/numberFormat";
 import { parseEventChunk, type StoredEvent } from "./eventChunk";
+import type { EventIndex } from "./eventIndex";
 
 export type HistoryFilter = {
   goalId?: string;
@@ -15,6 +16,7 @@ export type HistoryItem = {
   summary: string;
   origin: HistoryOrigin;
   amountDelta?: number;
+  progress?: { currentAmount: number; targetAmount: number };
 };
 
 export type HistoryPage = {
@@ -30,6 +32,8 @@ type HistoryCursor = {
 type HistorySource = {
   listChunkIds: () => Promise<number[]>;
   readChunk: (chunkId: number) => Promise<string>;
+  readIndex?: () => Promise<EventIndex | null>;
+  getSnapshotVersion?: () => number | null;
 };
 
 type HistoryLoadInput = {
@@ -67,6 +71,21 @@ const asFiniteNumber = (value: unknown): number | null =>
 
 const asString = (value: unknown): string | null => (typeof value === "string" ? value : null);
 
+const asOrigin = (value: unknown): HistoryOrigin | null =>
+  value === "user" || value === "system" ? value : null;
+
+const asProgress = (value: unknown): { currentAmount: number; targetAmount: number } | null => {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const currentAmount = asFiniteNumber(value.currentAmount ?? value.current ?? value.progress);
+  const targetAmount = asFiniteNumber(value.targetAmount ?? value.target);
+  if (currentAmount === null || targetAmount === null) {
+    return null;
+  }
+  return { currentAmount, targetAmount };
+};
+
 const pickPayloadString = (payload: Record<string, unknown>, keys: string[]): string | null => {
   for (const key of keys) {
     const value = asString(payload[key]);
@@ -78,6 +97,26 @@ const pickPayloadString = (payload: Record<string, unknown>, keys: string[]): st
 };
 
 const formatName = (value: string | null): string | null => (value ? value : null);
+
+const formatPositionContext = (
+  positionLabel: string | null,
+  accountName: string | null,
+): string | null => {
+  if (positionLabel && accountName) {
+    return `${positionLabel} in ${accountName}`;
+  }
+  return positionLabel ?? null;
+};
+
+const formatAllocationContext = (
+  goalName: string | null,
+  positionContext: string | null,
+): string | null => {
+  if (goalName && positionContext) {
+    return `${goalName} from ${positionContext}`;
+  }
+  return goalName ?? positionContext ?? null;
+};
 
 const parseCursor = (value: string | null | undefined): HistoryCursor | null => {
   if (!value) {
@@ -186,59 +225,127 @@ const eventMatchesFilter = (event: StoredEvent, filter?: HistoryFilter): boolean
   return true;
 };
 
+const filterChunkIdsByIndex = (index: EventIndex, filter?: HistoryFilter): number[] => {
+  if (!filter?.goalId && !filter?.positionId) {
+    return [...index.chunks].map((chunk) => chunk.chunkId).sort((left, right) => right - left);
+  }
+  const result: number[] = [];
+  for (const chunk of index.chunks) {
+    if (filter.goalId && !chunk.goalIds.includes(filter.goalId)) {
+      continue;
+    }
+    if (filter.positionId && !chunk.positionIds.includes(filter.positionId)) {
+      continue;
+    }
+    result.push(chunk.chunkId);
+  }
+  return result.sort((left, right) => right - left);
+};
+
 const toEventLabel = (eventType: string): string =>
   EVENT_LABELS[eventType] ?? eventType.replaceAll("_", " ");
 
 const buildSummary = (event: StoredEvent): { summary: string; amountDelta?: number } => {
   const payload = isRecord(event.payload) ? event.payload : {};
   if (event.type === "allocation_created") {
-    const amount = asFiniteNumber(payload.amount);
-    const goalName = formatName(pickPayloadString(payload, ["goalName"]));
+    const amountAfter = asFiniteNumber(payload.amountAfter ?? payload.amount);
+    const amountDelta = asFiniteNumber(payload.amountDelta) ?? amountAfter;
+    const goalName = formatName(pickPayloadString(payload, ["goalName", "name"]));
     const positionLabel = formatName(pickPayloadString(payload, ["positionLabel", "label"]));
-    if (amount !== null && goalName && positionLabel) {
+    const accountName = formatName(pickPayloadString(payload, ["accountName"]));
+    const positionContext = formatPositionContext(positionLabel, accountName);
+    const allocationContext = formatAllocationContext(goalName, positionContext);
+    const origin = asOrigin(payload.origin);
+    const trigger = asString(payload.trigger);
+    const prefix =
+      origin === "system"
+        ? trigger === "position_recalc"
+          ? "Allocation added automatically after value update"
+          : "Allocation added automatically"
+        : "Allocation added";
+    if (amountAfter !== null && allocationContext) {
       return {
-        summary: `Allocated ${formatCurrency(amount)} to ${goalName} from ${positionLabel}.`,
-        amountDelta: amount,
+        summary: `${prefix} for ${allocationContext}: ${formatCurrency(amountAfter)}.`,
+        amountDelta: amountDelta ?? undefined,
       };
     }
-    if (amount !== null && goalName) {
+    if (amountAfter !== null) {
       return {
-        summary: `Allocated ${formatCurrency(amount)} to ${goalName}.`,
-        amountDelta: amount,
+        summary: `${prefix}: ${formatCurrency(amountAfter)}.`,
+        amountDelta: amountDelta ?? undefined,
       };
     }
-    return amount === null
-      ? { summary: "Allocation added." }
-      : { summary: `Allocation added: ${formatCurrency(amount)}.`, amountDelta: amount };
+    return { summary: `${prefix}.` };
   }
   if (event.type === "allocation_updated") {
-    const amount = asFiniteNumber(payload.amount);
-    const goalName = formatName(pickPayloadString(payload, ["goalName"]));
+    const amountBefore = asFiniteNumber(payload.amountBefore);
+    const amountAfter = asFiniteNumber(payload.amountAfter ?? payload.amount);
+    const amountDelta =
+      asFiniteNumber(payload.amountDelta) ??
+      (amountBefore !== null && amountAfter !== null ? amountAfter - amountBefore : null);
+    const goalName = formatName(pickPayloadString(payload, ["goalName", "name"]));
     const positionLabel = formatName(pickPayloadString(payload, ["positionLabel", "label"]));
-    if (amount !== null && goalName && positionLabel) {
+    const accountName = formatName(pickPayloadString(payload, ["accountName"]));
+    const positionContext = formatPositionContext(positionLabel, accountName);
+    const allocationContext = formatAllocationContext(goalName, positionContext);
+    const origin = asOrigin(payload.origin);
+    const trigger = asString(payload.trigger);
+    const prefix =
+      origin === "system"
+        ? trigger === "position_recalc"
+          ? "Allocation adjusted automatically after value update"
+          : "Allocation adjusted automatically"
+        : "Allocation updated";
+    const rangeText =
+      amountBefore !== null && amountAfter !== null
+        ? `${formatCurrency(amountBefore)} -> ${formatCurrency(amountAfter)}`
+        : amountAfter !== null
+          ? formatCurrency(amountAfter)
+          : null;
+    if (rangeText && allocationContext) {
       return {
-        summary: `Allocation set to ${formatCurrency(amount)} for ${goalName} from ${positionLabel}.`,
+        summary: `${prefix} for ${allocationContext}: ${rangeText}.`,
+        amountDelta: amountDelta ?? undefined,
       };
     }
-    if (amount !== null && goalName) {
+    if (rangeText) {
       return {
-        summary: `Allocation set to ${formatCurrency(amount)} for ${goalName}.`,
+        summary: `${prefix}: ${rangeText}.`,
+        amountDelta: amountDelta ?? undefined,
       };
     }
-    return amount === null
-      ? { summary: "Allocation changed." }
-      : { summary: `Allocation set to ${formatCurrency(amount)}.` };
+    return { summary: `${prefix}.` };
   }
   if (event.type === "allocation_deleted") {
-    const goalName = formatName(pickPayloadString(payload, ["goalName"]));
+    const amountBefore = asFiniteNumber(payload.amountBefore ?? payload.amount);
+    const amountDelta =
+      asFiniteNumber(payload.amountDelta) ?? (amountBefore !== null ? -amountBefore : null);
+    const goalName = formatName(pickPayloadString(payload, ["goalName", "name"]));
     const positionLabel = formatName(pickPayloadString(payload, ["positionLabel", "label"]));
-    if (goalName && positionLabel) {
-      return { summary: `Allocation removed from ${goalName} on ${positionLabel}.` };
+    const accountName = formatName(pickPayloadString(payload, ["accountName"]));
+    const positionContext = formatPositionContext(positionLabel, accountName);
+    const allocationContext = formatAllocationContext(goalName, positionContext);
+    const origin = asOrigin(payload.origin);
+    const trigger = asString(payload.trigger);
+    const prefix =
+      origin === "system"
+        ? trigger === "position_recalc"
+          ? "Allocation removed automatically after value update"
+          : "Allocation removed automatically"
+        : "Allocation removed";
+    if (amountBefore !== null && allocationContext) {
+      return {
+        summary: `${prefix} for ${allocationContext}: ${formatCurrency(amountBefore)}.`,
+        amountDelta: amountDelta ?? undefined,
+      };
     }
-    if (goalName) {
-      return { summary: `Allocation removed from ${goalName}.` };
+    if (amountBefore !== null) {
+      return {
+        summary: `${prefix}: ${formatCurrency(amountBefore)}.`,
+        amountDelta: amountDelta ?? undefined,
+      };
     }
-    return { summary: "Allocation removed." };
+    return { summary: `${prefix}.` };
   }
   if (event.type === "allocations_reduced") {
     const reductions = Array.isArray(payload.reductions) ? payload.reductions : [];
@@ -249,6 +356,27 @@ const buildSummary = (event: StoredEvent): { summary: string; amountDelta?: numb
       const amount = asFiniteNumber(entry.amount);
       return sum + (amount ?? 0);
     }, 0);
+    if (reductions.length === 1 && isRecord(reductions[0])) {
+      const entry = reductions[0];
+      const amount = asFiniteNumber(entry.amount);
+      const goalName = formatName(pickPayloadString(entry, ["goalName", "name"]));
+      const positionLabel = formatName(pickPayloadString(entry, ["positionLabel", "label"]));
+      const accountName = formatName(pickPayloadString(entry, ["accountName"]));
+      const positionContext = formatPositionContext(positionLabel, accountName);
+      const allocationContext = formatAllocationContext(goalName, positionContext);
+      if (amount !== null && allocationContext) {
+        return {
+          summary: `Allocation reduced for ${allocationContext}: ${formatCurrency(amount)}.`,
+          amountDelta: -amount,
+        };
+      }
+      if (amount !== null) {
+        return {
+          summary: `Allocation reduced: ${formatCurrency(amount)}.`,
+          amountDelta: -amount,
+        };
+      }
+    }
     if (total <= 0) {
       return { summary: "Allocations reduced." };
     }
@@ -356,13 +484,17 @@ const buildSummary = (event: StoredEvent): { summary: string; amountDelta?: numb
 
 const buildHistoryItem = (event: StoredEvent): HistoryItem => {
   const { summary, amountDelta } = buildSummary(event);
+  const payload = isRecord(event.payload) ? event.payload : {};
+  const originOverride = asOrigin(payload.origin);
+  const progress = asProgress(payload.goalProgress ?? payload.progress);
   return {
     id: `${event.id}:${event.version}`,
     timestamp: event.createdAt,
     eventType: toEventLabel(event.type),
     summary,
-    origin: SYSTEM_EVENT_TYPES.has(event.type) ? "system" : "user",
+    origin: originOverride ?? (SYSTEM_EVENT_TYPES.has(event.type) ? "system" : "user"),
     amountDelta,
+    progress: progress ?? undefined,
   };
 };
 
@@ -383,7 +515,28 @@ export const createHistoryLoader =
     const requestedLimit = Math.floor(input.limit);
     const limit = Number.isFinite(requestedLimit) && requestedLimit > 0 ? requestedLimit : 20;
     const cursor = parseCursor(input.cursor);
-    const chunkIdsDesc = [...(await source.listChunkIds())].sort((left, right) => right - left);
+    const snapshotVersion = source.getSnapshotVersion?.() ?? null;
+    let index: EventIndex | null = null;
+    if (source.readIndex) {
+      try {
+        index = await source.readIndex();
+      } catch {
+        index = null;
+      }
+    }
+    const listedChunkIds = [...new Set(await source.listChunkIds())];
+    const indexedChunkIds = new Set(index?.chunks.map((chunk) => chunk.chunkId));
+    const useIndex =
+      index &&
+      snapshotVersion !== null &&
+      index.lastEventVersion === snapshotVersion &&
+      indexedChunkIds.size === index.chunks.length &&
+      indexedChunkIds.size === listedChunkIds.length &&
+      listedChunkIds.every((chunkId) => indexedChunkIds.has(chunkId));
+    const chunkIdsDesc =
+      useIndex && index
+        ? filterChunkIdsByIndex(index, input.filter)
+        : listedChunkIds.sort((left, right) => right - left);
     if (chunkIdsDesc.length === 0) {
       return { items: [], nextCursor: null };
     }
@@ -404,8 +557,16 @@ export const createHistoryLoader =
       scannedChunks < MAX_SCANNED_CHUNKS_PER_PAGE
     ) {
       const chunkId = chunkIdsDesc[chunkIndex];
-      const content = await source.readChunk(chunkId);
-      const parsed = parseEventChunk(content);
+      let parsed;
+      try {
+        parsed = parseEventChunk(await source.readChunk(chunkId));
+      } catch (error) {
+        if (useIndex) {
+          // Retry once without the index if files changed during this request.
+          return createHistoryLoader({ ...source, readIndex: undefined })(input);
+        }
+        throw error;
+      }
       scannedChunks += 1;
       const startEventIndex =
         eventIndex >= 0 ? Math.min(eventIndex, parsed.events.length - 1) : parsed.events.length - 1;
