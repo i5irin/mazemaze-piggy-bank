@@ -20,13 +20,13 @@ This document is not a Task Tracker. It describes the intended product specifica
 
 ### 0. Assumptions (Required)
 
-- **PWA** (mobile first)
-- Use **OneDrive / Google Drive** (selectable) for persistence
-- **No proprietary accounts**: Microsoft / Google sign-in (**personal accounts only**; state this explicitly in the UI and guides)
-- Data model: **Snapshot (latest state) + Event (event log)**
-- Simultaneous editing is not a goal. Conflicts use **first write wins** (a generation mismatch on save causes failure and prompts a reload; **no automatic merge**)
-- **Offline is view-only** (disable editing UI)
-- **Editing-status display (Lease) is required for the UX**. However, **Lease failures must not affect operation** (display only)
+- **PWA** (mobile first), with a **thin stateless API** and **Managed PostgreSQL**.
+- **PostgreSQL is the Canonical Source** for committed Workspace data.
+- **IndexedDB holds a cache of Canonical data and an Unresolved Operation Journal** for input protection. Neither is an independent Canonical Source.
+- Sharing uses **app-managed membership**. Authentication and current authorization are required at the Server boundary.
+- Saves use **optimistic concurrency and stale-write rejection**, with **no automatic merge or automatic rebase**.
+- **Offline is view-only**. The journal does not enable offline editing or general-purpose mutation synchronization.
+- Domain History is recorded as **Activity**; persistence does not require rebuilding State from Activity.
 
 ---
 
@@ -41,12 +41,13 @@ Sharing uses **shared pool accounts + shared goals**.
 ### 2. Scope and Policies
 
 - No account integrations (scraping / APIs). Balances, market values, deposits / withdrawals, and valuation updates are entered manually.
-- Persist data in OneDrive / Google Drive (selectable; ordinary user-visible storage areas are acceptable).
-- Use OneDrive / Google Drive sharing capabilities (treat a shared folder or shared item as the root).
-- Do not write to both providers simultaneously (select and use one provider).
-- Conflicts use first write wins (detected through generation information such as ETags). A mismatch causes save failure and prompts a reload. No automatic merge.
-- Offline is view-only. Disable editing UI.
-- Show editing status through Lease on a best-effort basis (do not block saving).
+- Store Canonical data in an app-hosted Managed PostgreSQL service and provide portability through versioned Export / Import.
+- This accepts app-hosted storage as a Product trade-off. A downloadable backup provides portability; it does not give users direct ownership or control of the live storage service.
+- Keep Personal data and each Shared Workspace separate. Multiple Shared Workspaces are supported.
+- Preserve unresolved input when a save cannot be confirmed. Distinguish a rejected HTTP attempt from an unknown logical-operation outcome (§8.4).
+- Do not automatically merge concurrent changes or rebase retained operations onto refreshed data.
+- Offline viewing uses cached data with an explicit freshness limitation. Editing requires an online, verified Workspace context.
+- Editing presence is not an MVP requirement and is not part of persistence correctness.
 
 ---
 
@@ -54,10 +55,11 @@ Sharing uses **shared pool accounts + shared goals**.
 
 - Frontend: **Next.js / React / TypeScript**
 - UI: Adopt **Fluent UI**, prioritizing a Microsoft-style tone (trustworthiness + approachability)
-- State management / data: At the implementer's discretion (established solutions are acceptable)
-- Local cache: IndexedDB or similar (at the implementer's discretion)
-- Microsoft Graph authentication: MSAL or similar (at the implementer's discretion; established solutions are acceptable)
-- Google authentication: Google Identity Services / OAuth (at the implementer's discretion)
+- Server: **Thin stateless API**, responsible for request validation, authorization, Domain validation, and persistence coordination
+- Canonical persistence: **Managed PostgreSQL**; correctness must not depend on hosting-specific functionality
+- Browser persistence: **IndexedDB**, with distinct responsibilities for Canonical cache and unresolved input protection
+- State management libraries and concrete API / database representations remain implementation decisions within these contracts
+- Authentication technology and identity lifecycle design are separate Production design decisions; this specification does not select an authentication service or protocol
 
 ---
 
@@ -73,14 +75,14 @@ The [Brand Specification](./brand/README.md) is authoritative for visual brand e
   - Dashboard (total assets, goal progress, unallocated amount)
   - Accounts / assets (list → details → edit)
   - Goals (list → details → edit allocations)
-  - Settings (Sign-in & storage, connection health, Workspace, Data & portability [Export / Import], reset guidance)
+  - Settings (Sign-in & access, Connection health, Workspace, Data & portability [Export / Import], destructive-operation guidance)
 
 #### 4.x Scope Display and Switching (UI Policy)
 
 - Use **scope switching** (Personal / Shared) for account / asset and goal lists, details, and editing
-- Display Shared by selecting a shared root (support multiple shared roots)
+- Display Shared by selecting a Workspace (support multiple Shared Workspaces)
 - Display non-writable shared data as view-only and disable editing UI
-- **Restore the last-used scope / shared root as the initial selection**
+- **Restore the last-used scope / Workspace as the initial selection**, subject to current access verification; a remembered selection does not grant access
 - Make dashboard **totals / breakdowns easy to read** (implementation discretion)
   - Examples: Combined totals plus a Personal / Shared breakdown, or switching among combined / Personal / Shared views
 
@@ -89,21 +91,30 @@ The [Brand Specification](./brand/README.md) is authoritative for visual brand e
 - As a rule, show a change summary when automatic adjustments occur.
 - There are two kinds of guidance to editing:
   1. **Normal allocation editing (10.3)**: A screen for manually adjusting Position → Goal allocation amounts
-  2. **Drawdown / repair UI (10.6)**: A dedicated interactive UI where users choose which allocations to reduce to resolve shortfalls, etc. (only when needed)
-- For ratio mode, explicitly state that initial ratios are not generated automatically when selecting the mode and in the V_old=0 case (see 10.5 ratio for details).
+  2. **Drawdown / adjustment UI (10.6)**: A dedicated interactive UI where users choose which allocations to reduce to resolve shortfalls, etc. (only when needed)
+- For ratio mode, explain the fixed closed reservations and the active / unallocated ratio pool. Selecting the mode does not generate ratios; a new pool without an old ratio stays unallocated (including V_old=0; see §10.5).
 
 ---
 
 ### 5. Terminology
 
-- **Account**: An account (personal / shared)
-- **Position**: An asset unit within an account (e.g., an ordinary JPY deposit, USD cash, investment fund A)
-- **Goal**: A goal (personal / shared)
-- **Allocation**: The amount allocated (reserved) from a Position to a Goal
-- **Snapshot**: A file containing the latest state (normalized data)
-- **EventChunk**: Event logs (for auditing / recovery); a chunk file grouping multiple events
-- **Lease**: A short-term, expiring lease file for editing-status display
-- **Unallocated (未割当)**: `Position.marketValue - ΣAllocation(for that Position)` (must not be negative)
+- **Workspace**: A context containing a dataset and defining the boundary for access, persistence versions, and replacement. Personal / Shared is a property of the Workspace, not of individual Domain entities. `workspaceId` identifies it independently of its name.
+- **Account**: An asset container within a Workspace. This Domain concept is distinct from a user's sign-in account.
+- **Position**: An asset unit within an Account (e.g., an ordinary JPY deposit, USD cash, investment fund A).
+- **Goal**: A savings goal within a Workspace.
+- **Allocation**: The amount reserved from a Position to a Goal in the same Workspace.
+- **Canonical State**: The current committed Domain data held by the Server in PostgreSQL.
+- **Activity / History**: User-facing records of Domain changes, including support for eligible Undo operations. Activity is not a technical request log or a required full event store.
+- **Spend / Payment Record**: Long-lived Domain data describing a Spend, including its payment breakdown and the information needed to interpret it. The UI may call this a `Receipt`.
+- **Operation Receipt**: Persistence bookkeeping for idempotency and committed-result lookup. It is distinct from Activity and Spend / Payment Records.
+- **Canonical cache**: A rebuildable browser copy of Server data, with its Workspace and timeline identity and freshness information.
+- **Unresolved Operation Journal**: Browser-retained logical operations and exact input whose outcomes still need resolution. It is distinct from both Canonical cache and unsubmitted editor input.
+- **Domain adjustment**: A deterministic adjustment within a normal accepted Domain operation, such as reducing Allocations after a valuation decrease.
+- **Canonical integrity problem**: A violation of the invariants required of Server Canonical State. Ordinary reads must not silently rewrite that State.
+- **Client cache recovery**: Rebuilding non-canonical cached data from verified Server data, without silently deleting unresolved journal entries.
+- **Unallocated (未割当)**: `Position.marketValue - ΣAllocation(for that Position)` (must not be negative).
+
+The persistence identities `restoreEpoch`, `workspaceIncarnationId`, `baseVersion`, `operationId`, and `requestId` have separate meanings defined in §8.2.
 
 ---
 
@@ -123,10 +134,11 @@ The [Brand Specification](./brand/README.md) is authoritative for visual brand e
 
 ### 7. Data Model (Logical)
 
+These are Product-level data requirements, not a relational schema. Each Account, Position, Goal, and Allocation belongs to one Workspace context. Personal / Shared is determined by that Workspace; entities do not independently declare this property. A Position belongs to an Account in the same Workspace, and an Allocation references only a Position and Goal in that Workspace. Cross-Workspace references are prohibited. The physical representation of Workspace membership is not prescribed here.
+
 #### 7.1 Account
 
 - `id: string`
-- `scope: "personal" | "shared"`
 - `name: string`
 
 #### 7.2 Position
@@ -144,7 +156,6 @@ The [Brand Specification](./brand/README.md) is authoritative for visual brand e
 #### 7.3 Goal
 
 - `id: string`
-- `scope: "personal" | "shared"`
 - `name: string`
 - `targetAmount: number` (integer yen, **0 or greater**)
 - `startDate?: string(YYYY-MM-DD)`
@@ -157,7 +168,8 @@ The [Brand Specification](./brand/README.md) is authoritative for visual brand e
 **Notes (Required)**
 
 - A Goal with `spentAt` is called a spent Goal.
-- Regardless of `status`, spent Goals are **excluded from automatic distribution** (equivalent to closed).
+- Closed Goals may retain Allocations, but do not receive automatic increases.
+- Regardless of `status`, spent Goals **must have no Allocations** and are excluded from automatic distribution.
 
 #### 7.4 Allocation
 
@@ -168,162 +180,206 @@ The [Brand Specification](./brand/README.md) is authoritative for visual brand e
 
 **Constraints (Required)**
 
-- **At most one `(positionId, goalId)` pair within the same scope (Allocations are unique)**
+- **At most one `(positionId, goalId)` pair within the same Workspace (Allocations are unique)**
 - For each `positionId`, `Σ allocatedAmount ≤ Position.marketValue` (exceeding it is prohibited)
 - For each `goalId`, `Σ allocatedAmount ≤ Goal.targetAmount` (exceeding it is prohibited)
 - **Physically delete** an Allocation when `allocatedAmount = 0` (do not retain zero-yen Allocations)
-- `Position.scope` and `Goal.scope` must match (both Personal, or both within the same Shared Root).
+- The Position's Account and the Goal must belong to the same Workspace.
+- Allocations must reference existing Positions and Goals; Positions must reference existing Accounts.
+- A spent Goal must have no Allocations.
+- All monetary values must satisfy §6 and be nonnegative. Allocation sums must satisfy both Position and Goal limits after every committed operation.
+- `remainingToTarget = Goal.targetAmount - Σ current Allocations(for that Goal)` is the incremental amount that can still be added to the Goal. It is a display / incremental capacity value, not the upper bound on the Goal's total Allocations or an existing Allocation's new absolute value. Absolute editing follows §10.3.
+
+#### 7.5 Activity and Spend / Payment Records
+
+- Record the Domain changes needed for History, adjustment summaries, and eligible Undo. Keep their meaning traceable without requiring Activity to reconstruct all State.
+- A Spend / Payment Record preserves the payment breakdown, time, and relevant Domain context for the Goal's Receipt view, independently of Operation Receipt retention.
+- Spend Undo requires information about the Spend operation's preceding semantic state (§10.4.1). Neither an Operation Receipt nor a technical request log substitutes for that Domain information.
+- Activity, Spend / Payment Records, and their display / interpretive context are part of the portable Domain dataset (§9). Temporary Undo eligibility is not portable; imported Spend records support History / Receipt display without restoring Undo capability. Imported Activity is not proof of a commit on the current Server.
+- Per-Activity `restoreEpoch` or `workspaceIncarnationId` is not required. Full replacement removes the previous current History from the current dataset; DB-wide restore restores State and History together.
 
 ---
 
-### 8. Cloud File Design (OneDrive / Google Drive)
+### 8. Persistence Architecture and Commit Contract
 
-#### 8.0 Storage Location (User-Visible)
+#### 8.1 Authority and Atomicity
 
-- App root folder examples:
-  - OneDrive: `/Apps/Mazemaze Piggy Bank/`
-  - Google Drive: `/My Drive/Apps/MazemazePiggyBank/`
-- Structure under app root:
-  - `personal/` (Personal workspace root)
-  - `shared/` (container for Shared workspaces)
-  - `.mpb-root.json` (probe)
-- Terminology:
-  - `personalRoot = <appRoot>/personal/`
-  - `sharedRoot = <shared workspace root>` (a folder under `<appRoot>/shared/`)
-- Shared data: Use a shared folder (or shared item) as the root and create the same structure beneath it
+- PostgreSQL is the Canonical Source. The API mediates reads and writes and enforces current authorization and Domain invariants.
+- Browser data and previews are not authoritative, even when they match client-side types. Server-side Domain validation is required for Production.
+- Commit State changes, necessary Activity, associated Domain records such as Spend / Payment Records, and the committed Operation Receipt atomically.
+- A normal save cannot succeed for State while separately failing to persist its necessary History. Failure to load History after a commit is a read failure, not a partial save.
+- The API is stateless between requests; correctness must not depend on a particular process retaining in-memory operation state. There are no server-side pending drafts.
+- Concrete transaction implementation, schema, and API design must satisfy these properties without being prescribed here.
 
-> Note: Assume users can edit / delete these files in OneDrive / Google Drive. The app must provide UI warnings (described below).
+#### 8.2 Persistence Identities
 
-#### 8.0.1 Pointer (SSoT)
+| Identity | Meaning and requirements |
+| --- | --- |
+| `restoreEpoch` | Opaque identity of the database-wide Canonical timeline. It stays unchanged during normal operation. After actual point-in-time recovery (PITR), assign a fresh value while all mutations remain stopped. It fences old mutations and responses; it does not classify History or grant authorization. |
+| `workspaceIncarnationId` | Opaque identity of the logical dataset incarnation of the same `workspaceId`, not a save version or a required monotonic counter. It stays unchanged during normal Domain commits. A Workspace full restore, full Import / overwrite, or same-ID reset / replacement assigns a fresh opaque value to reject stale mutation attempts and replay of pre-replacement journals. DB-wide PITR restores the value stored at the restore target; it does not itself issue a fresh incarnation ID (§8.5). It does not prevent authorized recovery queries from discovering the current incarnation. It is not a History category or authorization authority. |
+| `baseVersion` | The optimistic concurrency version on which a mutation is based within a Workspace incarnation. Each normal commit advances the Canonical version. PITR may return that version to its restore-target value. Compare versions only within the same `workspaceId`, `restoreEpoch`, and `workspaceIncarnationId`. |
+| `operationId` | Client-generated logical mutation identity. Replays use the same ID and payload binding. It supports idempotency and committed-result lookup, and is not an Entity ID, ordering key, or Workspace version. |
+| `requestId` | Observability identity of one HTTP / API attempt. Each replay attempt has a different requestId. It is not a persistence identity. |
 
-- Use **folderId as the SSoT** for root identification (names are not identifiers)
-- Google Drive permits folders with identical names, so do not identify a folder solely by a name match
-- Store personal / shared root folderIds in a pointer file (JSON)
-  - `schemaVersion`
-  - `updatedAt`
-  - `personalRootFolderId`
-  - `sharedRootFolderId` (only when present)
-  - `appRootFolderId` (internal use, optional)
-- Storage location:
-  - OneDrive: `<appRoot>/.mpb-pointer.json`
-  - Google Drive: `appDataFolder/.mpb-pointer.json`
-- Normally access folders through the pointer; restrict **name searches to recovery only**
-- If the pointed-to folder is **deleted / in the trash**, treat it as invalid and enter recovery
-  - Recovery: Search by name (select candidates) → create a new folder if none is found → update the pointer
-  - The app root name depends on the provider (OneDrive: `Mazemaze Piggy Bank` / Google Drive: `MazemazePiggyBank`)
+A mutation is bound to its Workspace, `restoreEpoch`, `workspaceIncarnationId`, `baseVersion`, and exact logical input. An operationId must not be reused to submit changed input or silently move an operation to another context.
 
-#### 8.0.2 Folder Rename Notice
+These are conceptual names in this specification, not prescribed PostgreSQL column names, TypeScript properties, Value Object names, or API JSON fields. Production design must preserve the distinct concepts and consider naming alignment without fixing their physical representation here.
 
-- **Continue updates** even if the pointed-to folder has an unexpected name
-- However, **show a notice in Settings** to prevent confusion about backups
-  - Applies to: Personal root / Shared root (Shared by me only)
-  - Guidance: Recommend `Data & portability > Export`
+#### 8.3 Normal Save
 
-#### 8.1 Snapshot (Required)
+Before sending HTTP, the browser must retain in its IndexedDB journal at least:
 
-- Example paths:
-  - personal: `<personalRoot>/snapshot-personal.json`
-  - shared: `<sharedRoot>/snapshot-shared.json`
-- Contents:
-  - `version: number` (+1 on every update)
-  - `stateJson: { accounts, positions, goals, allocations }` (normalized data only)
-  - `updatedAt: string(ISO8601)`
-- Conflict detection:
-  - Retain generation information such as `ETag` and use a matching condition when updating on save
+- Target Workspace and `operationId`
+- `restoreEpoch`, `workspaceIncarnationId`, and `baseVersion`
+- Exact input / payload needed to identify and recover that logical operation
 
-#### 8.2 EventChunk (Required)
+If this retention cannot be completed, do not send the mutation. Retain the editor input where possible and explain the next recovery action.
 
-- Example paths:
-  - personal: `<personalRoot>/events/event-<chunkId>.jsonl`
-  - shared: `<sharedRoot>/events/event-<chunkId>.jsonl`
-- `chunkId: number` (sequential)
-- `fromVersion: number`
-- `toVersion: number`
-- `eventsJsonl: JSON Lines` (one event per line)
-- `createdAt: string(ISO8601)`
-- Chunking:
-  - Split into N events per chunk (e.g., 500–2000) to avoid oversized files
+The Server conceptually checks:
 
-#### 8.3 Lease (Required / UX Only; Failure Must Not Affect Operation)
+1. Authentication and request validation
+2. Maintenance / access gate
+3. Current authorization for the requested operation and Workspace
+4. `restoreEpoch`
+5. `workspaceIncarnationId`
+6. `operationId` and payload identity, including an existing committed result
+7. `baseVersion` for an operation not already confirmed as committed
+8. Domain validation and the required deterministic adjustments
+9. Atomic commit of State, necessary Activity / Domain records, and committed receipt, subject to any required pre-commit Major adjustment confirmation (§10.6)
 
-- Example paths:
-  - personal: `<personalRoot>/leases/lease.json`
-  - shared: `<sharedRoot>/leases/lease.json`
-- Contents:
-  - `holderLabel: string` (display name or anonymous label)
-  - `leaseUntil: string(ISO8601)` (e.g., current time + 90 seconds)
-  - `updatedAt: string(ISO8601)`
-- Behavior:
-  - Update on a best-effort basis
-  - Saving and editing can continue even on failure (display only)
-  - Explicitly state in the UI that editing-status display is best-effort and may fail
+These are correctness properties, not prescribed API endpoints or a database layout. Checks and commit must remain effective under concurrent requests, revocation, replacement, and maintenance transitions.
 
-#### 8.4 Definition of sharedId (Required)
+- Within the same restoreEpoch and Workspace incarnation, two distinct mutations based on the same Canonical version cannot both advance State from that version. A stale write is rejected.
+- A matching mutation replay of an already committed operation must not apply the mutation again. The mutation acceptance checks above still apply to that replay. Recovery queries use current authorization under §8.4.1; stale client coordinates alone must not prevent result lookup.
+- Bind operation identity to payload; reject reuse with a different payload.
+- A browser must not bypass Server validation by submitting an entire replacement State as an ordinary save.
 
-- sharedId identifies a shared root.
-  - OneDrive: A URL-safe string combining `driveId` + `itemId` (e.g., `driveId_itemId`)
-  - Google Drive: `fileId` (driveId is supplementary information)
-- The shared scope is rooted under a shared folder (or shared item).
+#### 8.4 Result Semantics and Recovery
 
-#### 8.5 Export / Import (Data & portability)
+| Result | Meaning | Required recovery behavior |
+| --- | --- | --- |
+| Explicit success | The commit is confirmed. | Resolve the matching journal entry and adopt eligible Canonical data under §13.3. Do not let an older response replace a newer State. |
+| Explicit rejection | This HTTP attempt was not adopted. Another attempt of the same logical operation may already have committed. | Explain the rejection, retain input as needed, and resolve any uncertainty about other attempts before treating the logical operation as uncommitted. |
+| Unknown | Timeout, response loss, or another interruption prevents confirmation. | Retain the operation and exact input; use receipt lookup, Canonical refresh, and safe same-operation replay when permitted. |
 
-- Export: Write Snapshot + EventChunk as a **zip**
-  - `manifest.json` (schemaVersion / createdAt / scope / provider, etc.)
-  - `snapshot.json`
-  - `events.jsonl` (optional; only when events exist)
-- Import: Accept only exported zip files; **validate format → preview → apply**
-  - Reject invalid formats
-  - Applying overwrites existing data (state this beforehand)
+- Absence of a receipt is not proof of failure. PITR may have removed both a prior commit and its receipt from the current timeline.
+- Epoch or incarnation rejection does not disprove a historical commit on an earlier timeline or incarnation.
+- Canonical refresh establishes current State; by itself it does not always establish whether a particular logical operation committed.
+- **Same-operation replay** preserves operationId, payload binding, and logical mutation. It is allowed only when current access and identity permit it; it must not automatically rebase a stale operation.
+- **Applying intent again after refresh** is a new logical operation, explicitly initiated by the user against current data. Explain any unresolved earlier outcome before the user decides to proceed; never silently create a new operation to retry an unknown one.
+- Receipt retention and lookup behavior must preserve honest result semantics. A missing or expired record must not be presented as definitive evidence of non-commit. Specific retention periods remain a Production design decision.
 
-#### 8.6 Provider Switch (Open / Move)
+##### 8.4.1 Recovery Queries and Canonical Observation
 
-- Storage providers are selectable; **do not write to both simultaneously**
-- Keep the last-selected provider locally and restore it on reload (do not automatically switch to another provider even when signed out)
-- Google Drive scopes are `drive.file` + `drive.appdata` (because the pointer is stored in appDataFolder)
-- List candidates in the Switch dialog and show their states:
-  - `Available` / `Empty` / `Not signed in`
-- `Empty`: No root files (such as a snapshot) exist under the personal root
-- `Open`: Open existing data
-- `Create`: Show only for `Empty` (create an empty workspace)
-- `Move`: Copy, then **delete source data** (require double confirmation and backup confirmation)
-- Because `Move` **copies Snapshot and EventChunk sequentially**, many events may **increase API requests and make the operation sensitive to elapsed time or rate limits**
-  - Show progress in the UI
-  - If it fails partway through, **run Move again** (deletion occurs last)
-  - If source data has already been deleted, **recover through backup / Import**
-- If Google Drive returns a **403 due to insufficient scopes**, stop the affected cloud operation and offer an explicit sign-in action to renew consent. Do not open consent automatically or retry it recursively. An ordinary sharing-permission denial is not evidence of insufficient OAuth scopes.
+- A recovery query is a read, not a state-changing operation. Client-held restoreEpoch, workspaceIncarnationId, and baseVersion are neither authorization tokens nor locks, and matching Server values is not a prerequisite for an authorized recovery read.
+- Subject to current authentication, authorization, and applicable maintenance / access gates, a client with stale coordinates must be able to discover the current Canonical coordinates and refresh current State. Do not reject the query merely because its remembered epoch, incarnation, or version is old.
+- The same conceptual recovery flow must support both:
+  - **Current Canonical coordinates**: current restoreEpoch, workspaceIncarnationId, and Canonical version usable as baseVersion for a subsequent mutation.
+  - **Requested operation status**: what the Server currently knows about the specified operationId, including a retained committed result and its resulting identity / version where available.
+- One physical response or multiple coordinated reads may provide this observation. No endpoint, response shape, query service, or storage representation is prescribed.
+- Keep current Canonical coordinates distinct from the coordinates at which an operation committed. A known historical result can resolve that operation without making its old resulting State current again.
+- For an Import / reset that committed from incarnation I1 to I2 but lost its response, the authorized recovery flow must be able to report current I2 and the operation's known committed result while evidence is retained. This does not permit replaying an I1 mutation in I2.
+- Replacing current State and Activity / History must not unconditionally discard the replacement operation's own committed-result evidence at the same time. Operation Receipts serve recovery independently of portable Domain History; no specific retention duration is defined here.
+- A missing receipt, including after PITR rollback, may leave historical commit certainty unknown. The client can still adopt eligible current Canonical coordinates / State; uncertainty does not require remaining on the old timeline.
 
-#### 8.7 Remembered Connections and Reauthentication
+**Point-in-Time Observation and Concurrency**
 
-- Keep the selected provider separate from a per-provider record of successful connection on this browser. A default or merely selected provider is not evidence of previous use.
-- Record a successful explicit sign-in, or a successfully restored Microsoft connection with a usable token. The new preference stores provider flags only, not account names, email addresses, sharing links, or credentials; MSAL continues to manage its own authentication cache.
-- On startup, never open an authentication popup automatically. Without a successful-connection record, show the normal storage choices rather than a reauthentication reminder.
-- When online, offer a non-modal reminder only for the current workspace's provider if it was previously connected and now needs sign-in. Do not prompt for the other provider or automatically switch storage. Existing manual sign-in choices remain available.
-- Preserve Microsoft's silent token acquisition and renewal. If user interaction is required, stop the affected cloud operation and wait for an explicit sign-in action; do not automatically fall back to a popup. A transient network failure alone must not be treated as a demand for reauthentication.
-- Google token acquisition starts only from an explicit sign-in action. Page reload and token expiry may require another action; `prompt: none` is not a popup-free renewal mechanism. Do not add persistent Google token storage for this preference.
-- Open authentication or renewed-consent popups only after the user activates a sign-in button. Handle popup blocking, cancellation, and authentication errors without leaving the UI indefinitely busy; allow retry and prevent simultaneous interactive requests for the same provider.
-- Successful explicit sign-out clears that provider's reminder eligibility while preserving the selected storage provider. Do not immediately ask the user to reconnect. A later successful sign-in enables reminders again.
-- While offline, hide reauthentication reminders and retain the existing view-only behavior. If local preferences are unavailable or invalid, sign-in must remain usable, but remembering the connection across reloads is not guaranteed.
-- Legacy provider selection alone is not migrated into a successful-connection record. Connection records are local to this browser and do not grant access to cloud data.
+- A Canonical fetch or recovery result describes the Server's observation at that time. It does not acquire a lock, reserve a version, or guarantee that a later mutation will succeed.
+- For example, fetching version 42, another writer committing version 43, and a mutation based on 42 receiving stale rejection is normal optimistic concurrency. Refresh version 43 and follow the explicit review / retry rules; this loop is not an Architecture failure.
+- A commit, Workspace replacement, PITR, or authorization change after observation is handled by Server validation at mutation time. Reject mutations that no longer satisfy the current gates and refresh / reconcile within current authorization. Do not automatically merge or rebase to bypass rejection.
+- Browser adoption remains subject to §13.3, including rejection of delayed observations after a newer valid identity / version has been adopted.
+
+##### 8.4.2 Recovery Decisions
+
+The table assumes the recovery read itself is currently authorized and permitted by access gates. Identity comparisons refer to the operation's context versus the verified current Canonical observation.
+
+| Observation | Required behavior |
+| --- | --- |
+| Same epoch / incarnation; committed result known | Confirm the operation's result and reconcile with current Canonical State / version. Do not replace newer State with the operation's older resulting State. |
+| Same epoch / incarnation; result unresolved | Refresh Canonical State, protect retained input, and replay the same operation only where the mutation contract permits it. |
+| Same epoch; incarnation changed; committed result known | Confirm the known result and adopt the current incarnation / State. Do not re-execute the old-incarnation mutation. |
+| Same epoch; incarnation changed; result unknown or not found | Adopt the current incarnation / State while preserving honest uncertainty about the historical result. Retain input for user recovery where needed; do not automatically replay or rebase it. |
+| Epoch changed | Adopt the current Canonical timeline / State when access permits. Retained operation evidence may be inspected, but receipt absence does not prove historical non-commit. Never automatically replay or rebase the old-timeline mutation. |
+
+#### 8.5 Database-wide Restore
+
+- A DB-wide PITR restores State, History, Domain records, and Operation Receipts to the same target. Data committed after the target may disappear; retained pre-target History remains current History.
+- Stop all mutations across all writers for restore and timeline transition. After actual restore, assign a fresh opaque `restoreEpoch` before any mutations resume.
+- Restore each `workspaceIncarnationId` as part of database State to its value at the restore target. Do not retain the pre-PITR current value or issue a fresh incarnation ID merely because PITR occurred. Canonical versions may also move backward to the target; the fresh `restoreEpoch` distinguishes that timeline even when the incarnation ID is the same as one previously observed.
+- Example: At t1, a Workspace has incarnation I1 under epoch E1; a Full Import at t2 replaces I1 with I2. PITR to t1 restores I1 under a fresh epoch E2, not I2 or a newly issued I3. An old `(E1, I1)` mutation or response remains fenced from `(E2, I1)` by `restoreEpoch`.
+- Old clients must refresh and reconcile access. Old journals must not be rebased or resent onto the new epoch automatically.
+- Reconcile restored authorization under §12.2 before releasing access. A fresh epoch alone does not make restored authorization trustworthy.
+- Production recovery must establish writer quiescence, access gating, safe session handling, and controlled release. Backup / RPO, monitoring, and operational procedures require separate Production design; this specification promises no numerical recovery target.
 
 ---
 
-### 9. Initialization (Data Reset)
+### 9. Workspace Lifecycle and Data Portability
 
-- **Deleting the root folder = initialization (clean state)**
-- Explicitly state in the app's UI guidance:
-  - These folders / files are used by the app (editing is discouraged)
-  - They may be copied for backup purposes
-  - Leave them untouched if unsure
-  - Deleting the root folder removes all data and returns the app to its initial state
+#### 9.1 Workspace Initialization
+
+- Identify each Workspace independently of its display name and Personal / Shared selection.
+- Initialize a new Workspace with an empty, valid Domain dataset and a persistence identity under §8.
+- Creating a Shared Workspace does not grant other people access and does not automatically change the user's selected Workspace.
+- A missing cache is not an empty Workspace. Bootstrap existing committed data from the Server before offering creation based on an apparent absence of data.
+
+#### 9.2 Versioned Export
+
+- Export a selected Workspace as a **versioned ZIP containing JSON / JSONL** and metadata identifying the format version and dataset context.
+- Include current State, current History, and Spend / Payment Records with the Domain information needed to interpret and display them. Export must represent a consistent committed dataset, not a mix of States and History from different commits.
+- Empty History is valid. A portable backup must still represent its History unambiguously; it must not silently omit existing History.
+- Unresolved journal entries and unsubmitted editor input are not committed data. Explain their exclusion when unresolved changes are present; an Export is not a backup of those inputs.
+- Undo capability / reversal eligibility is not part of Export / Import. The format does not need temporary Undo eligibility or Operation Receipts; Operation Receipts are not portable History. Exported Domain data must not confer membership, identity, or access rights when imported.
+- The format must be versioned to permit future evolution. Format migration is distinct from PostgreSQL internal schema migration; neither a universal compatibility policy nor a specific migration mechanism is prescribed.
+
+#### 9.3 Import Validation and Preview
+
+- Accept supported versions of the portable ZIP format through **validation → preview → explicit apply**.
+- Reject corrupt, unsupported, invalid, or inconsistent input before proceeding to preview / apply. Do not automatically repair imported data.
+- Validate Domain invariants, required History / payment context, and dataset consistency. Preview is not a substitute for trusted validation at the apply boundary.
+- Preview identifies the target Workspace and shows that **all current State and current History will be replaced**, including the impact on other members of a Shared Workspace.
+- Strongly recommend exporting the current Workspace as a re-importable backup and provide a prominent action before applying Import. Backup creation is optional: Import must not require a successful Export.
+- Require two-stage destructive confirmation of the replacement scope and the absence of ordinary Domain Undo. Explain that a pre-import backup can be re-imported to recover the previous dataset. If the user proceeds without creating that backup, clearly warn **No pre-import backup was created** at the final confirmation; do not assume another backup exists. Explicit confirmation still permits Import without a backup.
+- Check current authorization and the target's current identity / version when applying. If the target changed after preview, reject the stale apply and require a refreshed preview and explicit confirmation.
+
+#### 9.4 Full Import / Replacement
+
+- Atomically replace **current State and current History together**, including the associated portable Domain records. After success, the previous current dataset is not part of the new current dataset.
+- Keep the target `workspaceId` and assign a fresh opaque `workspaceIncarnationId` as part of successful replacement. Reject pre-replacement mutation attempts and journal replay as stale; do not automatically replay or rebase them. Authorized recovery queries remain available under §8.4.1.
+- Do not import source persistence identities as the target's active identities. Workspace replacement does not rotate the global `restoreEpoch`.
+- Imported Activity retains its role as Domain History. It does not prove that a logical operation committed on the current Server and must not be used as an Operation Receipt.
+- Import does not restore sharing authority from the file. Target access remains governed by current app-managed authorization.
+- Ordinary Domain Undo does not undo Import. Re-importing a backup is another full replacement, with validation, preview, confirmation, and a fresh `workspaceIncarnationId`.
+- Keep commit-result recovery effective across replacement: retain the replacement operation’s own committed-result evidence rather than unconditionally discarding it with the replaced dataset. An authorized recovery query may confirm that operation and observe the new incarnation under §8.4.1, without replaying the old mutation or restoring the old dataset. Do not repeat Import as a new operation merely because confirmation was lost.
+- Imported Spend records and Activity are Domain data for History / Receipt display only; **Import never restores Spend Undo eligibility**, even when an imported Spend is less than 24 hours old. Do not revive an Undo CTA from imported data. Re-importing the pre-import backup is the recovery path for replacement; that re-import likewise does not restore Undo capability.
+
+#### 9.5 Reset and Deletion
+
+Treat the following as distinct destructive operations; do not combine them under an ambiguous data-deletion action:
+
+- **Reset Workspace contents**: Replace the selected Workspace's current Domain dataset, including History and Spend / Payment Records, with an empty valid dataset. Keep the same `workspaceId` and current access configuration; assign a fresh opaque `workspaceIncarnationId` atomically. Reset does not mean removing members.
+- **Delete Workspace**: Remove the Workspace from normal use, including access to its dataset. For a Shared Workspace, explain that all members lose access, not just the person initiating deletion. Stale requests must not recreate it or restore access.
+- **Account-wide / all-data deletion**: A separate account-lifecycle capability, outside the destructive scope defined here. Do not imply that resetting or deleting one Workspace performs it.
+
+For Workspace destructive actions:
+
+- Show the target Workspace, exact destructive scope, and consequences for other members.
+- Preserve **two-stage confirmation**, including an explicit acknowledgement and typed confirmation in the Danger zone.
+- Require current authorization for that destructive scope; ordinary editing capability is not itself a specification of management authority.
+- Offer Export before discarding the current dataset. Refresh confirmation if the target changes before apply.
+- Same-ID full replacement / reset must fence old mutations with a fresh `workspaceIncarnationId` while preserving recovery-query access to retained committed-result evidence under §8.4.1. Deletion must deny subsequent access and mutations even when a client retains old data or journals.
+- Do not silently delete unresolved input as part of local cache cleanup. Mark it as belonging to a replaced or deleted context and prevent automatic submission.
+- These operations affect only their stated target. Detailed permissions and account-lifecycle behavior, including the handling of deletion of a Personal Workspace, require separate Product / authorization design before being offered.
 
 ---
 
 ### 10. Operation Specification
 
+All operations below are subject to the Server commit contract (§8). Validate the final result against §7 before committing. Domain adjustments within one accepted operation do not merge concurrent user mutations.
+
 #### 10.1 Accounts and Assets
 
-- Create Account (personal / shared)
-- Create Position (assetType / label / marketValue)
+- Create Account in the selected Workspace
+- Create Position in an Account of the selected Workspace (assetType / label / marketValue)
 - Update Position valuation: Overwrite `marketValue` with the new value (allocation recalculation follows 10.5)
 - Change Position.allocationMode (fixed / ratio / priority):
   - **Changing the mode alone does not redistribute existing Allocations (retain them)**
@@ -337,13 +393,13 @@ Classify `marketValue` changes into two types.
   - An operation where the user enters an account balance or valuation to update it.
   - **Apply automatic recalculation in 10.5** (according to allocationMode).
 - **Internal adjustment (inside the app)**
-  - Updates associated with internal processing such as spending (10.4.1), Undo (10.4.1), and consistency repair (13.5 / 13.3).
+  - Updates within spending, Undo (10.4.1), and their required Domain adjustments (§10.6).
   - **Do not apply automatic recalculation in 10.5** (ensure consistency within the corresponding procedure).
   - Do not call 10.5 indiscriminately from a marketValue setter or similar implementation.
 
 #### 10.2 Goals
 
-- Create Goal (name / targetAmount / period / priority)
+- Create Goal in the selected Workspace (name / targetAmount / period / priority)
 - Close Goal: `status = "closed"` (logical state only; do not physically delete)
   - Assign `closedAt` on closure
   - Closed Goals remain visible, and **Allocation editing remains possible**
@@ -354,10 +410,23 @@ Classify `marketValue` changes into two types.
 
 #### 10.3 Allocations (Reservations)
 
-- Set `allocatedAmount` from Position → Goal (add / update / delete)
+- Set `allocatedAmount` from Position → Goal within the selected Workspace (add / update / delete)
   - Because **(positionId, goalId) is unique**, treat allocations as **upserts (update if present; create otherwise)**
   - Treat `allocatedAmount = 0` as **Allocation deletion**
 - Changes must satisfy the constraints (`Position: total allocations ≤ marketValue`, `Goal: total allocations ≤ targetAmount`)
+
+**Absolute Allocation Editing (Required)**
+
+- Edit `allocatedAmount` as a new absolute value, not an increment. Apply the same validation in Goal and Account / Position editors.
+- Conceptually, calculate capacity by excluding the Allocation currently being edited from both sums:
+  - `otherGoalAllocations = Σ Allocations(for the same Goal, excluding the edited Allocation)`
+  - `goalCapacityForThisAllocation = Goal.targetAmount - otherGoalAllocations`
+  - `otherPositionAllocations = Σ Allocations(for the same Position, excluding the edited Allocation)`
+  - `positionCapacityForThisAllocation = Position.marketValue - otherPositionAllocations`
+- Require a nonnegative integer input satisfying both `allocatedAmount ≤ goalCapacityForThisAllocation` and `allocatedAmount ≤ positionCapacityForThisAllocation`. For a new Allocation, no existing Allocation is excluded; the same definitions apply.
+- The maximum absolute value is `min(goalCapacityForThisAllocation, positionCapacityForThisAllocation)`. `Remaining to target` means the Goal's incremental capacity (§7.4), not this maximum. In an Allocation editor, `Available` must identify the Position capacity for this Allocation, including its currently reserved amount; `Maximum`, if shown, means the combined absolute limit. Do not use current unallocated funds alone as the limit for editing an existing Allocation.
+- Example: A Goal with target 100 has Allocations A=30 and B=30, so its remaining-to-target amount is 40. Editing A excludes A from the Goal sum, giving capacity `100 - 30 = 70`. Changing A from 30 to 50 is valid on the Goal side because `50 + 30 = 80 ≤ 100`, subject to Position capacity. Do not reject it because `50 > 40`.
+- These capacities describe valid current data and aid input validation. The Server must validate the resulting totals under §7 and the current mutation contract (§8); an editor's capacity display is not a reservation or concurrency guarantee.
 
 #### 10.4 Drawdown (Manual)
 
@@ -370,54 +439,55 @@ Classify `marketValue` changes into two types.
 
 Provide an operation to mark a Goal as spent, reflecting actual use of the funds after achieving it.
 
-- Applies primarily to closed Goals (allowing active Goals is at implementation discretion; closed only is recommended for the MVP)
-- Spending amount `X`: Total Allocations linked to this Goal
+- In the MVP, applies to closed Goals with no `spentAt`.
+- Spending amount `X`: Total Allocations linked to this Goal.
 
-**Procedure (Required)**
+**Procedure and Atomicity (Required)**
 
-1. The user **selects multiple Positions and specifies amounts** to pay `X` (the UI ensures the total equals `X`)
-2. Reduce each specified Position's `marketValue` (total reduction: `X`)
-3. **Delete all Allocations** linked to this Goal
-4. Assign `spentAt` to the Goal (ISO8601)
-5. If consistency is affected (such as a Position shortfall), automatically adjust / provide guidance according to 10.6
+1. The user **selects Positions and specifies amounts** to pay `X`. Validate that the total equals `X` and each payment is within the Position's balance.
+2. Reduce each specified Position's `marketValue` by its payment amount (total reduction: `X`).
+3. **Delete all Allocations** linked to the Goal.
+4. Record the Spend / Payment details and the preceding semantic state needed for eligible Undo.
+5. Assign `spentAt` to the Goal (ISO8601).
+6. If the resulting payment distribution causes a Position shortfall, apply the deterministic reductions and guidance in §10.6, preserving the final invariants.
 
-**Atomicity and Bypassing 10.5 (Required)**
+Commit these effects, necessary Activity, and the Operation Receipt **atomically**, after Major adjustment confirmation if §10.6 requires it. A committed spent Goal has no Allocations.
 
-- Process step 2 (marketValue reduction) and step 3 (deleting all Allocations) **atomically**.
-- These are **internal adjustments** and **must not trigger automatic recalculation in 10.5** (do not affect Goals other than the spending target).
+Steps 1–5 express the requested Spend's direct effects. Deleting the target closed Goal's Allocations does not by itself make Spend Major. Classify any secondary automatic Allocation adjustments, such as reductions for other Goals in step 6, under §10.6.
+
+These are **internal Domain adjustments** and must not trigger the valuation recalculation modes in §10.5. Required shortfall reductions may affect other Goals under §10.5.2 / §10.6; do not perform automatic redistribution to those Goals as though the payment were a valuation update.
 
 **Editing Restrictions for Spent Goals (Required)**
 
-- As a rule, Goals with `spentAt` **cannot be edited** (including goal information and allocations)
-- However, provide **Undo** on the Goal detail screen:
-  - Undo is available **only for the most recent operation** and **within 24 hours**
-  - Undo reverses spending, restoring reduced Position values and deleted Allocations
-  - Explicitly state the "most recent only / within 24 hours" restriction in the UI
+- As a rule, Goals with `spentAt` cannot be edited, including their information and Allocations.
+- Provide **Undo spend** for the **current Spend operation that established this Goal's current `spentAt`**, within **24 hours after that Spend committed**. This is the MVP grace period for accidental Spend.
+- The Spend need not be the latest operation in the Workspace. Editing an unrelated Goal, navigation, closing a drawer, changing screens, or reloading the browser must not by itself remove eligibility.
+- State that Undo applies only to the Goal’s current Spend within 24 hours in the UI. Determine eligibility from Domain information and current authorization, independently of Operation Receipt retention.
+- Imported Spend has no Undo eligibility (§9.4), regardless of its recorded time; do not show its Undo CTA.
 
-**Undo and Bypassing 10.5 (Required)**
+**Undo Spend (Required)**
 
-- Treat restoration of marketValue / Allocation through Undo as an **internal adjustment**; **do not trigger automatic recalculation in 10.5**.
-- After Undo, perform consistency checks equivalent to 13.3; if problems exist, show a summary / guidance according to 10.6.
-
-**Potential Constraint Violations after Undo (Required / Developer Note)**
-
-- Undo prioritizes reversing the spending operation's changes to restore the preceding state, so **temporary constraint violations may occur after Undo** if any of the following occurred during the period covered by Undo:
-  - `marketValue` changes through valuation updates (10.5)
-  - Limit changes through Goal.targetAmount updates (10.4.2)
-  - Other allocation edits (10.3), etc.
-- Possible violations:
-  - `Σ Allocation(position) > Position.marketValue` (Position over-allocation)
-  - `Σ Allocation(goal) > Goal.targetAmount` (Goal over-allocation)
-- In this case, follow **10.6**: automatic repair + summary (or guidance to the drawdown / repair UI).
+- Validate that the target is still the Spend establishing the Goal's current `spentAt`, is not an imported Spend, and is within 24 hours of its commit. Execute under current authorization, restoreEpoch, workspaceIncarnationId, baseVersion, and Domain invariants (§8), including revalidation at confirmation when a Major proposal is required.
+- Treat Undo as one Domain operation reversing that Spend's effects using its preceding semantic state, validated against the current world rather than blindly replacing it:
+  - Restore Position values reduced by the Spend.
+  - Restore Allocations deleted by the Spend.
+  - Clear `spentAt`.
+  - Restore any other Goal state changed by the Spend to its meaning immediately before that operation.
+- This is an internal adjustment; **do not invoke valuation recalculation in §10.5**.
+- Evaluate the proposed restoration against the current Workspace. Intervening valuation updates, target changes, or Allocation edits may mean that the unadjusted restoration no longer satisfies current constraints.
+- Use deterministic Domain adjustments and summary / guidance under §10.6 to satisfy current Position and Goal limits. Intermediate calculations may violate a limit; committed Canonical State must not.
+- Commit the final Undo result and associated Domain records / Activity atomically under §8. If Major adjustment is required, preview the result and obtain explicit confirmation under §10.6 before committing any Undo effects; do not commit an invalid intermediate State.
+- A stale baseVersion still rejects the operation. Domain adjustment during Undo does not authorize automatic conflict merge or rebase.
+- Import itself is not a Domain Undo operation (§9.4).
 
 #### 10.4.2 Allocation Adjustments When Updating Goal.targetAmount (Required)
 
 When Goal.targetAmount changes from `T_old → T_new`, resolve any excess if the total Allocations linked to that Goal exceed `T_new`.
 
-- **Default behavior (required): Immediate automatic proportional reduction**
+- **Default behavior (required): Deterministic proportional reduction**
   - Shrink Allocations linked to the Goal (across multiple Positions) while preserving their current distribution ratios.
   - Handle remainders and tie-breaking deterministically (e.g., allocatedAmount descending → positionId ascending).
-  - After adjustment, show a **change summary** (which Position changed by how many yen) and provide a route to normal allocation editing (10.3).
+  - Follow §10.6 for commit timing: Minor reductions commit with the target change before the summary; Major reductions require preview and confirmation before either is committed. Show which Position changes by how many yen and provide a route to normal allocation editing (10.3).
 - Do not provide additional reduction options (such as priority-based reduction); limit this to proportional reduction plus manual editing when needed.
 
 #### 10.5 Allocation Recalculation on Balance Updates (Required)
@@ -425,12 +495,12 @@ When Goal.targetAmount changes from `T_old → T_new`, resolve any excess if the
 ##### 10.5.0 Applicability (Required)
 
 - Apply 10.5 when `marketValue` changes through a **valuation update (user input)** (10.1.1).
-- Exclude **internal adjustments** such as spending / Undo / repair from the triggers for 10.5.
+- Exclude **internal adjustments** such as spending / Undo and their constraint adjustments from the triggers for 10.5.
 
 ##### 10.5.1 Overview
 
 When Position.marketValue changes from `V_old → V_new`, recalculate Allocations linked to that Position according to `Position.allocationMode`.
-(Note: Changing allocationMode alone does not recalculate. Recalculation occurs on marketValue updates or during repair.)
+(Changing allocationMode alone does not recalculate. Only valuation updates trigger these modes; internal adjustments use their own Domain rules.)
 
 After recalculation, always satisfy:
 
@@ -453,8 +523,9 @@ Supporting definitions:
   - Unallocated comes last among ties
 - Use `remaining(goal)` to make **only active Goals** eligible for automatic distribution.
   - **Do not increase** closed or spent Goals through automatic distribution (effectively a receiving capacity of 0).
-- **As a rule, retain existing Allocations for closed / spent Goals** (do not automatically zero them).
-  - However, when resolving `ΣAllocation(for that Position) > V_new`, include closed / spent Goals in reductions only if a shortfall remains after all active allocations have been reduced to 0 (shortfall resolution rule).
+- **As a rule, retain existing Allocations for closed Goals** (do not automatically zero them).
+  - Include closed Goals in shortfall reductions only after all active allocations have reached 0.
+  - Spent Goals have no Allocations and are never distribution or reduction recipients. An existing Allocation to a spent Goal is an integrity violation (§13.5).
 
 ##### 10.5.2 Shortfall Resolution (All Modes / Required)
 
@@ -462,7 +533,7 @@ If `ΣAllocation(for that Position) > V_new`, reduce allocations until the exces
 
 - Reduction order (deterministic):
   1. **Lowest-priority active Goals first** (priority descending), with goalId ascending for ties
-  2. Include **closed / spent Goals** only if excess remains after all active allocations reach 0
+  2. Include **closed Goals** only if excess remains after all active allocations reach 0
      - Reduction order: Newest `closedAt` first (descending) → `goalId` ascending
        (If `closedAt` is absent, use a deterministic rule such as `goalId` ascending)
 
@@ -470,40 +541,48 @@ If `ΣAllocation(for that Position) > V_new`, reduce allocations until the exces
 
 - Principle: Do not change Allocations.
 - Reduce only when a shortfall exists (10.5.2).
-- If the data violates Goal limits, repair through 13.5 / 13.3 by shrinking, never increasing.
+- Goal target reductions follow §10.4.2. A Canonical integrity problem follows §13.5; it must not be silently corrected by a read.
 
 ##### ratio
 
 **Overview (Required)**
 
-- ratio **scales the existing distribution ratios within the Position, including unallocated funds**, while preserving those ratios.
-- **Do not automatically generate initial ratios**. Ratios are defined by the Allocations created through user allocation editing (10.3) and the unallocated amount.
-- The UI must explicitly state:
-  - "ratio preserves existing ratios. First create allocations (or leave funds unallocated) to define the ratios."
-  - "When the balance increases from 0, allocations do not increase automatically because no ratio exists. Add allocations through allocation editing if needed."
+- Retain existing closed-Goal Allocations as fixed reservations whenever the updated Position value can cover them. Exclude them from both the ratio denominator and ratio recipients; never increase them automatically.
+- Spent Goals have no Allocations and do not participate.
+- Scale the old **active-Goal Allocations and unallocated funds** within the pool remaining after closed reservations.
+- Do not generate initial ratios automatically. The UI must explain that closed reservations are retained, existing active / unallocated proportions define the ratio, and any new pool without an existing ratio remains unallocated.
+- In particular, increasing a zero balance does not create Allocations automatically.
 
-**When `V_old > 0`**
+**Definitions (For One Position)**
 
-- Original unallocated amount: `U_old = V_old - ΣA_old`
-- Treat Allocations and unallocated funds as the same kind of distribution recipient, and first calculate:
-  - `A_new = floor(A_old * V_new / V_old)`
-  - `U_new = floor(U_old * V_new / V_old)`
-- If a remainder `R = V_new - (ΣA_new + U_new)` exists, distribute it one yen at a time in **descending order of original amounts (A_old, U_old)**
-  - Deterministic tie-breaking: For active Goals, `priority(ascending)` → `goalId(ascending)`; unallocated comes last among ties
+- `C`: Sum of its existing closed-Goal Allocations.
+- `A_old(goal)`: Its existing Allocation to each active Goal.
+- `U_old = V_old - C - ΣA_old(active)`: Its old unallocated amount.
+- `B = V_old - C = ΣA_old(active) + U_old`: The old ratio pool.
+- These values assume valid starting Canonical data. Handle invalid data under §13.5 rather than silently correcting it.
 
-**When `V_old = 0`**
+**When `V_new >= C`**
 
-- Principle: Do not perform proportional recalculation that increases allocations (retain existing allocations).
-- If constraint violations exist, shrink (repair) until consistency is satisfied (repair by reducing, never increasing).
+1. Retain each closed-Goal Allocation unchanged.
+2. Set the new ratio pool to `P = V_new - C`.
+3. If `B > 0`, calculate:
+   - `A_new(goal) = floor(A_old(goal) * P / B)` for each active Goal.
+   - `U_new = floor(U_old * P / B)`.
+   - Distribute the remaining `R = P - (ΣA_new(active) + U_new)` one yen at a time among recipients with positive old amounts, in descending order of those old amounts (`A_old`, `U_old`). Break active-Goal ties by priority ascending, then goalId ascending; unallocated comes last among equal amounts. Closed Goals never receive a remainder.
+4. If `B = 0`, no active / unallocated ratio exists: keep active Allocations at 0 and put all of `P` into unallocated funds. This also covers `V_old = 0`.
+5. Clamp each active Goal's result to its receiving capacity `remaining(goal)` (§10.5.1). Return every yen removed by clamping to unallocated funds; do not redistribute it to other Goals.
 
-**Applying Goal Limits (Simplified / Required)**
+**When `V_new < C`**
 
-- For active Goals, if `A_new(goal) > remaining(goal)`, clamp to `A_new(goal) = remaining(goal)`.
-- Return **all amounts removed by clamping to unallocated funds** (do not automatically redistribute them to other Goals).
+- Set all active-Goal Allocations and unallocated funds to 0.
+- Reduce closed-Goal Allocations by a total of `C - V_new` using the closed-Goal reduction order in §10.5.2, without going below 0. Delete zero-yen Allocations.
+- Because a closed reservation must shrink, this is a **Major adjustment**: preview and obtain confirmation before committing the valuation change and reductions (§10.6).
 
-**Shortfall Resolution**
+In either case, delete zero-yen Allocations and ensure `ΣA_new(closed) + ΣA_new(active) + U_new = V_new`, with nonnegative integer amounts and all Goal limits satisfied. Classify the proposed secondary automatic adjustments under §10.6 before committing, including ratio changes when there is no simple Position shortfall.
 
-- Finally, apply shortfall resolution in 10.5.2 (only if needed).
+**Example**
+
+For `V_old = 100`, closed reservations of 30, an active Allocation of 30, and unallocated funds of 40, an increase to `V_new = 200` keeps closed reservations at 30. The remaining pool is 170, scaled in the old ratio 30:40. Flooring gives active 72 and unallocated 97; the remaining yen goes to unallocated because its old amount (40) is larger. Final amounts are **closed 30 + active 72 + unallocated 98 = 200**.
 
 ##### priority
 
@@ -517,42 +596,64 @@ If `ΣAllocation(for that Position) > V_new`, reduce allocations until the exces
     - If the decrease creates a shortfall, reduce allocations through 10.5.2 (shortfall resolution).
 - Do not automatically increase allocations to closed / spent Goals.
 
-#### 10.6 Hybrid Policy: Automatic Adjustment and Guidance to the Drawdown UI (Required)
+#### 10.6 Minor / Major Domain Adjustments and Confirmation (Required)
 
-When allocations must shrink because of balance updates (10.5), consistency repair, etc., default to automatic adjustment + summary, but guide the user to the drawdown / repair UI under certain conditions.
+When a normal Domain operation (valuation or target update, Spend, or Undo) requires secondary automatic Allocation adjustments, calculate and validate its proposed resulting State before committing. These rules do not authorize silent correction of corrupt Canonical data or automatic merge of concurrent mutations.
 
-**Default Behavior (Required)**
+**Classification Scope (Required)**
 
-- Automatic adjustment (reduction) → change summary → **route to normal allocation editing (10.3)**
+- Distinguish the user's **direct requested effects** from **secondary automatic adjustments**. Minor / Major classification applies to the latter, not to the direct effects alone.
+- Direct effects include a Spend's selected Position balance reductions, deletion of its target Goal's Allocations, creation of its Spend / Payment Record, and assignment of `spentAt`. User-entered Allocation changes in an Allocation editor are also direct effects, not automatic adjustments. Their ordinary validation and confirmation requirements still apply.
+- Secondary automatic adjustments are Allocation changes automatically calculated in addition to those direct effects to satisfy Domain invariants or the applicable recalculation rules. Examples include valuation-triggered reductions or ratio recalculation, proportional reductions after a Goal target change, adjustments to other Goals caused by Spend, and adjustments needed to make an Undo restoration satisfy current invariants.
+- **Affected Goals** means the distinct Goals whose Allocations change through the relevant secondary automatic adjustment, whether by an increase or a reduction. Do not count a Goal merely because the original operation directly targets it; count it if its Allocations also undergo a secondary adjustment.
+- **Automatic reduction amount** means the sum of Allocation reductions caused by that secondary adjustment. Conceptually, `automaticReductionAmount = Σ max(0, beforeAllocation - afterAllocation)` over the relevant Allocations, comparing amounts immediately before and after the secondary adjustment, after accounting for direct effects. Treat absence as 0 for this calculation. Increases do not offset reductions, and the user's directly entered amount is not the reduction amount. This definition prescribes no data structure or implementation method.
+- A ratio-mode valuation update can change or reduce Allocations even when `Σ Allocations ≤ V_new` and the simple Position shortfall is 0. Those changes are secondary automatic adjustments and participate in classification; zero shortfall does not mean no adjustment.
 
-**Immediately guide the user to the drawdown / repair UI if any of the following applies (required)**
+**Major Classification (Required)**
 
-1. **An Allocation for a closed or spent Goal must be reduced by even 1 yen**
-2. The number of affected Goals **exceeds N**
-3. The shortfall / repair amount **exceeds x% of V_new**
+The following **common conditions** apply to relevant secondary automatic adjustments regardless of operation type. A proposed adjustment is Major if:
 
-- Exact values of `N` and `x` are at implementation discretion (may change during the MVP).
+1. A secondary automatic adjustment must reduce an Allocation for a closed Goal by even 1 yen. Direct deletion of the Spend target's Allocations does not meet this condition.
+2. The number of affected Goals, as defined above, exceeds implementation-defined `N`.
 
-**Explicitly State That Reductions Are Not Restored (Required)**
+For **Position valuation updates only**, also classify the adjustment as Major when `automaticReductionAmount` exceeds implementation-defined `x% of V_new`, where `V_new` is that Position's post-update `marketValue`. Use the secondary Allocation reductions, including ratio-mode reductions, rather than the entered valuation change or simple shortfall alone.
 
-- Allocations reduced or deleted for closed / spent Goals **are not automatically restored** by later balance increases or Position additions.
-- In the drawdown / repair UI, explicitly state that restoration requires manually re-adding them through normal allocation editing (10.3).
+Do not apply the percentage condition to Goal target updates, Spend, or Spend Undo. Their common Major conditions still apply; this specification defines no additional amount-based threshold or substitute denominator for those operations. Any such extension belongs to later Production Architecture / Domain Design.
 
-**Default Proposal in the Drawdown / Repair UI (Required)**
+Exact values of `N` and `x` remain at implementation discretion. An adjustment is Minor when none of the conditions applicable to its operation type is met.
 
-- Show the deterministic calculation result from 10.5.2 (shortfall resolution) as the initial **default proposal (suggested values)**.
-- Users can edit, confirm, and apply the suggested values (confirming them unchanged is also allowed).
-- The UI may briefly explain which rules produced the proposal (e.g., lower-priority active Goals → newest closedAt first), at implementation discretion.
-- If user edits to suggested values leave constraint violations, detect them before saving and prompt further editing.
-  (The app must not automatically shift allocations to another Goal to resolve these violations.)
+**Minor: Commit, Then Summarize**
 
-**Context-Specific Wording (Required)**
+- Commit the original user mutation and its required deterministic secondary adjustment in **one atomic commit**, with the required Domain records, Activity, and Operation Receipt.
+- After confirmed commit, show a change summary and provide a route to normal allocation editing (§10.3). Further user changes are new explicit operations.
 
-- Use different guidance wording when navigating from a change summary to normal allocation editing (10.3) and when navigating directly to the drawdown / repair UI because a threshold was exceeded.
+**Major: Preview and Confirm Before Commit**
+
+- **Do not commit the original mutation or its adjustments before user confirmation.** A preview is not a save or a partial commit.
+- Calculate the proposed result from current Canonical State and user input, validate it, and open the drawdown / adjustment UI with an explanation of the required changes.
+- Show the applicable deterministic result as the default proposal, including §10.5.2 for Position shortfalls, the ratio rules for ratio updates, and §10.4.2 for Goal target reductions.
+- Let the user review / edit the proposal and explicitly confirm the resulting operation. Detect remaining invariant violations and request correction; do not automatically move Allocations to another Goal to make the proposal valid.
+- On confirmation, journal the exact confirmed operation before submission and recheck current authorization, restoreEpoch, workspaceIncarnationId, baseVersion, and Domain invariants under §8. Operation identity and payload binding must reflect the confirmed input; changed input is not a replay of an earlier operation.
+- Only then commit the **original requested change + confirmed adjustment atomically**, together with the required Domain records, Activity, and Operation Receipt.
+- If the proposal became stale before confirmation, reject its application. Refresh current Canonical data and generate a new proposal for renewed user review / confirmation; **do not automatically rebase or commit a stale proposal**.
+- Cancelling before submission leaves Canonical State unchanged. After submission, closing the UI does not cancel the operation; unknown-result recovery follows §8.4.
+- This flow requires **no server-side pending draft**. A proposal can be recalculated from Canonical State and user input. Concrete API shapes and proposal representation are not prescribed.
+
+**Explicitly State That Reductions Are Not Restored**
+
+- Allocations reduced or deleted for closed Goals are not automatically restored by later balance increases or Position additions. Explain that manual allocation editing (§10.3) is required to re-add them.
+- Spent Goals remain without Allocations unless an eligible Undo first reverses the Spend; do not offer re-allocation while a Goal remains spent.
+
+**Context-Specific Guidance**
+
+- Distinguish the summary of an already committed Minor adjustment from a Major proposal awaiting confirmation. Never apply reductions twice when reviewing a committed result.
+- Explain the applicable calculation rules in the proposal where useful, such as lower-priority active Goals followed by closed Goals in deterministic order.
 
 ---
 
 ### 11. Deletion Policy (Required for Consistency)
+
+These are Entity deletions within a Workspace, distinct from Workspace reset or deletion (§9.5). Commit each deletion and its required dependent changes atomically under §8. References to physical deletion describe removal from current Domain State, not a database schema or a policy for historical record retention.
 
 #### 11.1 Position Deletion
 
@@ -583,104 +684,127 @@ When allocations must shrink because of balance updates (10.5), consistency repa
 
 ---
 
-### 12. Sharing (Shared Pool Accounts + Shared Goals)
+### 12. Workspaces, Membership and Sharing
 
-- The unit of sharing is Snapshot + Events + Lease under a shared root (shared folder / shared item)
-- Join through OneDrive / Google Drive sharing (sharing links / joining a share)
-- Within shared, allow creation and updates of shared-scope Account / Position / Goal / Allocation
-- Delegate permissions to each provider's sharing system (owner / member-level treatment is sufficient for the MVP)
-- **Permission Differences (Required)**
-  - **Display shares without write permission as view-only and disable editing UI**
-- **Listing on the Sharing User's Side (Required)**
-- Limit shared listings to items under `<appRoot>/shared/`
-- Shared roots must be immediate child folders of `<appRoot>/shared/`
-  - Display two sections: "Shared with me" and "Shared by me"
-  - "Shared by me" shows only folders whose permissions include `read` / `write`
-- Sharing may be **included within Settings** as sharing settings (joining, listings, permission display, links to providers, etc.)
+#### 12.1 Personal and Shared Access
+
+- Personal data is private to its authorized user. Sharing applies to Shared Workspaces containing shared pool Accounts, Positions, Goals, and Allocations.
+- Support multiple Shared Workspaces and app-managed membership. Use `workspaceId` to identify a context; names, local selections, URLs, and cached role labels do not grant access.
+- Display `Can edit` or `View-only` for the selected Workspace. View-only permits authorized viewing but disables mutations, including Import and reset.
+- Check current authorization on the Server for every operation, including State / History reads, receipt lookup, Export, and management actions. Sharing and destructive management authority must be defined separately from ordinary edit capability.
+- Provide Workspace creation, selection, and membership-management entry points in Settings. Distinguish Workspaces shared by the user from those shared with the user where that relationship is known.
+- Creating a Workspace does not automatically share it. Joining or inviting must establish app-authorized membership; possession of an arbitrary URL is not permission.
+- When access is revoked, the Server must deny subsequent unauthorized operations. On learning of revocation, the browser must stop presenting that Workspace as accessible, disable edits, and prevent late responses from restoring it. Retained input is not authority to resend.
+- A cached offline view cannot prove that access is still current. Network disconnection alone cannot ensure immediate remote erasure of copies already held by a browser; recheck access when reconnecting.
+- Availability, retention, invalidation, and removal of Shared cached data across explicit sign-out, account switch, authentication expiry, and confirmed authorization loss must align with Production Auth / Identity / Privacy design. This specification does not guarantee continued offline display after sign-out or choose a cache lifecycle or encryption mechanism.
+- Authentication, identity linking, invitation mechanisms, role-management details, and account lifecycle are separate design decisions. No particular login service, invitation token format, or account-linking workflow is required here.
+
+#### 12.2 Authorization after Restore
+
+- PITR may revive revoked membership, old roles, invitations, deleted Workspaces, deleted accounts, or obsolete account links. Do not resume production-authoritative access from those restored records without reconciliation.
+- **Shared access must remain fail-closed after restore** until a trusted Owner identity is re-established and sharing is reconciled with appropriate operator confirmation. A restored Owner record alone is insufficient evidence.
+- A newly authenticated user who obtains the new restoreEpoch must not thereby regain access through revived authorization records.
+- Hold affected access and mutations behind the restore gate. Establish safe session invalidation / reconciliation so old or newly created sessions cannot bypass that gate.
+- Reconstruct sharing from trustworthy confirmation before releasing a Workspace. Release must be specific to the reconciled Workspace; it must not implicitly release unrelated Workspaces.
+- Concrete Owner verification, session handling, and authorization-reconciliation procedures remain Production design responsibilities. This requirement does not mandate an independent authorization ledger.
 
 ---
 
-### 13. Synchronization and Conflicts (First Write Wins)
+### 13. Browser Cache, Synchronization and Recovery
 
-#### 13.1 Startup / Resume
+#### 13.1 Startup, Resume, and Workspace Switching
 
-- Fetch Snapshot and cache it locally (IndexedDB, etc.), retaining ETags and similar metadata
-- Offline: View the cached Snapshot only (disable editing UI)
+- On browser restart, treat cached State and access information as **unverified**. Verify current access, restoreEpoch, workspaceIncarnationId, and Canonical State with the Server before enabling editing.
+- On resume or reconnect, refresh the selected Workspace and reconcile unresolved operations before allowing stale context to be used for new mutations.
+- Offline, allow view-only use of available cached data with a freshness limitation, subject to the identity / access lifecycle policy in §12.1. When no valid cache is available, explain that an online connection is needed to load data.
+- Remembered Workspace selection is a preference. If it is no longer accessible, explain that state and offer another authorized selection without treating it as an empty Workspace.
+- Keep cache, journal entries, and editor input associated with their originating Workspace and identity. Switching Workspace must not move or submit an operation in the new context.
+- Responses for a previously selected Workspace must not overwrite the active screen. Any retained data for another Workspace remains subject to its own identity and authorization checks.
 
-#### 13.2 Editing
+#### 13.2 Editing and Journal Protection
 
-- Editing is online-only (disable input offline, or provide a route to retry the operation after reconnecting)
-- Update Lease as best-effort editing-status display (editing can continue if it fails)
+- Editing is online-only and requires current edit access. Disable inputs and mutation controls while offline, view-only, or blocked by maintenance / integrity / access verification.
+- Confirmed user actions create logical operations. Retain each operation under §8.3 before HTTP transmission; do not continuously send while typing.
+- Preserve unsubmitted input where possible when connectivity or access changes. Distinguish it from a submitted operation whose outcome is unknown.
+- The journal survives ordinary reloads when browser storage remains available. It is not an offline collaborative editing queue and must not collect offline mutations for automatic synchronization.
+- Never silently discard unresolved operation identity or exact input merely because a response was lost, a refresh occurred, the Workspace changed, or cache recovery ran.
+- Once a result is resolved, journal bookkeeping may be retired. If input is no longer applicable, present it as retained input for review, copying, or explicit discard rather than current Canonical data.
+- No server-side pending draft is created to implement this protection.
 
-#### 13.3 Saving (Required)
+#### 13.3 Canonical Adoption and Timeline Fences
 
-1. Retain generation information (ETag, etc.) from Snapshot retrieval
-2. Apply changes locally to generate new `stateJson` (also generate / append EventChunk)
-3. Immediately before saving, perform **pre-save consistency checks / repair** (equivalent to 13.5; shrink only, never increase)
-4. Update Snapshot conditional on matching generation information (a mismatch fails the save)
+- Adopt restoreEpoch or workspaceIncarnationId only through a verified Server response for the relevant context. Identities are opaque; do not order them lexically or infer a transition from local preferences.
+- After adopting a new identity, **do not adopt delayed old-identity GET / State, History, Operation Receipt, or mutation responses into cache or UI**, including responses from requests issued before the transition.
+- This fence concerns the response’s Canonical observation context. It does not prohibit a currently authorized recovery query about an operation from an old epoch / incarnation. A verified current observation may report that operation’s retained historical result separately from current State (§8.4.1); historical lookup must not restore an old Canonical identity / version or authorize mutation replay.
+- A late response must not restore an older identity. Freshness / request-context verification must distinguish a verified transition from a delayed response; merely receiving an authenticated response is not enough.
+- Within the same Workspace, epoch, and incarnation, never replace adopted Canonical State with an older version. A response confirming an earlier commit does not justify rolling back the displayed State.
+- Apply these rules across open browser contexts / tabs as they learn of a transition. Browser restart requires Server verification rather than trust in stored identity alone.
+- On an identity transition, stop displaying the old dataset as current and invalidate old History and result views. Reconcile access before exposing replacement data.
+- Editor input may be retained separately for user recovery, but editing in progress cannot postpone the timeline fence. Never automatically rebase or resend old journals or drafts onto the new timeline.
+- Access revocation, Workspace deletion, and restore quarantine must also prevent late responses from re-enabling access, regardless of version ordering.
 
-#### 13.4 Save Failure (Required)
+#### 13.4 Conflicts and Unresolved Outcomes
 
-- Fetch the latest Snapshot again
-- **Discard** local edits
-- Notify the user, for example: "Could not save because the data was updated elsewhere. The latest data has been reloaded."
+- Use §8.4 to distinguish success, rejection, and unknown. Timeouts must not automatically roll back Canonical State or declare the logical operation failed.
+- On stale-write rejection, refresh Canonical data, preserve the user's input separately, and explain the conflict. Do not automatically merge or submit the input against the new version.
+- If another attempt may have committed, use the authorized recovery flow to observe current Canonical coordinates and retained operation results (§8.4.1–§8.4.2). Stale client coordinates do not block that read. Replay remains subject to mutation acceptance; do not claim non-commit from receipt absence or refreshed State alone.
+- Explicit user review may lead to a new operation against the latest State. Preserve the distinction from replaying the original logical operation.
+- Old epoch / incarnation journals remain stale even if their operationIds are known. Retaining input does not grant permission to submit it again.
+- Mutation retry and backoff must preserve logical-operation identity and respect access, version, and timeline gates. Recovery reads respect current access without requiring the client’s old coordinates to match.
 
-#### 13.5 Consistency Checks on Load (Required)
+#### 13.5 Integrity and Cache Recovery
 
-When loading a Snapshot, validate:
-
-- Uniqueness of `(positionId, goalId)`
-- `Σ Allocation(position) ≤ marketValue`
-- `Σ Allocation(goal) ≤ targetAmount`
-- Broken references (Allocations pointing to nonexistent positionId / goalId)
-- **No Allocations for spent Goals (with spentAt)**
-- `marketValue >= 0`, `targetAmount >= 0`, `allocatedAmount >= 0`
-
-**Response (Required)**
-
-- Delete Allocations with broken references and show a warning.
-- Delete any Allocations linked to spent Goals and show a warning.
-- Correct negative amounts to 0 and show a warning (or prevent saving and provide guidance; implementation discretion, but behavior must be deterministic).
-- For constraint violations, default to **automatic repair (shrink, never increase) + summary + route to normal allocation editing (10.3)**.
-- If the conditions in 10.6 apply (closed / spent reductions, number affected, proportion), **guide the user to the drawdown / repair UI**.
+- **Domain adjustment**: Apply the deterministic rules of §10 as part of an accepted operation and validate its final State. This is normal Domain behavior, not corruption recovery.
+- **Canonical integrity problem**: If Server Canonical data violates §7, detect and explain the problem, prevent unsafe normal mutations, and direct the user toward explicit recovery. Do not silently alter Canonical data during reads, remove broken references, or clamp invalid values merely to make a read succeed. Specific recovery tooling is not prescribed.
+- **Client cache recovery**: Invalid or corrupt cached data may be discarded and rebuilt from verified Server Canonical data without an extra confirmation. Clearing this cache must not silently clear the Unresolved Operation Journal or editor input.
+- **Invalid Import**: Reject it under §9.3 before preview / apply; do not silently adjust the file into a valid dataset.
+- Following loss of all browser storage, authorized users must be able to bootstrap committed Canonical data from the Server. Recovery of uncommitted input and lost operationIds is best effort and cannot be guaranteed.
+- Ordinary cache refresh is not a data reset and must not create an empty Workspace or initiate Canonical writes.
 
 ---
 
 ### 14. Quotas / Abuse Prevention (Design Policy)
 
-- Back off and retry on OneDrive / Google Drive API throttling such as 429, and inform the user
-- Impose app-side limits (indicative examples):
-  - Maximum 100 Goals
-  - Maximum 200 Positions
-  - Maximum 1000 events per day
-- Chunk Events and minimize Snapshots to avoid oversized files
+- Protect service availability with appropriate limits on Workspace count, Entity count, Activity volume, mutation / lookup traffic, and Import / Export size and resource use.
+- Set concrete thresholds through Production design and measurement; this specification assigns no numerical quota.
+- Enforce limits at trusted boundaries, including concurrent create / delete operations and bulk Import. Rejection must not leave a partially applied dataset.
+- Explain quota or throttling failures and the next useful action. Temporary retries must use bounded backoff and respect the same-operation and unknown-outcome rules.
+- Paginate History and bound resource consumption without discarding required History or conflating Activity retention with Operation Receipt retention.
 
 ---
 
 ### 15. Outside MVP Scope (Unsupported)
 
-- Real-time collaborative editing and automatic conflict merging
-- Sharing personal assets with others (sharing outside shared scope)
+- Real-time collaborative editing, CRDTs, and automatic conflict merging or rebase
+- Offline editing and general-purpose offline mutation synchronization
+- Full Event Sourcing as a persistence contract
+- Server-side pending drafts and mandatory editing-presence UI
+- Sharing personal assets with others (sharing outside Shared Workspaces)
 - Automatic exchange-rate or asset-price retrieval (conversion is manual)
 - Strict accounting journal entries (complete separation of deposits / gains and losses / withdrawals)
 - Anonymous editing without sign-in
 
 ---
 
-### 16. Explicitly Delegated Implementation Decisions
+### 16. Explicitly Delegated Design and Implementation Decisions
 
-- UI / navigation / wording / layout details
-- Local caching approach (IndexedDB, state management library, synchronization timing)
-- Internal Event format (provided event types and their meaning remain traceable)
-- UX for joining a share (pasting a sharing link, selecting from a shared list, etc.)
-- Graph API call design, retry, and error-display optimization
-- Exact values of thresholds `N` and `x` in 10.6 (may change during the MVP)
-- Handling `closedAt` on Goal reopening (remove / retain). However, **reduction order must be deterministic**.
+- UI / navigation / wording / layout details within the shared interaction contracts
+- State management, scheduling, and browser storage representation within the required IndexedDB cache / journal and timeline behavior
+- Domain object / aggregate boundaries, command design, and transaction implementation that preserve the Product invariants and atomicity requirements
+- Logical relational model, schema, constraints, indexing, physical naming, and API design
+- Activity and Spend / Payment Record representation, keeping their responsibilities separate from Operation Receipts
+- Production authentication, identity / account lifecycle, invitations, Owner verification, session invalidation, and authorization reconciliation, subject to §12
+- Receipt retention, backup / RPO, restore procedures, monitoring, and performance design, subject to honest outcome reporting and the restore gates
+- Format evolution and internal schema migration as separate concerns
+- Exact values of thresholds `N` and `x` in §10.6
+- Handling `closedAt` on Goal reopening (remove / retain), with deterministic reduction ordering
+
+Delegation does not permit weakening atomicity, Server validation, current authorization, input protection, or timeline rejection. Production platform validation remains necessary; the requirements here are not a claim that every browser, network failure, or recovery procedure has already been verified.
 
 **Priorities When Unsure**
 
 1. Least privilege and privacy
-2. Avoid data loss (however, this specification's requirement to discard local edits on save failure takes precedence)
+2. Avoid data loss and preserve unresolved input without misrepresenting commit certainty
 3. Reduce the number of actions (mobile UX)
 
 ---
@@ -780,69 +904,70 @@ Refer to the [Brand Specification](./brand/README.md) for icon shape, color, mas
 
 ## Mazemaze Piggy Bank: Shared Notification and Status Display Specification
 
-This chapter defines notifications (success / caution / error) shared across all screens, and status displays for saving, synchronization, offline operation, and similar states.
+This chapter defines notifications and status displays shared across all screens. Saving and recovery must use Part I §8 and §13; individual screens must not redefine commit certainty.
 
 ### 1. Notification UI Types (Consistent)
 
 - **Toast (brief display)**
-  - Purpose: Lightweight feedback (save completion, minor adjustment notifications, state changes).
-  - Position: Bottom center (prioritize a consistent appearance on desktop / mobile).
-  - Auto-dismiss: A few seconds; slightly longer is acceptable when an action is included.
-  - Actions: At most one (e.g., `Review` / `Retry`).
+  - Lightweight feedback for confirmed saves, minor adjustments, and connectivity changes.
+  - Position: Bottom center, consistently across desktop / mobile.
+  - Auto-dismiss after a few seconds; allow longer when an action is included.
+  - At most one action (e.g., `Review` / `Check status`).
 - **Dialog (blocking)**
-  - Purpose: Significant events requiring user action (changes lost after save failure, conflicts, insufficient permissions, etc.).
-  - Principle: Present a short summary + next action (`Reload` / `Try again` / `Open Settings`).
-- **Inline display (within the screen)**
-  - Purpose: Problems to correct in place, such as input errors and constraint violations in an editor.
-  - Examples: Error text below a field, explanations of disabled states.
+  - For conflicts, access changes, destructive actions, or recovery requiring a user decision.
+  - Present what is known, the affected Workspace / input, and a useful next action.
+  - Do not claim changes were lost or never saved unless that conclusion is supported.
+- **Inline display**
+  - Validation errors, explanations of disabled controls, and retained-input review.
 
-Note: Do not adopt persistent MessageBar-style banners in the MVP.
+Do not adopt persistent MessageBar-style banners in the MVP. Important unresolved outcomes must remain discoverable through status and Connection health after a Toast is dismissed.
 
-### 2. Synchronization Status Signal (Shared)
+### 2. Connection and Save Status Signal (Shared)
 
-- Always show the overall screen synchronization status in the following locations:
+- Always show the selected context's status:
   - **Desktop: Bottom of the left sidebar**
   - **Mobile: Right end of the header**
-- Standardize on **a circular dot + short English wording**.
-  - Change only the dot color, not the text color.
-  - Do not add icons.
-- Clicking the status area navigates to `Settings > Connection health` (`/settings#connection-health`).
+- Use **a circular dot + short English wording**. Change the dot color, not the text color; do not add icons.
+- Activate the status area to open `Settings > Connection health` (`/settings#connection-health`).
+- Distinguish connectivity, current access, verification / maintenance, and operation outcome. One status label must not imply that every operation has succeeded.
 
-#### Example Display Values
+Suggested wording and color mapping:
 
-- Online (green dot / `Online`)
-- Saving… (yellow dot / `Saving…`)
-- Sign-in required (yellow dot / `Sign-in required`)
-- Retry needed (red dot / `Retry needed`)
-- Offline (red dot / `Offline`)
-- View-only (yellow dot / `View-only`)
-- Show `Retry needed` only when partial failure leaves items in the retry queue.
+| Wording | Meaning | Dot |
+| --- | --- | --- |
+| `Online` | Connected with a verified, usable context; not proof of an individual save | Green |
+| `Checking…` | Verifying data or access | Yellow |
+| `Saving…` | A confirmed user operation is being submitted / resolved | Yellow |
+| `Sign-in required` | Authentication action is needed | Yellow |
+| `View-only` | Current access permits viewing, not editing | Yellow |
+| `Offline` | Server verification / saving is unavailable | Red |
+| `Outcome unknown` | A submitted operation has no confirmed outcome | Yellow |
+| `Review needed` | A conflict, rejected input, or integrity problem needs attention | Red |
+| `Access unavailable` | Access was revoked or the Workspace is unavailable | Red |
+| `Recovery in progress` | A maintenance / restore gate prevents normal use | Yellow |
 
-#### Dot Colors (R/Y/G)
-
-- Green: Online
-- Yellow: Saving… / View-only / Sign-in required
-- Red: Offline / Retry needed
+- Prioritize the condition restricting the current action, while showing unresolved operations separately in Connection health. Offline or revoked access must not hide their existence.
+- A Workspace switch changes the status context; retained input for another Workspace stays associated with that Workspace.
+- `Last verified` describes the latest successful Canonical verification. A last-confirmed-save time, if shown, must be labelled separately. Neither claims that an unresolved operation failed.
 
 ### 3. Offline and View-Only Handling
 
-- When offline or when a share is View-only:
-  - Disable editing UI (inputs / buttons).
-  - Briefly explain why editing is unavailable in an accessible location (consolidate details in Settings; short supplementary text may appear near primary editing controls).
-- On transition to offline, **notify the state change once through a Toast**.
-  - Example: `Offline: changes won’t be saved.` (optional action: `Open Settings`)
-- While offline, avoid a persistent banner; prioritize communicating the state through the status area (desktop sidebar / mobile header signal).
+- Disable editing controls when offline or View-only. Explain the reason near the controls or through an accessible status description.
+- Show a one-time Toast on transition to offline, for example `Offline: viewing cached data. Editing is unavailable.`
+- Retain in-progress input where possible; an operation submitted before the transition may still have an unknown outcome.
+- Cached content must be identifiable as cached / unverified when applicable. No cache means data cannot be shown until an authorized online load succeeds.
+- When access is revoked or restore quarantine applies, do not present it as ordinary View-only access. Follow §12 and §13 before showing the Workspace again.
 
-### 4. Save Failure and Conflict Experience
+### 4. Save Results, Conflicts, and Recovery
 
-- Use a **Dialog** for save failures that may lose changes (conflicts, insufficient permissions, etc.).
-  - Contents: What happened (one line) + potentially lost scope (short summary) + next action (`Reload` recommended; `Open Settings` if needed).
-- A Toast with `Retry` is acceptable for temporary, retryable failures (but prioritize a Dialog for lost-change situations).
-- Explicitly treat **partial failure (Snapshot saved successfully / History event save failed)** as failure.
-  - Notification wording must include partial failure and the requirement to retry.
-  - Keep the retry queue **only within the session** (no need to carry it across reloads).
-  - Explain in the UI that history may remain incomplete until retry finishes.
-- Do not automatically merge conflicts. Make reloading the latest data the primary user action.
+- **Confirmed success**: Show completion only after a verified commit result. Resolve the matching input / journal without replacing newer Canonical State with an older response.
+- **Explicit rejection**: Explain the rejected attempt and retain correctable input. If another attempt may have committed, show that uncertainty and provide result checking.
+- **Unknown outcome**: Say that saving could not be confirmed. Provide `Check status` and retained-input review; do not label it automatically as failed or start a new logical operation as a retry.
+- **Conflict**: Refresh Canonical data, show a Dialog explaining the stale write, and preserve input separately. A user may review and explicitly apply intent as a new operation; there is no automatic merge / rebase.
+- **Safe retry**: An action replaying the same operation uses its original identity and payload. Disable it when access, epoch, incarnation, or other safety conditions no longer permit replay, with a visible explanation.
+- Retained input must remain reachable even if an editor closed when submission started. Label it as unconfirmed / unapplied as appropriate; do not display it as committed State.
+- A History read failure after a confirmed save must offer History reload without submitting the mutation again.
+- Normal refresh / cache recovery must preserve unresolved journals. Explicitly discarding retained input does not cancel or undo a potentially committed Server operation.
 
 ---
 
@@ -850,38 +975,25 @@ Note: Do not adopt persistent MessageBar-style banners in the MVP.
 
 ### 1. Policy
 
-- As a rule, editing operations **autosave per operation** (do not require an explicit "Save snapshot").
-- Present status (Online / Saving… / Sign-in required / Retry needed / Offline / View-only) according to the shared specification so users know when saving occurs.
+- As a rule, editing operations **autosave per confirmed operation**. When Domain validation requires a Major adjustment, defer committing the original change until the user confirms its proposed result (§10.6); initial input confirmation alone is insufficient.
+- Do not continuously save while typing. Confirmation may be Enter, Blur, or an explicit action according to the screen requirements.
+- Journal the operation before HTTP (§8.3). Local optimistic presentation, if used, must remain distinguishable from confirmed Canonical data.
+- Follow the shared status and result contract; network connectivity is not save confirmation.
 
 ### 2. Save Triggers (UI Perspective)
 
-- Goal:
-  - Create / update / close / reopen a Goal
-  - Change Goal priority
-  - Increase / decrease allocations (Allocation changes confirmed through absolute-value input)
-  - Execute "Remove all allocations" (explicit action)
-  - Confirm Spend (`Mark as spent...`)
-  - Confirm Undo spend
-- Position:
-  - Create / update / delete a Position
-  - Update valuation (when inline editing is confirmed through Enter / Save, etc.)
-  - Change Recalc Mode
-- Account:
-  - Create / update / delete an Account
-- Sharing settings:
-  - Switch scope or shared folder (only where necessary, according to state-persistence policy)
-
-Note: Do not continuously save while typing (save per confirmed operation).
-For example, save a Goals Allocation input when confirmed through Enter / Blur.
+- Goal: Create / update / close / reopen, change priority, confirm Allocation changes, remove all Allocations, confirm Spend, confirm Undo spend.
+- Position: Create / update / delete, confirm valuation, change Recalc Mode.
+- Account: Create / update / delete.
+- Workspace management actions use their own explicit confirmation and authorization requirements. Scope / Workspace selection is a navigation preference, not an asset mutation.
 
 ### 3. UI Feedback
 
-- Save starts: Briefly transition the status to `Saving…`
-- Save succeeds: Return status to `Online`; allow the applied time to be checked through `Last sync`.
-  - Success Toasts may be suppressed for frequent operations to avoid noise.
-- Save fails:
-  - Changes may be lost: Dialog
-  - Temporary, retryable failure: Toast (Retry) + status area set to `Retry needed`
+- Save starts: Show `Saving…`.
+- Confirmed success: Indicate completion and update the relevant verified data / timestamps. Frequent success Toasts may be suppressed.
+- Rejection or conflict: Explain the cause and preserve input for review under the shared contract.
+- Unknown: Expose the unresolved outcome and recovery actions; do not silently discard input, claim failure, or hide it behind `Online`.
+- Operations confirmed as committed must survive browser reload by reloading Canonical data from the Server, subject to explicit later deletion / replacement and the database restore policy.
 
 ---
 
@@ -906,8 +1018,9 @@ This chapter defines the UI for reviewing what happened and when for Goals and a
   - Summary (one short line)
   - Details (expand when needed: related IDs, before / after values, notes, etc.)
 - Default to newest first.
-- Explicitly identify the display source in the History view (e.g., `Source: cloud event log.`),
-  and show explanatory status text during loading / failure as well.
+- History displays the selected Workspace's current Domain Activity. Explain loading, failure, and cached / unverified display where applicable; technical storage details are not required in the UI.
+- Apply the same access and timeline fences as State (§13.3), including late History responses and pagination. After replacement, do not combine previously loaded History with the replacement History.
+- Activity and the Goal Receipt view are Domain information. Neither is the Operation Receipt lookup used to resolve a submitted mutation.
 - Standardize Recent activity templates in English, for example:
   - `Account created: <name>`
   - `Position added: <position> -> <account>`
@@ -940,36 +1053,36 @@ This chapter defines the UI for reviewing what happened and when for Goals and a
 
 ## Mazemaze Piggy Bank: Automatic Adjustment (Minor / Major) Notifications and Navigation (UI Requirements)
 
-This chapter defines the UI when allocations are automatically adjusted because of balance changes or similar events.
+This chapter defines feedback for Minor adjustments already committed and Major adjustment proposals awaiting confirmation, following Part I §10.6.
+
+Classify secondary automatic Allocation adjustments under §10.6, not the original operation's direct requested effects. Count distinct Goals changed by those adjustments; a normal Spend's direct deletion of its target closed Goal's Allocations alone does not require a Major proposal.
 
 ### 1. Terminology
 
-- **Minor**: Below the core specification thresholds (10.6), without requiring an immediate user decision about repair.
-- **Major**: Meets the core specification thresholds (10.6), requiring a user decision (repair / drawdown).
+- **Minor**: Meets none of the applicable Major conditions in §10.6; the original mutation and deterministic adjustment commit atomically before the summary.
+- **Major**: Meets a Major condition in §10.6; neither the original mutation nor the adjustment commits until the user explicitly confirms the proposal.
 
-### 2. Minor Adjustments (Below Threshold)
+### 2. Minor Adjustments (No Applicable Major Condition)
 
-- Show a **Toast** when automatic adjustment occurs.
+- After confirmed atomic commit, show a **Toast**:
   - Icon: ⚠️ (caution)
-  - Wording: Short summary (e.g., `Allocations adjusted automatically.`)
+  - Wording: A short summary, e.g., `Allocations adjusted automatically.`
   - Action: `Review`
-- `Review` opens a **change Summary**.
-  - Desktop: Modal or drawer (a consistent container across the app)
-  - Mobile: Full-screen sheet / overlay
-- Summary contents:
-  - What changed (affected Goals / Positions, summary of differences)
-  - A tone that communicates action is not immediately mandatory
-- Two actions from the summary:
-  1. **OK/Close** (acknowledge and close)
-  2. **Open repair** (navigate to the drawdown / repair UI)
-- Show Summary / Repair **only when the event occurs**; do not provide a persistent entry point to reopen it later.
-- Support later discovery through History / Activity.
+- `Review` opens a **change Summary**:
+  - Desktop: Modal or drawer, consistently across the app.
+  - Mobile: Full-screen sheet / overlay.
+- Show the affected Goals / Positions and committed differences. Make clear that no immediate action is mandatory.
+- Provide **OK/Close** and **Open adjustments** (the drawdown / adjustment UI). Any subsequent edits are new operations; reviewing the result must not reapply its reductions.
+- Show this summary guidance when the Domain change occurs, without a persistent entry point to reopen the summary. History / Activity supports later discovery.
 
-### 3. Major Adjustments (At or Above Threshold)
+### 3. Major Adjustments (Applicable Major Condition Met)
 
-- When an automatic adjustment is major, **go directly to the drawdown / repair UI** because a user decision is required.
-  - Even on direct navigation, place a brief explanation (what happened / why the user is here) at the top.
-- A Toast before navigation is optional (it can be noisy, so direct navigation alone is acceptable initially).
+- Open the drawdown / adjustment UI **before committing any part of the requested change**. Explain why confirmation is required and label the displayed result as a proposal, not saved data.
+- Show the original requested change together with its suggested adjustments. Let the user review / edit, cancel, or explicitly confirm the complete result.
+- Do not display a save-success Toast or show proposed effects as committed Canonical State before confirmation and successful commit.
+- Confirmation applies the normal journal, authorization, identity, version, and invariant checks (§8 / §10.6), then atomically commits the original change and confirmed adjustments.
+- On stale confirmation, retain input separately and offer a refreshed proposal for renewed confirmation. Do not automatically rebase or apply it.
+- No server-side pending draft is required. Cancelling before submission leaves Canonical State unchanged; unresolved submitted operations use the shared recovery UI.
 
 ---
 
@@ -997,14 +1110,12 @@ This chapter defines the UI when allocations are automatically adjusted because 
 - **Global Progress**:
   - Formula: `(total allocations across all Goals / total target amounts across all Goals) * 100`
   - Display: A thick Butter yellow bar (fill) in the header.
-- **Lease Banner**:
-  - When another device is editing (holding a Lease), show a thin Butter yellow strip at the very top with English wording such as "Someone is editing...".
 - **Scope switching**:
   - Switch between `Personal` / `Shared`. When Shared is selected, show a dropdown directly below for the shared context name (family, team, etc.).
   - When Personal is selected, disable the shared workspace dropdown and
     show `Switch to Shared to choose a workspace` to prevent mistakes (do not show the selected value).
-  - When Shared is selected, append access status to the selected workspace name (e.g., `Family budget (Editable)` / `Family budget (Read-only)`).
-  - Do not show duplicate shared metadata (Shared space / Shared ID) at the top of Shared screens.
+  - When Shared is selected, append access status to the selected workspace name (e.g., `Family budget (Can edit)` / `Family budget (View-only)`).
+  - Do not repeat the Workspace name / identifier at the top of Shared screens when the scope selector already establishes the context.
 - **Currency display**:
   - Internal currency is fixed to JPY (converted to yen, integer).
   - Even in the English UI, use `¥` and `,` separators consistently.
@@ -1018,7 +1129,7 @@ This chapter defines the UI when allocations are automatically adjusted because 
 - **Fixed sidebar (left: 280px)**:
   - Top: Scope switching & shared context selection.
   - Middle: Navigation (Dashboard, Accounts, Goals, Settings).
-  - Bottom: Cloud synchronization status (Online / Saving… / Sign-in required / Retry needed / Offline / View-only).
+  - Bottom: Connection and save status, following the shared status contract.
 - **Main view (right: flexible)**:
   - **Whole-view scrolling**: Keep the sidebar fixed; the entire main view scrolls vertically.
   - **Sticky Header**: Keep the Global Progress section fixed at the top while scrolling.
@@ -1064,7 +1175,7 @@ This chapter defines the UI when allocations are automatically adjusted because 
 - **Bottom navigation**: Four tabs: Home, Accounts, Goals, Settings (do not use the `Dashboard` label on mobile).
 - **Header**:
   - Place a shared header at the top of the screen.
-  - Place synchronization status (circular dot + short wording) at the right end; tapping opens synchronization details in Settings.
+  - Place connection and save status (circular dot + short wording) at the right end; tapping opens Connection health in Settings.
 
 #### Content Structure
 
@@ -1105,11 +1216,11 @@ This chapter defines the UI when allocations are automatically adjusted because 
 - **Unallocated handling**: Standardize UI wording to `Unallocated` throughout Dashboard / Accounts / Positions (do not use `Free`). Always frame it positively as available headroom. Avoid overemphasis; display it in Soft gray tones as part of the breakdown.
 - **Scope labels**: Dashboard `Top / Last` labels must match the display limit N.
 - **English UI**: System wording (Last / Top / Updated, etc.) must be English only. User-entered names (Goal / Account / Position names) may use any language.
-- **Shared-scope navigation**: When Shared is selected, navigate using query parameters as the SSoT, based on `/shared/<provider:sharedId>/goals` / `/shared/<provider:sharedId>/accounts`.
+- **Workspace navigation**: Preserve the selected Workspace context in Goals / Accounts navigation and deep links using app-managed Workspace identity. Keep selection parameters as the URL SSoT. A URL does not grant access; validate the destination context and avoid applying responses from a previously selected Workspace.
 - **Scrolling**:
   - Avoid nested scrolling within the desktop main view (such as scrolling only within the Accounts list); always use whole-page scrolling.
-- **Cloud conflicts**:
-  - Do not automatically merge on save failure. Notify through a Dialog / Toast and provide a reload action.
+- **Conflicts and unresolved saves**:
+  - Follow the shared result contract: refresh Canonical data, preserve input separately, and require explicit review before applying it as a new operation. Do not automatically merge or infer failure from a timeout.
 - **PWA (future: when Japanese is added)**:
   - Prioritize the `lang` cookie; initially set `lang` from Accept-Language.
   - Use `/manifest.webmanifest` for default English and `/manifest-ja.webmanifest` for Japanese; switch `<link rel="manifest">` according to the cookie.
@@ -1138,6 +1249,7 @@ This chapter defines the UI when allocations are automatically adjusted because 
   - Accounts list: Creation time ascending (fixed)
   - Positions list (mobile Account detail): Creation time descending (newest first)
 - **Currency**: Fixed to JPY (yen). Foreign currency / points also require manual entry as integers already converted to yen.
+- **Allocation validation**: Account / Position Allocation editors use the absolute-value capacities in Part I §10.3, excluding the edited Allocation from both the Position and Goal sums. Use the same `Available`, `Remaining to target`, and `Maximum` meanings as the Goal editor; enforce both resulting totals under §7.4.
 - **Recalculation mode**: Default to Fixed.
 - **Desktop information architecture**:
   - Left: Accounts list (select by clicking a row; no `View` button)
@@ -1149,7 +1261,7 @@ This chapter defines the UI when allocations are automatically adjusted because 
 - **Notifications (Toast)**: Display at bottom center.
   - **Success**: Feedback such as save completion (may be suppressed for frequent operations).
   - **Celebration**: When a Goal is achieved (🎉 icon). Supplement decoration through shape (icons / shadows / borders / spacing) rather than more colors.
-  - **Caution**: Automatic allocation adjustment caused by balance reduction (⚠️ icon + `Review`).
+  - **Caution**: After a committed Minor allocation adjustment, show ⚠️ with `Review`. A Major adjustment opens its proposal before commit under §10.6.
 - **Supporting UI**: Provide explanations and examples for recalculation modes and asset categories through tooltips (desktop) or popovers (mobile).
 - **History entry point**:
   - Provide `History` in Position details (follow this document's History chapter).
@@ -1178,13 +1290,13 @@ This chapter defines the UI when allocations are automatically adjusted because 
 - **Add (Account / Position)**:
   - Enter data in a drawer sliding in from the right.
   - When adding an asset, default the destination Account to the currently selected Account.
-  - On confirming `Add account` / `Add position`, close the drawer and save in the background.
+  - On confirming `Add account` / `Add position`, retain the operation in the journal before submission. The drawer may close while saving, provided status and retained-input recovery remain available if the outcome is unresolved.
 - **Update (valuation)**:
   - Use inline editing by clicking directly on the valuation cell.
   - Confirm with `Enter`; cancel with `Esc`.
   - Show the hint only the first time: `Enter to save · Esc to cancel`
   - Consolidate instructions in the ⓘ beside the heading: `Enter to save · Esc to cancel` / `JPY integer only.`
-  - Autosave on `Enter` confirmation.
+  - Start autosave on `Enter` confirmation, subject to §10.6: a required Major adjustment pauses before commit for proposal review and explicit confirmation.
 
 #### Position Editing from Goals (Deep Link)
 
@@ -1194,8 +1306,8 @@ This chapter defines the UI when allocations are automatically adjusted because 
 - If `returnGoalId` is present, Close actions (Close button / overlay / Esc) return to Goals.
 - Keep the `Save position` label unchanged as `Save position`.
   - On save success, close the drawer and return to Goals through the same Close handler.
-  - On save failure, keep the drawer open and allow correction in place.
-- If there is in-progress input when using `Back to goal` or Close, show a discard-confirmation dialog (`Discard changes and go back` / `Stay`).
+  - On rejection or unknown outcome, keep the drawer open with retained input and the appropriate correction / result-checking action. An unknown outcome is not an instruction to resubmit changed input.
+- For unsubmitted input, show a discard-confirmation dialog when using `Back to goal` or Close (`Discard changes and go back` / `Stay`). Leaving the editor must not silently remove a submitted unresolved journal entry or imply that its Server operation was cancelled.
 
 #### Routing & State Restoration (URL SSoT)
 
@@ -1222,26 +1334,24 @@ This chapter defines the UI when allocations are automatically adjusted because 
 
 #### Save Triggers (Confirmation Actions)
 
-- In desktop Accounts, always attempt to save on the following confirmations (changes must survive reload):
+- In desktop Accounts, submit the following confirmations under the journal and access contract (confirmed commits must survive reload under the restore policy):
   - `Add account` / `Save account` / `Delete account`
   - `Add position` / `Save position` / `Delete position`
   - `Enter` in Value inline editing
 
-#### Save Failure / Conflicts / Disabled States
+#### Save Results / Conflicts / Disabled States
 
-- **Success**:
-  - For inline editing, return the cell from `Saving…` to its normal display.
-  - Update the shared synchronization status (`Saving…` / `Online` / `Retry needed`).
-  - Do not flood the UI with success Toasts.
-- **General failure**:
-  - Show a failure Toast (with `Retry` if needed).
-  - Discard the latest edit and return to the pre-save state (rollback).
-- **Conflict failure**:
-  - Do not automatically merge.
-  - Recover through fetching the latest data → discarding local edits → Dialog notification.
-- **Offline / View-only**:
-  - Disable `Add / Edit / Delete / Inline edit`.
-  - Briefly explain why they are disabled.
+- **Confirmed success**:
+  - Return the inline cell from `Saving…` to its normal display using eligible Canonical data.
+  - Update the shared status without flooding the UI with success Toasts.
+- **Rejection**:
+  - Explain the cause, retain input for correction, and check any uncertainty about another attempt before presenting the operation as uncommitted.
+- **Unknown**:
+  - Preserve the operation / input and offer result checking. Do not automatically roll back or retry as a new operation.
+- **Conflict**:
+  - Fetch eligible latest data, keep the local input separately, and show a Dialog. No automatic merge or rebase.
+- **Offline / View-only / unavailable access**:
+  - Disable `Add / Edit / Delete / Inline edit` and explain the condition under the shared status contract.
 
 #### Button Placement (Desktop)
 
@@ -1294,16 +1404,16 @@ This chapter defines the UI when allocations are automatically adjusted because 
 
 - After successful `Add account`, always open the created Account's `Account detail`.
 - After successful `Add position`, return to `Account detail`.
-- Attempt to save additions on confirmation; they must survive reload (follow this document's Autosave and Synchronization / Conflicts chapters).
+- Attempt to save additions on confirmation; confirmed commits must survive reload under the restore policy (follow Autosave and Part I §8 / §13).
 
 #### Editing Entry Points and Save Feedback
 
 - Tapping a Position card opens `Position detail`.
 - Perform edits such as valuation updates and recalculation-mode changes in `Position detail`.
 - Follow shared save-feedback requirements:
-  - Success: Update `Saving… / Online` (suppress success Toasts for frequent operations)
-  - General failure: Failure Toast (with `Retry` as needed) + rollback
-  - Conflict: Fetch latest + discard local edits + Dialog notification (no automatic merge)
+  - Confirmed success: Update data and status (suppress success Toasts for frequent operations)
+  - Rejection / unknown: Explain the result, retain input, and offer correction or result checking as appropriate.
+  - Conflict: Fetch eligible latest data + preserve input separately + Dialog notification; no automatic merge / rebase.
 - Disable editing UI in `Offline / View-only` and show a short English explanation.
 
 ---
@@ -1329,8 +1439,9 @@ This chapter defines the UI when allocations are automatically adjusted because 
 
 ### 2. Data Model (Goal)
 
+A Goal belongs to the selected Workspace; Personal / Shared comes from that Workspace (§7).
+
 - `id`: string
-- `scope`: "personal" | "shared"
 - `name`: string (Goal name)
 - `targetAmount`: number (JPY integer)
 - `priority`: number (Order; integer starting at 1)
@@ -1341,6 +1452,7 @@ This chapter defines the UI when allocations are automatically adjusted because 
 ### 3. Business Logic & Constraints
 
 - **Allocation limit**: Always maintain `sum(AllocatedAmount) <= Goal.targetAmount`.
+- **Closed / Spent Allocations**: Closed Goals may retain Allocations. Spent Goals must have none; disable allocation editing and add-allocation actions until an eligible Undo reverses the Spend.
 - **State determination (two axes)**:
   - Active: `status=active` and no `spentAt`
   - Closed: `status=closed` and no `spentAt`
@@ -1352,7 +1464,7 @@ This chapter defines the UI when allocations are automatically adjusted because 
   - Display the list in priority order. Use manual insertion logic (moving D to second yields A, D, B, C, ...).
   - On reopening (Closed -> Active), automatically assign the last priority.
 - **Recalculation on balance updates**:
-  - When asset valuation decreases and allocations are automatically adjusted, follow the Toast / navigation requirements in this document's Automatic Adjustment chapter.
+  - When asset valuation decreases and Allocations need adjustment, show a summary after a Minor commit or a proposal before a Major commit, following §10.6 and the Automatic Adjustment UI chapter.
   - Support later discovery through the History UI.
 
 ### 4. UI/UX Specification
@@ -1373,7 +1485,7 @@ This chapter defines the UI when allocations are automatically adjusted because 
   - Always show state (`Active / Closed / Spent`) in Goal detail.
 - **Primary actions (header)**:
   - Show `Mark as spent...` only when Closed and no spentAt is present.
-  - Show `Undo spend` when spentAt is present.
+  - For a non-imported current Spend, show `Undo spend`; enable it only within 24 hours of that Spend commit and with current access / Domain eligibility. Explain unavailability. Do not show an Undo CTA for imported Spend.
   - Do not show `Mark as spent...` in the `Active` state for the MVP.
 - **Tabs**:
   - `Details`: Edit basic Goal information.
@@ -1390,7 +1502,7 @@ This chapter defines the UI when allocations are automatically adjusted because 
 - **FAB (add actions)**:
   - Consolidate add actions in the FAB menu (icon + label).
   - Always show `🎯 Goal` (Add goal).
-  - Enable `➕ Allocation` (Add allocation) only in the Goal detail `Allocations` tab.
+  - Enable `➕ Allocation` (Add allocation) only in the Goal detail `Allocations` tab for an editable, unspent Goal with online edit access.
   - Outside that context, disable it and show a short explanation in the same menu (e.g., `Open a goal to add allocations.`).
 - **Input method**: Use the standard system keyboard through `inputmode="numeric"`.
 - **Mode switching**: Use in-place editing, replacing display text with editable fields through buttons in the detail screen.
@@ -1399,7 +1511,7 @@ This chapter defines the UI when allocations are automatically adjusted because 
 
 #### 4.3 Scope and Sharing Display
 
-- **Asset labels**: Within shared scope, display `[CreatorName] AssetName` so the contributor can be identified.
+- **Asset labels**: Within Shared scope, identify the contributor using a Domain attribution label such as `[CreatorName] AssetName`. This label is not membership evidence or authority; identity representation is delegated to Production design.
 - **Shared Goals**: Scope selection already filters them, so a sharing marker is generally unnecessary on individual screens. Do not adopt mixed-scope displays.
 
 ### 5. Primary Interactions and Navigation
@@ -1409,17 +1521,20 @@ This chapter defines the UI when allocations are automatically adjusted because 
 - The Allocations tab lists only Positions with **allocated > 0** (avoid listing many unallocated Positions).
 - Add primarily through `➕ Allocation` in the FAB (no permanent form).
 - On desktop, a single `+ Add allocation` may appear at the upper right of the Allocations tab.
-- When there are no allocations, an `Add allocation` CTA may appear in the Allocations tab's Empty state.
+- When there are no allocations, an `Add allocation` CTA may appear in the Allocations tab's Empty state for an editable, unspent Goal. Access and offline restrictions still apply.
 - On mobile, do not duplicate `+ Add allocation` outside Empty state.
 - Each allocation row shows:
-  - `Available ¥X`
-  - `Allocation (JPY)` input (current value)
-  - `After change: Unallocated ¥Y` (only while editing)
+  - `Available ¥X`: the Position capacity for this Allocation (`positionCapacityForThisAllocation` in Part I §10.3), including this Allocation's current amount.
+  - `Allocation (JPY)` input (the new absolute value, initially the current value).
+  - `After change: Unallocated ¥Y` (only while editing), where `Y = positionCapacityForThisAllocation - entered absolute value` for valid input.
+- If shown, `Remaining to target` is the Goal's current incremental capacity, while `Maximum` is `min(goalCapacityForThisAllocation, positionCapacityForThisAllocation)`. Do not use the remaining-to-target amount as the upper bound for an existing Allocation's absolute value.
 - Each row shows `✏️ Edit` (small / secondary), invoking the Goals → Accounts deep link.
 - Constraints:
-  - Allocation <= Available
-  - Total Allocations across the Goal <= Remaining to target
-  - Integer JPY only
+  - Exclude the edited Allocation's current amount from both capacity sums under Part I §10.3; for a new Allocation, there is no existing amount to exclude.
+  - `0 ≤ allocatedAmount ≤ positionCapacityForThisAllocation` (`Available`).
+  - `allocatedAmount ≤ goalCapacityForThisAllocation`.
+  - After the change, total Allocations for the Goal must be `≤ Goal.targetAmount`, and total Allocations for the Position must be `≤ Position.marketValue`.
+  - Integer JPY only.
 - Saving:
   - Confirm with Enter / Blur and autosave.
   - Do not provide a `Save allocation` button.
@@ -1440,19 +1555,19 @@ This chapter defines the UI when allocations are automatically adjusted because 
 
 - Perform Spend through a dedicated drawer opened from `Mark as spent...` in the right-pane header, not through a tab.
 - In the Spend drawer, enter payment distribution per Position and validate the matching total and upper limits.
-- Place `Undo spend` in the same header location for Goals with spentAt.
-- Explicitly state Undo conditions (most recent only / within 24 hours) in Receipt or details.
+- Place `Undo spend` in the same header location for a Goal’s non-imported current Spend. Imported Spend has no Undo CTA.
+- Explain in Receipt or details that Undo targets the Spend establishing this Goal’s current `spentAt`, within 24 hours after its commit. Unrelated operations, navigation, drawer close, screen changes, or browser reload do not remove eligibility. Revalidate current access, persistence identity / version, and Domain constraints when executing Undo; follow §10.6 if Major confirmation is needed.
 
 #### 5.3 History / Receipt
 
 - `History` shows the most recent N items within the tab and fetches more through `Load more`.
 - Do not adopt a two-step `Open history` flow (tab → button → separate container).
-- Show `Receipt` only for Goals with spentAt, presenting payment breakdown and date / time as view-only.
+- Show `Receipt` only for Goals with spentAt, presenting the Spend / Payment Record breakdown and date / time as view-only. This long-lived Domain view is independent of idempotency / committed-result Operation Receipts. Imported Spend records remain displayable here without Undo capability.
 
 #### 5.4 Feedback (Toast / State)
 
-- Suppress success Toasts for frequent operations (prioritize `Saving…/Online` status).
-- Automatic adjustment notifications may navigate to the Allocations tab through `Review`.
+- Suppress success Toasts for frequent operations; use the shared connection and save status contract, including unresolved outcomes.
+- After a committed Minor adjustment, `Review` may navigate to its summary / Allocations tab. Major adjustments open the proposal UI before commit and require explicit confirmation (§10.6).
 
 #### 5.5 Goals → Accounts Deep Link (Position Editing)
 
@@ -1467,8 +1582,8 @@ This chapter defines the UI when allocations are automatically adjusted because 
   - Show `Back to goal`.
   - Close actions (Close button / overlay / Esc) return to Goals.
   - After successful `Save position`, close the drawer and return to Goals through that Close handler.
-  - On save failure, neither close the drawer nor return to Goals.
-- Treat `Back to goal` as cancellation; show a discard-confirmation dialog if input is in progress.
+  - On rejection or unknown outcome, neither close the drawer nor return to Goals automatically; keep input and the appropriate recovery action available.
+- Treat `Back to goal` as leaving the editor; confirm discarding unsubmitted input. It does not cancel or undo a submitted operation, and unresolved journals must remain available through recovery UI.
 
 #### 5.6 Routing & State Restoration (URL SSoT / push-replace)
 
@@ -1481,10 +1596,12 @@ This chapter defines the UI when allocations are automatically adjusted because 
 
 #### 5.7 Stale-While-Revalidate (Avoid Delays When Returning)
 
-- Default Goals / Accounts to immediate display of local state + background revalidation.
-- Do not clear the detail pane when returning; refresh with non-blocking feedback (e.g., `Refreshing...`).
-- While editing (input in progress), do not immediately apply revalidation results; prioritize the user's operation.
-- Preserve return navigation through `returnGoalId` / `returnTab` without delaying the return after saving.
+- Default Goals / Accounts to immediate display of eligible local data plus background revalidation, with cached / unverified status when applicable.
+- Within a valid context, avoid clearing detail panes unnecessarily when returning; use non-blocking feedback such as `Refreshing...`.
+- Preserve editor input separately from Canonical data. Within the same identity, refreshed data must not overwrite the user's draft; a later submission must still satisfy concurrency checks.
+- Editing in progress must not delay adopting a verified new restoreEpoch / workspaceIncarnationId or acknowledging revoked access. Stop treating old data as current, invalidate old History / Receipt views, and apply §13.3.
+- Never roll back to an older Canonical version within the same identity. Do not automatically rebase or submit retained input after revalidation.
+- Preserve return navigation through `returnGoalId` / `returnTab` when the destination remains valid and accessible; otherwise explain why it is unavailable.
 
 ---
 
@@ -1492,15 +1609,15 @@ This chapter defines the UI when allocations are automatically adjusted because 
 
 ### 1. Overview and Design Concept
 
-- **Role**: The foundational infrastructure screen for managing OneDrive / Google Drive connections, shared scopes, and data consistency.
+- **Role**: Manage sign-in / access, Workspaces, connection and save recovery, and data portability.
 - **Design**: Warm Precision. Based on Fluent UI, with Butter yellow (`#F6E58D`) accents.
 - **UI structure**:
   - Desktop: Single-column card layout limited to 800px wide.
-  - Mobile: Two-line list items by category. Tapping opens a full-screen Overlay (Sheet / Modal) with details, synchronized with the URL hash.
-  - The mobile list summarizes state through title + subtext; do not show lengthy errors in full in the list.
-  - Avoid redundancy: Do not provide a dedicated card containing only the `Settings` title and description.
+  - Mobile: Two-line category items opening a full-screen Overlay (Sheet / Modal), synchronized with the URL hash.
+  - Summarize state through title + subtext; keep lengthy errors inside details.
+  - Do not provide a redundant card containing only the Settings title / description.
 - **Information architecture (top to bottom)**:
-  1. `Sign-in & storage`
+  1. `Sign-in & access`
   2. `Connection health`
   3. `Workspace`
   4. `Data & portability`
@@ -1508,93 +1625,53 @@ This chapter defines the UI when allocations are automatically adjusted because 
   6. `Advanced / Diagnostics`
   7. `Danger zone`
 
-### 2. Sign-in & storage
+### 2. Sign-in & access
 
-- **Signed out**
-  - Heading: `Choose where to save`
-  - Show vertically stacked OneDrive / Google Drive cards
-  - Descriptions:
-    - `Save to your Microsoft account.`
-    - `Save to your Google account.`
-  - CTA: **Official sign-in buttons** (logos only inside the buttons)
-  - Do not show `Switch…`
-- **Signed in**
-  - Display:
-    - `Connected to: OneDrive / Google Drive`
-    - `Signed in as: <name/email>`
-    - `Workspace: Personal / Shared (view-only/can edit)`
-  - Buttons:
-    - `Sign out`
-    - `Switch…` (**also includes Switch account**)
-- Restore the last-selected provider on reload (do not automatically switch providers even when signed out)
-- Apply §8.7 for remembered connections: show a reminder for the current provider only when previously connected, online, and in need of sign-in. Use the official sign-in button; keep the normal choices available for first-time use and deliberate switching. An authenticated inactive provider must not be displayed as the current connection.
-- **Switch… dialog**
-  - List candidates across OneDrive / Google Drive
-  - States: `Available` / `Empty` / `Not signed in`
-  - Show `Create` only for `Empty`
-  - Make `Open` the primary action for `Available`
-- `Move data…` requires double confirmation + backup confirmation
-  - Show **progress (phase + item count)** while Move runs
-  - **Do not allow cancellation** during Move (avoid corruption)
-  - On failure, **run Move again** (deletion occurs last)
-- For signed-out candidates, show only the official sign-in button (no Open / Move)
-- Do not continuously display provider logos in Settings (use them only within sign-in buttons).
+- When signed out, explain that signing in is required to load authorized Server data and edit. State that data is stored by the app and can be exported.
+- When signed in, show the current user identity and selected Workspace access without implying that login alone grants Workspace membership.
+- Provide explicit sign-in / sign-out actions appropriate to the eventual authentication design. Do not fix a login service, account-linking flow, or invitation mechanism here.
+- Do not launch interactive authentication automatically from startup, background refresh, or error recovery. Handle cancellation and errors without leaving the UI indefinitely busy.
+- Distinguish a transient network failure from a need to sign in; avoid sign-in prompts while offline or immediately after deliberate sign-out.
+- Sign-out must stop authenticated use of the current context. It must not be presented as deleting Server data, undoing a submitted operation, or confirming its outcome.
+- Retained input and browser-cache visibility across sign-out / account changes require an explicit privacy and identity-lifecycle policy in Production design; do not silently transfer them to another identity.
 
 ### 3. Connection health
 
-- Show `Status: <state>` at the top (using the six shared states).
-- Show `Last sync` as relative time, with absolute time as supplementary information (title / details).
-- Consolidate recovery actions into:
-  - `Retry now` (enabled only for `Retry needed`)
-  - `Clear cache & reload`
-  - `Reload from cloud`
-- Show `Sign-in required` when online but signed out / expired.
-- On Google Drive insufficient scopes (403 / insufficient scopes), show a permission-renewal message and let the user explicitly activate sign-in with consent. Do not open a popup from background loading or recovery (§8.7).
-- Google Drive scopes are `drive.file` + `drive.appdata` (the pointer is stored in appDataFolder).
-- When `Retry now` is disabled, **always show** short helper text directly below the button (do not rely on hover).
-  - Examples: `No queued retries.` / `You're offline.` / `Read-only mode.`
-- Place `Retry queue` / `Snapshot version` inside `Show details`.
-- Prioritize key information and recovery actions rather than redundant information.
-- Folder rename notice:
-  - Applies to: App / Personal / Shared (Shared by me only)
-  - Wording: `Notice: A folder name was changed. Sync will continue, but for backups use Export in Data & portability.`
-  - Include a route to `Data & portability` (`#data-portability`).
+- Show current connectivity, verification / access restrictions, and unresolved save status under the shared status contract.
+- Show `Last verified` as relative time with absolute time available in details. Distinguish it from any last-confirmed-save timestamp.
+- Provide appropriate recovery actions:
+  - `Refresh data`: Recheck authorized Canonical data; preserve journal entries and input.
+  - `Rebuild cache`: Discard rebuildable cached data and reload from the Server; preserve the unresolved journal and input. Disable online rebuild when the Server is unavailable and explain why.
+  - `Check operation status`: Use the authorized recovery flow to observe current Canonical coordinates and the unresolved operation’s known result, even when its original epoch / incarnation is stale (§8.4.1). This does not resubmit the mutation.
+  - `Retry operation`: Offer only for safe same-operation replay, with the original identity / payload.
+  - `Review retained input`: Show its originating Workspace and known outcome without claiming it is current State.
+- When an action is disabled, show short helper text directly below it, without requiring hover.
+- Put technical identity / version information and diagnostic details inside `Show details`. Do not require users to understand persistence identifiers to choose a recovery action.
+- Explain maintenance / restore quarantine as restricted access pending recovery. Sign-in or cache clearing must not appear to bypass the restriction.
+- Keep retained operations for other Workspaces discoverable without mixing their results into the selected Workspace's status or granting access to unavailable Server data.
 
 ### 4. Workspace
 
-- **Discovery logic**: Use the shared root's **folderId** as the SSoT and retrieve its immediate child folders (name searches only during recovery).
-- Consolidate shared workspace selection states and warnings in this section.
-- Display `No shared workspace selected` only within Workspace.
-- Organize details into three blocks:
-  - `Shared workspace`
-  - `Share link`
-  - `Note` (only when needed)
-- Provide creation within the app:
-  - `Create shared workspace…` → name-entry dialog → create → update the list
-  - Silently create `<appRoot>/shared` if absent
-  - Do not automatically switch the selected context after creation (retain Personal / the existing Shared context)
-  - Notice: `Creating a workspace doesn’t share it automatically.`
-- Provide sharing-link creation for the selected workspace:
-  - One `Access type` (`View` / `Edit`) switch + one `Create link` button
-  - Show the generated link as readonly and allow copying with `Copy`
-  - Disable when nothing is selected and briefly explain why (e.g., `Select a shared workspace first.`)
-  - On failure, show a short summary; isolate details in `Show details` if needed
-  - Offer `Open in Drive` as an alternative (provide fallback wording if it cannot be obtained)
-  - Notice: `Creating a link doesn’t share it automatically - only people you send the link to can access it.`
-- Truncate long `Location` paths and provide `Copy path` when possible
-- Clearly show `Access` as `Can edit / View-only` through chips or similar UI (avoid adding too many colors)
+- List authorized Shared Workspaces and support selection alongside Personal scope. Restore the last selection subject to current verification.
+- Display `No shared workspace selected` only within this section.
+- Show the selected Workspace's name and `Can edit / View-only` status. Names are labels, not identifiers or authorization evidence.
+- Provide `Create shared workspace…` through a name-entry dialog; update the list after confirmed success without automatically switching the selected context.
+- Explain `Creating a workspace doesn’t share it automatically.`
+- Provide management entry points for inviting / managing access subject to current authority. Explain the effect of granting, changing, or revoking access; do not prescribe invitation-link mechanics.
+- Do not imply that ordinary edit capability grants permission to manage members, reset contents, or delete the Workspace.
+- Explain unavailable, revoked, or restore-quarantined access and offer an authorized alternative context where available.
 
 ### 5. Data & portability
 
-- Consolidate Export / Import in this section.
-- Export:
-  - Two buttons: `Export personal data` / `Export shared data`
-  - Include `snapshot.json` and `events.jsonl` in the zip
-- Import:
-  - Accept only previously exported zip files; proceed through **validation → preview → apply**
-  - Reject corrupt / invalid formats
-  - Explicitly state that applying overwrites existing data
-  - Provide a file-selection flow that works on mobile (iOS / Android)
+- Follow Part I §9 for format, validation, preview, and full replacement semantics.
+- Offer `Export personal data` and `Export shared data`, clearly identifying the target Workspace and respecting current authorization.
+- Export a consistent current State + History dataset, including Spend / Payment Records, in the versioned ZIP format. Explain that unresolved input is excluded.
+- Import through a mobile-compatible file-selection flow (iOS / Android), then validation → preview → explicit apply.
+- Reject invalid / inconsistent data without automatic correction. Display the target and scope of replacement before apply.
+- Provide a prominent `Export backup before import` action and strongly recommend it. Backup creation is optional; a skipped or unsuccessful Export must not prevent Import when the user explicitly confirms proceeding without a backup.
+- Require acknowledgement that current State + History will be fully replaced, Import has no ordinary Undo, and a pre-import backup can be re-imported for recovery. Imported Spend does not regain Undo capability.
+- Apply two-stage destructive confirmation with clear target, replacement scope, and backup status. At the final confirmation, prominently warn `No pre-import backup was created` when proceeding without a backup; do not infer that one exists. Permit explicit confirmation without a backup. If the Workspace changes after preview, refresh the preview and confirmation rather than applying against stale data.
+- On an unknown outcome, offer result checking and preserve the operation context; do not automatically apply Import again as a new operation.
 
 ### 6. Appearance
 
@@ -1604,26 +1681,30 @@ This chapter defines the UI when allocations are automatically adjusted because 
 ### 7. Advanced / Diagnostics
 
 - A collapsible display is recommended.
-- Group infrequent diagnostic operations (such as Storage checks).
-- Do not place `Review allocations` in Settings.
+- Group infrequent connection, browser-storage, and persistence diagnostics.
+- Keep technical request / operation identifiers in details; do not expose credentials, sensitive payloads, or unnecessary personal information in logs or diagnostic output.
+- Diagnostic operations must not bypass access / maintenance gates or silently clear unresolved input.
+- Do not place allocation-adjustment review in Settings; use the Domain UI.
 
 ### 8. Danger zone
 
-- Consolidate dangerous operations and require two-stage confirmation.
-- In the mobile list, use restrained emphasis such as a pale red background / left border.
-- Operation: `Delete cloud data` (do not use the word `Uninstall`)
-  - Step 1: Warning + `I understand` checkbox
-  - Step 2: Enter `DELETE`
-- After execution, stay signed in, clear only **the active provider's local cache**, and reload.
+- Distinguish `Reset workspace contents` from `Delete workspace` under Part I §9.5. Do not expose an operation until its authorization and lifecycle policy is defined.
+- Identify the target Workspace, affected data, and Shared-member consequences before confirmation. Reset keeps the Workspace and its current access configuration; deletion removes access to that Workspace for all members.
+- Preserve two-stage confirmation:
+  1. Warning with exact destructive scope + `I understand` checkbox; offer Export first.
+  2. Typed confirmation, for example `RESET` or `DELETE`, matching the specific action.
+- Use restrained emphasis in the mobile list, such as a pale red background / left border.
+- After confirmed reset, refresh the new incarnation and its empty dataset. After confirmed deletion, stop showing the removed Workspace as accessible and offer another authorized context.
+- Retained old input remains separate and cannot be automatically submitted. Ordinary local cleanup must not silently erase unresolved journals.
+- Unknown outcomes follow the shared result contract; dismissing the dialog or refreshing is not proof of failure.
+- Account-wide / all-data deletion is a distinct future lifecycle capability, not an implied effect of either action.
 
 ### 9. Required Implementation Logic
 
 - Standardize status navigation to `/settings#connection-health`.
-- On mobile, interpret `#connection-health` as opening the corresponding Overlay. Anchor scrolling is acceptable on desktop.
-- If possible, handle other section hashes such as `#sign-in-storage` / `#workspace` / `#data-portability`
-  the same way (open the Overlay directly).
+- On mobile, interpret the hash as opening the corresponding Overlay; anchor scrolling is acceptable on desktop.
+- Support direct entry to sections such as `#sign-in-access`, `#workspace`, and `#data-portability` using the same pattern where possible.
 - UI wording must be English only.
-- Display both OneDrive / Google Drive providers (without persistent logos).
-- Use **folderId as the SSoT** for root identification; name searches are for recovery only.
+- Apply shared save-result, current-access, and timeline rules to all Settings actions, including Export / Import and destructive operations.
 
 ---

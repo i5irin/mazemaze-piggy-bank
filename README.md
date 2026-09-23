@@ -8,7 +8,9 @@
 
 A Progressive Web App (PWA) designed to manually manage multiple asset accounts and allocate funds to specific "Savings Goals" to track progress.
 
-Instead of using a dedicated backend server, this application adopts a serverless architecture using **Microsoft OneDrive or Google Drive** directly as the data store, prioritizing user privacy and data ownership.
+The adopted Product Architecture uses a **thin stateless API and Managed PostgreSQL** for Canonical data, with app-managed sharing and versioned Export / Import for portability.
+
+**Implementation boundary:** The runnable application still uses the earlier Bring Your Own Storage (BYOS) implementation with Microsoft OneDrive / Google Drive. The setup and deployment instructions below run that implementation; they do not provision the PostgreSQL backend or the new authentication / membership system.
 
 ## Documentation
 
@@ -22,67 +24,68 @@ The specification describes the intended product behavior and is not used as a t
 
 ## 📖 Overview & Purpose
 
-This app is not just an expense tracker or a simple asset manager; it focuses on clarifying "which asset is reserved for what purpose."
+The product focuses on clarifying "which asset is reserved for what purpose." The overview and architecture below summarize the adopted [Product Specification](docs/specification.md).
 
 - **Asset Allocation**: Manually link assets (Positions such as Cash, Bank Deposits, Investment Funds) to specific Goals (e.g., Travel, Big Purchases) by assigning reserved amounts (Allocations).
 - **Market Value Adjustment**: When the market value of an asset (e.g., Investment Trust) is updated, the allocated amounts linked to that asset are **recalculated according to the Position's allocation mode**.
-- **Sharing**: Manage a "Shared Pool Account" and "Shared Goals" with partners or family members using the selected cloud provider's sharing capabilities.
+- **Sharing**: Manage shared pool accounts and Goals with partners or family through app-managed Workspace membership. Personal / Shared is a Workspace property; Accounts, Positions, Goals, and Allocations stay within that Workspace.
 
-## ✨ Features
+## ✨ Product Features
 
-- **Personal Microsoft / Google Accounts**: No proprietary account registration required.
-- **Fully Serverless (Client-to-Cloud)**: User data is stored in the selected personal OneDrive or Google Drive instead of an application-owned database.
-- **Mobile First**: UI designed for one-handed operation on smartphones.
-- **Microsoft Fluent UI**: Adopts a design system that is both friendly and professional.
-- **Offline Viewing**: Browse the latest cached data even without an internet connection (Editing is disabled offline).
-- **Selectable Storage Provider**: OneDrive or Google Drive; one provider is active at a time and the app does not dual-write.
-- **Dark Mode**: Supports system / light / dark appearance preferences.
-- **Sharing Permissions**: Shared workspaces respect read/write capability in the UI.
-- **Data Portability**: Export / Import and storage-provider Move flows are available for supported data.
+- **Mobile First**: A PWA designed for one-handed use, also usable in desktop browsers.
+- **Microsoft Fluent UI**: A design system that is both friendly and professional.
+- **Offline Viewing**: Browse eligible cached data with its freshness limitations visible; editing requires an online, verified Workspace context.
+- **Dark Mode**: System / light / dark appearance preferences.
+- **Shared Workspaces**: Multiple Shared Workspaces with `Can edit` and `View-only` access.
+- **Data Portability**: Versioned ZIP exports containing JSON / JSONL; Import uses validation, preview, and explicit apply.
 
-## 🛠 Tech Stack
+## 🛠 Intended Product Architecture
 
-- **Frontend**: Next.js / React / TypeScript
-- **UI Framework**: Fluent UI
-- **Microsoft Auth & Storage**: Microsoft Graph API (OneDrive) / MSAL
-- **Google Auth & Storage**: Google Identity Services / Google Drive API
-- **Data Strategy**: Snapshot (Latest State) + Event history (Logs) + Lease
-- **Export / Import**: ZIP-based data portability
+- **Frontend**: Next.js / React / TypeScript, delivered as a PWA.
+- **UI Framework**: Fluent UI.
+- **API**: A thin stateless API mediates Canonical reads and writes, enforcing current authorization and Domain validation.
+- **Canonical Storage**: App-hosted Managed PostgreSQL. Persistence correctness must not depend on a particular hosting provider.
+- **Browser Storage**: IndexedDB holds a rebuildable Canonical cache and an Unresolved Operation Journal for input protection and recovery when a save cannot be confirmed. It is not an offline editing queue.
+- **Sharing**: App-managed Workspace membership. Authentication technology, identity lifecycle, and invitation mechanics remain Production design decisions.
+- **Portability**: Versioned ZIP + JSON / JSONL for current State, History, and associated portable Domain records. Export provides a downloadable backup, not ownership of the live storage service. Full Import replaces the target Workspace dataset.
 
-## ⚠️ Constraints & Scope
+OneDrive / Google Drive are not Canonical persistence in this architecture. See the [Product Specification](docs/specification.md) for the full persistence, recovery, sharing, and Workspace lifecycle contracts.
 
-This app focuses on digitizing "personal manual management" and explicitly excludes the following features:
+## ⚠️ Product Constraints & Scope
 
-1.  **No Automatic Sync**: No bank APIs or scraping. All balances and market values are entered manually.
-2.  **JPY (Integer) Only**: Foreign currencies and investment funds are handled as integer JPY values (converted manually at input).
-3.  **Conflict Resolution (First-in Wins)**:
-    - The app does not support simultaneous editing or automatic merging.
-    - Optimistic generation / ETag-style checks are used where available. A detected mismatch fails the save and requires reloading the latest data.
-4.  **No Real-time Sync**: While a "Lease" file is used to show an "Editing" status to others, strictly real-time locking or synchronization is not implemented. Lease information is a best-effort status aid; lease failures must not block editing or saving.
+1. **Manual Financial Input**: No bank APIs or scraping. Balances and market values are entered manually.
+2. **JPY (Integer) Only**: Foreign currencies and investment funds are entered as integer JPY values, converted manually.
+3. **Optimistic Concurrency**: Reject stale writes and require explicit review against refreshed Canonical data. No automatic merge, automatic rebase, or CRDT.
+4. **Offline Is View-only**: No offline editing or general-purpose mutation synchronization.
+5. **Domain History**: Activity supports user-facing History and eligible Undo; Full Event Sourcing is not adopted. Editing presence is not an MVP requirement, and there are no server-side pending drafts.
 
-## 📁 Data Storage
+## Current Implementation / Development Setup
 
-Data is stored in the user's selected OneDrive or Google Drive in the following structure.
-**Note**: Deleting the app root folder removes the cloud data under it and resets that workspace. Use **Export** in Settings before deleting cloud files to keep a backup.
+The instructions from here through Deployment describe the **current BYOS application**. It uses MSAL / Microsoft Graph for OneDrive and Google Identity Services / Google Drive API for Google Drive. One provider is active at a time, and sharing uses provider capabilities. These are implementation facts, not the adopted Product Architecture or a choice of authentication for the new backend.
 
-- **Snapshot**: A normalized JSON file holding the current state of Accounts, Positions, Goals, and Allocations.
-- **Events**: Chunked log files for auditing and recovery.
-- **Lease**: Temporary files used to show editing status for concurrent editing conflicts.
-- **Shared data**: Shared workspaces created by the user live under the selected app root's `shared/` folder. Shared workspaces can also be opened through cloud-provider sharing capabilities.
+The current code and tests define this executable behavior:
 
-Default app roots:
+- [Authentication](src/components/AuthProvider.tsx) and [provider selection](src/components/StorageProviderContext.tsx)
+- [Storage adapter](src/lib/storage/storageService.ts), [OneDrive implementation](src/lib/onedrive/oneDriveService.ts), and [Google Drive implementation](src/lib/google/googleDriveService.ts)
+- [Current persistence code](src/lib/persistence) and [Settings / portability tools](src/app/settings/SettingsClient.tsx)
 
-- **OneDrive**: `/Apps/Mazemaze Piggy Bank/`
-- **Google Drive**: `/My Drive/Apps/MazemazePiggyBank/`
+### Current BYOS Data Storage
 
-The product specification defines the authoritative folder, pointer, Snapshot, EventChunk, Lease, shared-root, and portability behavior. Do not treat folder names alone as the identity of a workspace where the specification defines an ID / pointer-based identity.
+The existing application stores snapshots, event chunks, and editing-presence lease files in the selected user's Drive, with an IndexedDB snapshot cache. These files and provider-specific concurrency checks are not the new PostgreSQL commit contract.
 
-Import overwrites existing data. Move copies supported data to the destination provider and then deletes source data; review the confirmation and export a backup first.
+- **Snapshot**: JSON containing Accounts, Positions, Goals, and Allocations.
+- **Events**: Chunked Domain history with a derived event index.
+- **Lease**: Editing-presence records in cloud storage.
+- **Shared data**: Owned shared workspaces live under the app root's `shared/` folder; access to other shared workspaces uses provider sharing.
 
----
+Default app root labels / locations:
 
-> **Note**
-> While designed as a PWA for mobile use, this application is fully functional on desktop browsers. Recommended browsers: Latest Chrome, Edge, Safari.
+- **OneDrive**: `/Apps/Mazemaze Piggy Bank/` (the implementation resolves Microsoft Graph's app root).
+- **Google Drive**: `/My Drive/Apps/MazemazePiggyBank/`.
+
+The implementation follows stored folder IDs / pointers, so names alone do not identify existing roots. Deleting an app root removes the cloud data under it; export a backup before deleting non-disposable data. See the development reset procedure below for pointer and cache cleanup.
+
+Current ZIP Import / Export and provider-switch / Move tools operate on this BYOS format. They are not migration tools for the PostgreSQL architecture. Import overwrites data. Move copies the Personal snapshot and event chunks, then deletes the source app root, including owned Shared folders; it does not migrate Shared workspaces. Review destructive confirmations and export backups of affected data before using these tools.
 
 ## ✅ Setup
 
@@ -98,7 +101,7 @@ cp .env.example .env.local
 
 ## 🔐 Microsoft Sign-in Setup
 
-Microsoft sign-in supports **Personal Microsoft accounts only**.
+The current Microsoft setup targets **personal Microsoft accounts** using the consumers authority.
 
 1. Create a Microsoft Entra app registration for personal Microsoft accounts and add the Single-page application (SPA) platform.
 2. Add a redirect URI for local development (for example, `http://localhost:3000`) and each deployed environment. Each URI must match that environment's `NEXT_PUBLIC_MSAL_REDIRECT_URI`.
@@ -127,7 +130,7 @@ The test file name is `pb-test.json` under the app folder. **Write test file** c
 
 ## 🔐 Google Sign-in Setup
 
-The product supports **personal Google accounts**.
+The current Google setup is intended for **personal Google accounts**.
 
 1. Create or select a Google Cloud project and enable the **Google Drive API**.
 2. Configure OAuth branding, audience, and consent settings. If the app is in testing, add the accounts that will test it as test users.
@@ -191,7 +194,7 @@ npm run check
 
 ## 🚀 Deployment
 
-Deployments are performed via **GitHub Actions** using the Vercel CLI.
+The current BYOS application is deployed via **GitHub Actions** using the Vercel CLI. These workflows do not provision the intended PostgreSQL backend or app-managed membership system.
 To avoid double-deploys, Vercel's Git integration deployment should be disabled by `vercel.json`.
 
 Both dev and production workflows run `vercel pull --environment=production`, followed by `vercel build --prod`. Configure application variables in each project's **Production** environment, including the dev project. The workflows retrieve those values; a local `.env.local` file does not configure Vercel. Rebuild and deploy after changing application environment variables.
@@ -277,6 +280,5 @@ git push origin v1.0.0
 ## 📌 Project Constraints
 
 - UI text and code comments must be written in English only. Japanese is a future localization target defined in the product specification.
-- Personal Microsoft and personal Google accounts only (no work or school accounts).
 - Offline mode is view-only; editing is disabled.
 - No telemetry or analytics are added by default.
